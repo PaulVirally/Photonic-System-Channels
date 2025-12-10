@@ -1,0 +1,89 @@
+using MatrixFreeRandomizedLinearAlgebra
+using LinearMaps
+using LinearAlgebra
+using JLD2
+using CUDA
+
+function generate_rsvd()
+    compute_env, smr, rsvd_params = parse_args()
+
+    fname = file_prefix(smr)
+    jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
+    jld_key = "UR_asym/"
+    if ispath(jld_path)
+        jld = jldopen(jld_path, "r")
+        if haskey(jld, jld_key * "U") && haskey(jld, jld_key * "D") && haskey(jld, jld_key * "V")
+            @info string(now()) * " [rsvd::generate_rsvd] RSVD for $(jld_key) already exists at $(jld_path): skipping"
+            close(jld)
+            return
+        else
+            close(jld)
+        end
+    end
+
+    @info string(now()) * " [rsvd::generate_rsvd] Computing RSVD for UR_asym"
+    @info string(now()) * " [rsvd::generate_rsvd] Loading G₀ operators"
+    G₀_ur = LinearMap(load_greens_function(compute_env, smr, Design, Receiver)) # sender -> receiver
+    G₀_ru_adjoint = LinearMap(adjoint(load_greens_function(compute_env, smr, Receiver, Design))) # receiver -> sender (adjoint)
+
+    G₀_ur_asym = (G₀_ur - G₀_ru_adjoint) / 2im # Anti-Hermitian part of G₀_ur
+    sample_vec = zeros(eltype(G₀_ur_asym), 0)
+    if use_gpu(compute_env)
+        sample_vec = cu(sample_vec)
+    end
+
+    @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀_ur_asym)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+    out = rsvd(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+
+    @info string(now()) * " [rsvd::generate_rsvd] Saving RSVD to $(jld_path)"
+    _save_rsvd(out, jld_path, jld_key)
+end
+
+# function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, target::SMRVolumeSymbol, source::SMRVolumeSymbol)
+#     fname = file_prefix(smr)
+#     jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
+#     if ispath(jld_path)
+#         jld = jldopen(jld_path, "r")
+#         jld_key = volume_symbol2char(target) * volume_symbol2char(source) * "/"
+#         if haskey(jld, jld_key * "U") && haskey(jld, jld_key * "D") && haskey(jld, jld_key * "V")
+#             @info string(now()) * " [rsvd::_run_rsvd] RSVD for $(jld_key) already exists at $(jld_path): skipping"
+#             close(jld)
+#             return
+#         else
+#             close(jld)
+#         end
+#     end
+#
+#     @info string(now()) * " [rsvd::_run_rsvd] Computing RSVD for $(volume_symbol2char(target)) -> $(volume_symbol2char(source))"
+#     @info string(now()) * " [rsvd::_run_rsvd] Loading G₀"
+#     G₀ = load_greens_function(compute_env, smr, SMRVolumeSymbol.Receiver, SMRVolumeSymbol.Sender)
+#     @info string(now()) * " [rsvd::_run_rsvd] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+#     out = rsvd(G₀, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=similar(G₀, eltype(G₀), 0))
+#     @info string(now()) * " [rsvd::_run_rsvd] Saving RSVD to $(jld_path)"
+#     _save_rsvd(out, jld_path, jld_key)
+# end
+
+function _save_component(jld::JLD2.JLDFile, key::String, component::AbstractArray)
+    if haskey(jld, key)
+        @info string(now()) * " [rsvd::_save_component] $(key) already exists: skipping"
+    else
+        @info string(now()) * " [rsvd::_save_component] Saving $(key)"
+        jld[key] = Array(component) # Ensure the data is copied to the host
+    end
+end
+
+function _save_rsvd(factorization::SVD, jld_path::String, jld_key::String)
+    U, S, Vt = factorization.U, factorization.S, factorization.Vt
+    jld = jldopen(jld_path, "a+")
+
+    @info string(now()) * " [rsvd::_save_rsvd] Saving left singular vectors"
+    _save_component(jld, jld_key * "V", Vt')
+
+    @info string(now()) * " [rsvd::_save_rsvd] Saving singular values"
+    _save_component(jld, jld_key * "D", Diagonal(S))
+
+    @info string(now()) * " [rsvd::_save_rsvd] Saving right singular vectors"
+    _save_component(jld, jld_key * "U", U)
+
+    close(jld)
+end
