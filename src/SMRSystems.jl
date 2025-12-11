@@ -201,17 +201,21 @@ Load or generate the vacuum Green's function operator G₀ between the target an
 - `target::SMRVolumeSymbol`: The target volume symbol (Sender, Mediator, or Receiver).
 - `source::SMRVolumeSymbol`: The source volume symbol (Sender, Mediator, or Receiver).
 
+# Keyword Arguments
+- `force_generate::Bool=false`: If true, forces regeneration of the Green's function even if it exists on disk.
+- `save_to_disk::Bool=true`: If true, saves the generated Green's function to disk.
+
 # Return
 - `G₀::VacuumGreensOperator`: The vacuum Green's function operator between the target and source volumes.
 """
-function load_greens_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol)
+function load_greens_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol; force_generate::Bool=false, save_to_disk::Bool=true)
     target_volume = volume(system, target)
     source_volume = volume(system, source)
 
     fname = greens_fname(target_volume, source_volume)
     fpath = joinpath(preload_dir(environment), fname)
 
-    if isfile(fpath)
+    if isfile(fpath) && !force_generate
         @info string(now()) * " [SMRSystem::load_greens_function] Loading G₀ from $(fpath)"
         io = open(fpath, "r")
         G₀ = deserialize(io, VacuumGreensOperator)
@@ -227,10 +231,13 @@ function load_greens_function(environment::ComputeEnvironment, system::SMRSystem
     @info string(now()) * " [SMRSystem::load_greens_function] Generating G₀"
     G₀ = VacuumGreensOperator(target_volume, source_volume)
     @info string(now()) * " [SMRSystem::load_greens_function] Loaded G₀"
-    @info string(now()) * " [SMRSystem::load_greens_function] Saving G₀ to $(fpath)"
-    io = open(fpath, "w")
-    serialize(io, G₀)
-    close(io)
+    if save_to_disk
+        mkpath(dirname(fpath))
+        @info string(now()) * " [SMRSystem::load_greens_function] Saving G₀ to $(fpath)"
+        io = open(fpath, "w")
+        serialize(io, G₀)
+        close(io)
+    end
     if use_gpu(environment)
         @info string(now()) * " [SMRSystem::load_greens_function] Moving G₀ to GPU"
         useGpu!(G₀)
