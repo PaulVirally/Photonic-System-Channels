@@ -216,9 +216,17 @@ function load_greens_function(environment::ComputeEnvironment, system::SMRSystem
     fpath = joinpath(preload_dir(environment), fname)
 
     if isfile(fpath) && !force_generate
+        volumes_overlap = GilaElectromagnetics.GilaOperators.ovrChk(target_volume, source_volume)
+        if volumes_overlap
+            source_mask = GilaElectromagnetics.GilaOperators.mskRng(target_volume, source_volume)
+            target_mask = GilaElectromagnetics.GilaOperators.mskRng(source_volume, target_volume)
+        else
+            source_mask = (0:0, 0:0, 0:0)
+            target_mask = (0:0, 0:0, 0:0)
+        end
         @info string(now()) * " [SMRSystem::load_greens_function] Loading G₀ from $(fpath)"
         io = open(fpath, "r")
-        G₀ = deserialize(io, VacuumGreensOperator)
+        G₀ = VacuumGreensOperator(deserialize(io, VacuumGreensOperator).mem, source_mask, target_mask)
         @info string(now()) * " [SMRSystem::load_greens_function] Loaded G₀"
         close(io)
         if use_gpu(environment)
