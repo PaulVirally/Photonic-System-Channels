@@ -42,7 +42,7 @@ function _default_project_dir(project_name::AbstractString)
     path = joinpath("/Users", ENV["USER"], "Desktop", project_name)
     if haskey(ENV, "MOLERING")
         # On our group's server
-        path = joinpath("/home", ENV["USERS"], "Sender-Mediator-Receiver SVD Bounds", "projects", project_name)
+        path = joinpath("/home", ENV["USER"], "Sender-Mediator-Receiver SVD Bounds", "projects", project_name)
     elseif haskey(ENV, "CC_CLUSTER")
         # On compute Canada
         path = joinpath("/home", ENV["USER"], "projects", "rrg-smolesky", ENV["USER"], project_name)
