@@ -4,7 +4,7 @@ using ArgParse
 settings = ArgParseSettings()
 @add_arg_table settings begin
     "-n", "--num-cells"
-        help = "Number of cells in x dimension"
+        help = "Number of cells in each dimension"
         arg_type = Int
         required = true
 end
