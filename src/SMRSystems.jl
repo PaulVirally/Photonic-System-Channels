@@ -93,10 +93,10 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3,
     sm_dir = (1, 0, 0) # Assume separation along x-axis
 
     mediator_size_wl = mediator_num_cells .* scale
-    mediator_center_wl = sender_center_wl .+ (sender_size_wl .* sm_dir .÷2) .+ sm_separation_wl .+ (mediator_size_wl .* sm_dir .÷2)
+    mediator_center_wl = sender_center_wl .+ sender_size_wl .* sm_dir .+ sm_separation_wl
 
     mr_dir = (1, 0, 0) # Assume separation along x-axis
-    receiver_center_wl = mediator_center_wl .+ (mediator_size_wl .* mr_dir .÷2) .+ mr_separation_wl .+ (receiver_num_cells .* scale .* mr_dir .÷2)
+    receiver_center_wl = mediator_center_wl .+ mediator_size_wl .* mr_dir .+ mr_separation_wl
 
     sender_volume = GlaVol(sender_num_cells, (scale, scale, scale), sender_center_wl)
     mediator_volume = GlaVol(mediator_num_cells, (scale, scale, scale), mediator_center_wl)
@@ -123,7 +123,7 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
     sender_size_wl = sender_num_cells .* scale
     rs_dir = (1, 0, 0) # Assume separation along x-axis
 
-    receiver_center_wl = sender_center_wl .+ (sender_size_wl .* rs_dir .÷2) .+ rs_separation_wl .+ (receiver_num_cells .* scale .* rs_dir .÷2)
+    receiver_center_wl = sender_center_wl .+ sender_size_wl .* rs_dir .+ rs_separation_wl
 
     sender_volume = GlaVol(sender_num_cells, (scale, scale, scale), sender_center_wl)
     receiver_volume = GlaVol(receiver_num_cells, (scale, scale, scale), receiver_center_wl)
