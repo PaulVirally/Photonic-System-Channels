@@ -3,6 +3,20 @@ using LinearMaps
 using LinearAlgebra
 using JLD2
 using CUDA
+using GilaElectromagnetics
+ 
+function disjoint_union_hack(G₀_ur::VacuumGreensOperator, G₀_ru_adjoint::VacuumGreensOperator, smr::SMRSystem)
+    s = sender(smr)
+    r = receiver(smr)
+    GilaElectromagnetics.GilaOperators.isoverlappingoperator(G₀_ur) || error("G₀_ur is not an overlapping operator")
+    GilaElectromagnetics.GilaOperators.isoverlappingoperator(G₀_ru_adjoint) || error("G₀_ru_adjoint is not an overlapping operator")
+    union_volume = G₀_ur.mem.srcVol # srcVol == trgVol for overlapping operators
+    sender_mask = GilaElectromagnetics.GilaOperators.mskRng(s, union_volume) # Mask for sender region within the union volume
+    receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, union_volume) # Mask for receiver region within the union volume
+    disjoint_G₀_ur = VacuumGreensOperator(G₀_ur.mem, receiver_mask, sender_mask) 
+    disjoint_G₀_ru_adjoint = VacuumGreensOperator(G₀_ru_adjoint.mem, sender_mask, receiver_mask)
+    return disjoint_G₀_ur, disjoint_G₀_ru_adjoint
+end
 
 function generate_rsvd()
     compute_env, smr, rsvd_params = parse_args()
@@ -23,14 +37,19 @@ function generate_rsvd()
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing RSVD for UR_asym"
     @info string(now()) * " [rsvd::generate_rsvd] Loading G₀ operators"
-    G₀_ur = LinearMap(load_greens_function(compute_env, smr, Design, Receiver)) # sender -> receiver
-    G₀_ru_adjoint = LinearMap(adjoint(load_greens_function(compute_env, smr, Receiver, Design))) # receiver -> sender (adjoint)
-
-    G₀_ur_asym = (G₀_ur - G₀_ru_adjoint) / 2im # Anti-Hermitian part of G₀_ur
+    G₀_ur = load_greens_function(compute_env, smr, Design, Receiver) # receiver -> universe
+    G₀_ru_adjoint = adjoint(load_greens_function(compute_env, smr, Receiver, Design)) # universe -> receiver (adjoint, so it goes receiver -> universe)
+    G₀_ur, G₀_ru_adjoint = disjoint_union_hack(G₀_ur, G₀_ru_adjoint, smr)
+    G₀_ur_asym = (LinearMap(G₀_ur) - LinearMap(G₀_ru_adjoint)) / 2im # Anti-Hermitian part of G₀_ur
     sample_vec = zeros(eltype(G₀_ur_asym), 0)
     if use_gpu(compute_env)
         sample_vec = cu(sample_vec)
     end
+
+    v = similar(sample_vec, eltype(sample_vec), size(G₀_ur_asym, 2))
+    out = G₀_ur_asym * v # Warm up GPU if needed
+    @show size(v)
+    @show size(out)
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀_ur_asym)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
     out = rsvd(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
