@@ -87,6 +87,10 @@ function _save_component(jld::JLD2.JLDFile, key::String, component::AbstractArra
 end
 
 function _save_rsvd(factorization::SVD, jld_path::String, jld_key::String)
+    if jld_path == ""
+        @info string(now()) * " [rsvd::_save_rsvd] Empty jld_path provided: skipping save"
+        return
+    end
     U, S, Vt = factorization.U, factorization.S, factorization.Vt
     jld = jldopen(jld_path, "a+")
 
@@ -94,7 +98,7 @@ function _save_rsvd(factorization::SVD, jld_path::String, jld_key::String)
     _save_component(jld, jld_key * "V", Vt')
 
     @info string(now()) * " [rsvd::_save_rsvd] Saving singular values"
-    _save_component(jld, jld_key * "D", Diagonal(S))
+    _save_component(jld, jld_key * "D", S)
 
     @info string(now()) * " [rsvd::_save_rsvd] Saving right singular vectors"
     _save_component(jld, jld_key * "U", U)
