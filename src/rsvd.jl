@@ -40,16 +40,11 @@ function generate_rsvd()
     G₀_ur = load_greens_function(compute_env, smr, Design, Receiver) # receiver -> universe
     G₀_ru_adjoint = adjoint(load_greens_function(compute_env, smr, Receiver, Design)) # universe -> receiver (adjoint, so it goes receiver -> universe)
     G₀_ur, G₀_ru_adjoint = disjoint_union_hack(G₀_ur, G₀_ru_adjoint, smr)
-    G₀_ur_asym = (LinearMap(G₀_ur) - LinearMap(G₀_ru_adjoint)) / 2im # Anti-Hermitian part of G₀_ur
-    sample_vec = zeros(eltype(G₀_ur_asym), 0)
+    G₀_ur_asym = (LinearMap(G₀_ur) - LinearMap(G₀_ru_adjoint)) / ComplexF64(2im) # Anti-Hermitian part of G₀_ur
+    sample_vec = zeros(ComplexF64, 0)
     if use_gpu(compute_env)
-        sample_vec = cu(sample_vec)
+        sample_vec = CuArray(sample_vec)
     end
-
-    v = similar(sample_vec, eltype(sample_vec), size(G₀_ur_asym, 2))
-    out = G₀_ur_asym * v # Warm up GPU if needed
-    @show size(v)
-    @show size(out)
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀_ur_asym)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
     out = rsvd(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
