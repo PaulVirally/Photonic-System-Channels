@@ -1,4 +1,5 @@
 function generate_greens()
+    @info string(now()) * " [generate_greens::generate_greens] Starting Greens function generation"
     compute_env, smr, _ = parse_args()
 
     @info string(now()) * " [generate_greens::generate_greens] Generating Greens functions for SMR system"
@@ -27,4 +28,6 @@ function generate_greens()
     @info string(now()) * " [generate_greens::generate_greens] Generating universe -> sender Greens function"
     load_greens_function(compute_env, smr, Sender, Design)
     run_gc()
+
+    @info string(now()) * " [generate_greens::generate_greens] Completed Greens function generation"
 end

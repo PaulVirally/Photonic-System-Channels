@@ -6,11 +6,16 @@ using CUDA
 using GilaElectromagnetics
  
 function generate_rsvd()
+    @info string(now()) * " [rsvd::generate_rsvd] Starting RSVD generation"
     compute_env, smr, rsvd_params = parse_args()
     if isnothing(mediator(smr))
-        return _generate_rsvd_sr(compute_env, smr, rsvd_params)
+        _generate_rsvd_sr(compute_env, smr, rsvd_params)
+        @info string(now()) * " [rsvd::generate_rsvd] Completed RSVD generation for SR system"
+        return nothing
     end
-    return _generate_rsvd_smr(compute_env, smr, rsvd_params)
+    _generate_rsvd_smr(compute_env, smr, rsvd_params)
+    @info string(now()) * " [rsvd::generate_rsvd] Completed RSVD generation for SMR system"
+    return nothing
 end
 
 function _disjoint_union_hack(G₀_ur::VacuumGreensOperator, G₀_ru_adjoint::VacuumGreensOperator, smr::SMRSystem)
