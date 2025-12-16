@@ -5,7 +5,15 @@ using JLD2
 using CUDA
 using GilaElectromagnetics
  
-function disjoint_union_hack(G₀_ur::VacuumGreensOperator, G₀_ru_adjoint::VacuumGreensOperator, smr::SMRSystem)
+function generate_rsvd()
+    compute_env, smr, rsvd_params = parse_args()
+    if isnothing(mediator(smr))
+        return _generate_rsvd_sr(compute_env, smr, rsvd_params)
+    end
+    return _generate_rsvd_smr(compute_env, smr, rsvd_params)
+end
+
+function _disjoint_union_hack(G₀_ur::VacuumGreensOperator, G₀_ru_adjoint::VacuumGreensOperator, smr::SMRSystem)
     s = sender(smr)
     r = receiver(smr)
     GilaElectromagnetics.GilaOperators.isoverlappingoperator(G₀_ur) || error("G₀_ur is not an overlapping operator")
@@ -18,9 +26,7 @@ function disjoint_union_hack(G₀_ur::VacuumGreensOperator, G₀_ru_adjoint::Vac
     return disjoint_G₀_ur, disjoint_G₀_ru_adjoint
 end
 
-function generate_rsvd()
-    compute_env, smr, rsvd_params = parse_args()
-
+function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
     fname = file_prefix(smr)
     jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
     jld_key = "UR_asym/"
@@ -39,7 +45,7 @@ function generate_rsvd()
     @info string(now()) * " [rsvd::generate_rsvd] Loading G₀ operators"
     G₀_ur = load_greens_function(compute_env, smr, Design, Receiver) # receiver -> universe
     G₀_ru_adjoint = adjoint(load_greens_function(compute_env, smr, Receiver, Design)) # universe -> receiver (adjoint, so it goes receiver -> universe)
-    G₀_ur, G₀_ru_adjoint = disjoint_union_hack(G₀_ur, G₀_ru_adjoint, smr)
+    G₀_ur, G₀_ru_adjoint = _disjoint_union_hack(G₀_ur, G₀_ru_adjoint, smr)
     G₀_ur_asym = (LinearMap(G₀_ur) - LinearMap(G₀_ru_adjoint)) / ComplexF64(2im) # Anti-Hermitian part of G₀_ur
     sample_vec = zeros(ComplexF64, 0)
     if use_gpu(compute_env)
@@ -53,29 +59,46 @@ function generate_rsvd()
     _save_rsvd(out, jld_path, jld_key)
 end
 
-# function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, target::SMRVolumeSymbol, source::SMRVolumeSymbol)
-#     fname = file_prefix(smr)
-#     jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
-#     if ispath(jld_path)
-#         jld = jldopen(jld_path, "r")
-#         jld_key = volume_symbol2char(target) * volume_symbol2char(source) * "/"
-#         if haskey(jld, jld_key * "U") && haskey(jld, jld_key * "D") && haskey(jld, jld_key * "V")
-#             @info string(now()) * " [rsvd::_run_rsvd] RSVD for $(jld_key) already exists at $(jld_path): skipping"
-#             close(jld)
-#             return
-#         else
-#             close(jld)
-#         end
-#     end
-#
-#     @info string(now()) * " [rsvd::_run_rsvd] Computing RSVD for $(volume_symbol2char(target)) -> $(volume_symbol2char(source))"
-#     @info string(now()) * " [rsvd::_run_rsvd] Loading G₀"
-#     G₀ = load_greens_function(compute_env, smr, SMRVolumeSymbol.Receiver, SMRVolumeSymbol.Sender)
-#     @info string(now()) * " [rsvd::_run_rsvd] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
-#     out = rsvd(G₀, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=similar(G₀, eltype(G₀), 0))
-#     @info string(now()) * " [rsvd::_run_rsvd] Saving RSVD to $(jld_path)"
-#     _save_rsvd(out, jld_path, jld_key)
-# end
+function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, jld_key::String)
+    fname = file_prefix(smr)
+    jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
+    if ispath(jld_path)
+        jld = jldopen(jld_path, "r")
+        if haskey(jld, jld_key * "U") && haskey(jld, jld_key * "D") && haskey(jld, jld_key * "V")
+            @info string(now()) * " [rsvd::_run_rsvd] RSVD for $(jld_key) already exists at $(jld_path): skipping"
+            close(jld)
+            return
+        else
+            close(jld)
+        end
+    end
+
+    @info string(now()) * " [rsvd::_run_rsvd] Computing RSVD for $(jld_key)"
+    @info string(now()) * " [rsvd::_run_rsvd] Loading G₀ operator"
+    target = char2volume_symbol(jld_key[1]) # First character indicates target
+    source = char2volume_symbol(jld_key[2]) # Second character indicates source
+    G₀_ab = load_greens_function(compute_env, smr, target, source)
+    sample_vec = zeros(ComplexF64, 0)
+    if use_gpu(compute_env)
+        sample_vec = CuArray(sample_vec)
+    end
+
+    @info string(now()) * " [rsvd::_run_rsvd] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀_ab)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+    out = rsvd(LinearMap(G₀_ab), rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+
+    @info string(now()) * " [rsvd::_run_rsvd] Saving RSVD to $(jld_path)"
+    _save_rsvd(out, jld_path, jld_key)
+end
+
+function _generate_rsvd_smr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
+    jld_keys = ["RS/", "SM/", "MR/", "MM/"]
+    for jld_key in jld_keys
+        @info string(now()) * " [rsvd::_generate_rsvd_smr] Processing $(jld_key)"
+        _run_rsvd(compute_env, smr, rsvd_params, jld_key)
+    end
+end
+
+function 
 
 function _save_component(jld::JLD2.JLDFile, key::String, component::AbstractArray)
     if haskey(jld, key)
