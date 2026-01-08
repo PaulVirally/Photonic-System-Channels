@@ -103,8 +103,6 @@ function _generate_rsvd_smr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     end
 end
 
-function 
-
 function _save_component(jld::JLD2.JLDFile, key::String, component::AbstractArray)
     if haskey(jld, key)
         @info string(now()) * " [rsvd::_save_component] $(key) already exists: skipping"
