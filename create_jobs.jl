@@ -83,6 +83,7 @@ struct ClusterConfig
     preload_dir::String
     project_dir::String
     scratch_dir::String
+    code_dir::String
 end
 
 num_threads(config::ClusterConfig) = config.has_slurm ? "\$SLURM_CPUS_PER_TASK" : "auto"
@@ -101,7 +102,8 @@ function ClusterConfig(server::AbstractString)
                              48, # Max VRAM in GB
                              MOLERING_PRELOAD_DIR,
                              MOLERING_PROJECT_DIR,
-                             MOLERING_SCRATCH_DIR)
+                             MOLERING_SCRATCH_DIR,
+                             MOLERING_CODE_DIR)
     elseif server == "narval"
         return ClusterConfig(server,
                              true, # Runs slurm
@@ -110,7 +112,8 @@ function ClusterConfig(server::AbstractString)
                              40, # Max VRAM in GB
                              CC_PRELOAD_DIR,
                              server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/",
-                             CC_SCRATCH_DIR)
+                             CC_SCRATCH_DIR,
+                             CC_CODE_DIR)
     elseif server == "fir"
         return ClusterConfig(server,
                              true, # Runs slurm
@@ -119,7 +122,8 @@ function ClusterConfig(server::AbstractString)
                              80, # Max VRAM in GB
                              CC_PRELOAD_DIR,
                              server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/",
-                             CC_SCRATCH_DIR)
+                             CC_SCRATCH_DIR,
+                             CC_CODE_DIR)
     end
     error("Unknown server: $server")
 end
@@ -185,23 +189,23 @@ function experiment_name(smr::SMRSystem)
     r = receiver(smr)
     if isnothing(m)
         sep = rs_separation(smr)[1] # Assume only x-separation for heat transfer
-        return "($(join(s.cel, ",")))_$(rational2string(sep, "ss"))_($(join(r.cel, ",")))@($(join(rational2string.(s.scl, "ss"), ",")))"
+        return "\\($(join(s.cel, ","))\\)_$(rational2string(sep, "ss"))_\\($(join(r.cel, ","))\\)@\\($(join(rational2string.(s.scl, "ss"), ","))\\)"
     end
     sm_sep = sm_separation(smr)
-    sm_sep_string = "($(rational2string(sm_sep[1])), $(rational2string(sm_sep[2])), $(rational2string(sm_sep[3])))"
+    sm_sep_string = "\\($(rational2string(sm_sep[1])), $(rational2string(sm_sep[2])), $(rational2string(sm_sep[3]))\\)"
     mr_sep = mr_separation(smr)
-    mr_sep_string = "($(rational2string(mr_sep[1])), $(rational2string(mr_sep[2])), $(rational2string(mr_sep[3])))"
-    return "($(join(s.cel, ",")))_$(sm_sep_string)_($(join(m.cel, ",")))_$(mr_sep_string)_($(join(r.cel, ",")))@($(join(rational2string.(s.scl, "ss"), ",")))"
+    mr_sep_string = "\\($(rational2string(mr_sep[1])), $(rational2string(mr_sep[2])), $(rational2string(mr_sep[3]))\\)"
+    return "\\($(join(s.cel, ","))\\)_$(sm_sep_string)_\\($(join(m.cel, ","))\\)_$(mr_sep_string)_\\($(join(r.cel, ","))\\)@\\($(join(rational2string.(s.scl, "ss"), ","))\\)"
 end
 
 function heat_transfer_args(smr::SMRSystem, params::RSVDParams)
     s = sender(smr)
     r = receiver(smr)
-    sender_string = "($(join(s.cel, ",")))"
-    receiver_string = "($(join(r.cel, ",")))"
+    sender_string = "\\($(join(s.cel, ","))\\)"
+    receiver_string = "\\($(join(r.cel, ","))\\)"
     sep = rs_separation(smr)[1] # Assume only x-separation for heat transfer
-    rs_sep_string = "($(rational2string(sep)),0//1,0//1)"
-    scale_string = "($(join(rational2string.(s.scl), ",")))"
+    rs_sep_string = "\\($(rational2string(sep)),0//1,0//1\\)"
+    scale_string = "\\($(join(rational2string.(s.scl), ","))\\)"
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "rs" # Design the entire region
@@ -212,14 +216,14 @@ function smr_args(smr::SMRSystem, params::RSVDParams)
     s = sender(smr)
     m = mediator(smr)
     r = receiver(smr)
-    sender_string = "($(join(s.cel, ",")))"
-    mediator_string = "($(join(m.cel, ",")))"
-    receiver_string = "($(join(r.cel, ",")))"
+    sender_string = "\\($(join(s.cel, ","))\\)"
+    mediator_string = "\\($(join(m.cel, ","))\\)"
+    receiver_string = "\\($(join(r.cel, ","))\\)"
     sm_sep = sm_separation(smr)
-    sm_sep_string = "($(rational2string(sm_sep[1])), $(rational2string(sm_sep[2])), $(rational2string(sm_sep[3])))"
+    sm_sep_string = "\\($(rational2string(sm_sep[1])), $(rational2string(sm_sep[2])), $(rational2string(sm_sep[3]))\\)"
     mr_sep = mr_separation(smr)
-    mr_sep_string = "($(rational2string(mr_sep[1])), $(rational2string(mr_sep[2])), $(rational2string(mr_sep[3])))"
-    scale_string = "($(join(rational2string.(s.scl), ",")))"
+    mr_sep_string = "\\($(rational2string(mr_sep[1])), $(rational2string(mr_sep[2])), $(rational2string(mr_sep[3]))\\)"
+    scale_string = "\\($(join(rational2string.(s.scl), ","))\\)"
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "m" # Design the mediator region
@@ -314,7 +318,7 @@ function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSyste
     --time=$(seconds2string(time_s)) \\
     --cpus-per-task=$cores \\
     --mem=$(memory_GB)G \\
-    --chdir=$CC_CODE_DIR \\
+    --chdir=$(cluster.code_dir) \\
 """
     if job in [GenerateRSVD, ComputeBounds] # Use GPU for RSVD generation and bounds computation
         header *= """    --gres=gpu:$(gpu_string(cluster, memory_GB)):1 \\\n"""
@@ -354,6 +358,9 @@ function job_launcher_script(jobs::AbstractVector{JobType},
 echo Running job launcher for $(join(string.(jobs), ", "))
 echo There $(length(sender_cells) > 1 ? "are" : "is") $(length(sender_cells)) job$(length(sender_cells) > 1 ? "s" : "") to launch
 echo We are expecting to be on $(cluster.name)
+
+# Change to code directory
+cd $(cluster.code_dir)
 
 # Create scratch, preload, and project directories if they don't exist
 mkdir -p $(cluster.scratch_dir)/$(PROJECT_NAME)/
