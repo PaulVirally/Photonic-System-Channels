@@ -205,7 +205,7 @@ function heat_transfer_args(smr::SMRSystem, params::RSVDParams)
     receiver_string = "\\($(join(r.cel, ","))\\)"
     sep = rs_separation(smr)[1] # Assume only x-separation for heat transfer
     rs_sep_string = "\\($(rational2string(sep)),0//1,0//1\\)"
-    scale_string = "\\($(join(rational2string.(s.scl), ","))\\)"
+    scale_string = "$(rational2string(s.scl[1]))"
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "rs" # Design the entire region
@@ -223,7 +223,7 @@ function smr_args(smr::SMRSystem, params::RSVDParams)
     sm_sep_string = "\\($(rational2string(sm_sep[1])), $(rational2string(sm_sep[2])), $(rational2string(sm_sep[3]))\\)"
     mr_sep = mr_separation(smr)
     mr_sep_string = "\\($(rational2string(mr_sep[1])), $(rational2string(mr_sep[2])), $(rational2string(mr_sep[3]))\\)"
-    scale_string = "\\($(join(rational2string.(s.scl), ","))\\)"
+    scale_string = "$(rational2string(s.scl[1]))"
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "m" # Design the mediator region
