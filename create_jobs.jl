@@ -410,7 +410,6 @@ end
 num_experiments = 32
 separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
 num_experiments = length(separations)
-@show separations
 
 print(job_launcher_script(
     [GenerateGreens, GenerateRSVD],
