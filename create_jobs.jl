@@ -86,7 +86,7 @@ struct ClusterConfig
     code_dir::String
 end
 
-num_threads(config::ClusterConfig) = config.has_slurm ? "\$SLURM_CPUS_PER_TASK" : "auto"
+num_threads(config::ClusterConfig) = config.has_slurm ? "\\\$SLURM_CPUS_PER_TASK" : "auto"
 
 function cpu2turbo(cpu::String)
     if cpu == "Epyc 7413" return 4.6 end
@@ -414,13 +414,13 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
     return script
 end
 
-num_experiments = 32
+num_experiments = 3
 separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
 num_experiments = length(separations)
 
 print(job_launcher_script(
     [GenerateGreens, GenerateRSVD],
-    ClusterConfig("molering"),
+    ClusterConfig("narval"),
     repeat([(16, 64, 64)], num_experiments), # sender cells: 0.5×4×4 λ³
     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
     repeat([(16, 64, 64)], num_experiments), # receiver cells, same as sender
