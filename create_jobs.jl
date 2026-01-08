@@ -405,7 +405,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
             script *= header
 
             job_args = args(smr, rsvd_params)
-            script *= "julia -t $(num_threads(cluster)) $(main_file(job_type)) $job_args \n"
+            script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args \n"
 
             script *= footer
         end
