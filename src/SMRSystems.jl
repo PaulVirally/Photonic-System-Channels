@@ -1,7 +1,7 @@
 module SMRSystems
 
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
-export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design
+export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
 export load_greens_function, file_prefix
 
 using GilaElectromagnetics
@@ -142,6 +142,15 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
     return SMRSystem(sender_volume, nothing, receiver_volume, design_volume, design_regions, χ)
 end
 
+function SMRSystem(sender_num_cells::NTuple{3, Int}, mediator_num_cells::Union{Nothing, NTuple{3, Int}}, receiver_num_cells::NTuple{3, Int}, sm_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, mr_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, rs_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, scale::Rational{Int}, χ::ComplexF64)
+    if isnothing(mediator_num_cells)
+        design_regions = [Sender, Receiver]
+        return SMRSystem(sender_num_cells, rs_separation_wl, receiver_num_cells, design_regions, scale, χ)
+    end
+    design_regions = [Mediator]
+    return SMRSystem(sender_num_cells, sm_separation_wl, mediator_num_cells, mr_separation_wl, receiver_num_cells, design_regions, scale, χ)
+end
+
 # Generate the filename for the Green's function between the target and source volumes.
 function greens_fname(target_volume::GlaVol, source_volume::GlaVol)
     rational2str(r::Rational) = string(numerator(r), "ss", denominator(r))
@@ -187,6 +196,22 @@ function volume(system::SMRSystem, symbol::SMRVolumeSymbol)
         return design(system)
     end
     throw(ArgumentError("Invalid SMRVolumeSymbol: $symbol"))
+end
+
+function volume_pairs(smr::SMRSystem)
+    pairs = @NamedTuple{source::GlaVol, target::GlaVol}[]
+    if isnothing(mediator(smr))
+        # heat transfer: (ur, ru) [TODO: add (su, us)]
+        push!(pairs, (source=receiver(smr), target=universe(smr))) # ur
+        push!(pairs, (source=universe(smr), target=receiver(smr))) # ru
+    else
+        # generic smr: (rs, ms, mm, rm)
+        push!(pairs, (source=sender(smr), target=receiver(smr))) # rs
+        push!(pairs, (source=sender(smr), target=mediator(smr))) # sm
+        push!(pairs, (source=mediator(smr), target=mediator(smr))) # mm
+        push!(pairs, (source=mediator(smr), target=receiver(smr))) # mr
+    end
+    return pairs
 end
 
 """
