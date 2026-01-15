@@ -61,7 +61,7 @@ end
 function crop_to_receiver(v::AbstractVector, smr::SMRSystem, total_volume::GlaVol)
     r = receiver(smr)
     receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, total_volume)
-    v_tens = reshape(v, size(total_volume)..., :)
+    v_tens = reshape(v, total_volume.cel..., :)
     cropped_tens = view(v_tens, receiver_mask..., :)
     return vec(cropped_tens)
 end
