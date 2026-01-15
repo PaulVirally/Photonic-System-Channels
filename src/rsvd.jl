@@ -35,7 +35,7 @@ function asym_ur(G₀_uu::VacuumGreensOperator, smr::SMRSystem)
     s = sender(smr)
     r = receiver(smr)
     G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
-    union_volume = G₀_ur.mem.srcVol # srcVol == trgVol
+    union_volume = G₀_uu.mem.srcVol # srcVol == trgVol
     sender_mask = GilaElectromagnetics.GilaOperators.mskRng(s, union_volume) # Mask for sender region within the union volume
     receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, union_volume) # Mask for receiver region within the union volume
     disjoint_union_projector_action(x_union::AbstractArray{ComplexF64, 4}) = begin
