@@ -53,7 +53,7 @@ function asym_ur(G₀_uu::VacuumGreensOperator, smr::SMRSystem)
         copyto!(w, vec(out_tens))
         return w
     end
-    projector =  LinearMap{ComplexF64}(vec_action!, vec_aqction!, size(G₀_uu)...; ismutating=true)
+    projector =  LinearMap{ComplexF64}(vec_action!, vec_action!, size(G₀_uu)...; ismutating=true)
     G₀ = LinearMap(G₀_uu)
     return (G₀ * projector - projector * G₀') / (2im) # Note that projector is orthogonal
 end
