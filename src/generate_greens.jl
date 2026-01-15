@@ -34,5 +34,10 @@ function generate_greens()
     load_greens_function(compute_env, smr, Design, Design)
     run_gc()
 
+    # receiver -> receiver
+    @info string(now()) * " [generate_greens::generate_greens] Generating receiver -> receiver Greens function"
+    load_greens_function(compute_env, smr, Receiver, Receiver)
+    run_gc()
+
     @info string(now()) * " [generate_greens::generate_greens] Completed Greens function generation"
 end

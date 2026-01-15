@@ -66,6 +66,8 @@ function crop_to_receiver(v::AbstractVector, smr::SMRSystem, total_volume::GlaVo
     return vec(cropped_tens)
 end
 
+asym(x) = (x - x') / (2im)
+
 function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
     fname = file_prefix(smr)
     jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
@@ -108,6 +110,16 @@ function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd
 
     # @info string(now()) * " [rsvd::generate_rsvd] Saving RSVD to $(jld_path)"
     # _save_rsvd(out, jld_path, jld_key)
+
+    @info string(now()) * " [rsvd::generate_rsvd] Computing constraint asymmetry eigen decomposition"
+    χ = susceptibility(smr)
+    @info string(now()) * " [rsvd::generate_rsvd] Loading G₀_rr operator"
+    G₀_rr = load_greens_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
+    A = imag(inv(χ)) - asym(LinearMap(G₀_rr))
+    @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(A)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+    out = reigen_hermitian(A, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+    @info string(now()) * " [rsvd::generate_rsvd] Saving constraint asymmetry reigen to $(jld_path)"
+    _save_reigen_hermitian(out.vectors, out.values, jld_path, "constraint_asym/")
 end
 
 function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, jld_key::String)
