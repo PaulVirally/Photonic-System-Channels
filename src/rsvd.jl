@@ -115,7 +115,7 @@ function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd
     χ = susceptibility(smr)
     @info string(now()) * " [rsvd::generate_rsvd] Loading G₀_rr operator"
     G₀_rr = load_greens_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
-    A = imag(inv(χ)) - asym(LinearMap(G₀_rr))
+    A = imag(inv(χ))*I - asym(LinearMap(G₀_rr))
     @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(A)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
     out = reigen_hermitian(A, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
     @info string(now()) * " [rsvd::generate_rsvd] Saving constraint asymmetry reigen to $(jld_path)"
