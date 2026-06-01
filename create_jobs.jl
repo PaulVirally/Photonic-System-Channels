@@ -10,7 +10,7 @@ using Dates
 # `julia create_jobs.jl > job_launcher.sh` and copy it over to the cluster of
 # your choice to run it with `bash job_launcher.sh`.
 
-const PROJECT_NAME = "heat-transfer_sep_4x4x0p5"
+const PROJECT_NAME = "heat-transfer_sep_2x2x0p5"
 
 # Molering config
 const MOLERING_UNAME = "paulv"
@@ -23,7 +23,8 @@ const MOLERING_SCRATCH_DIR = "/home/molering/fatmole/$(MOLERING_UNAME)/Photonic-
 const CC_UNAME = "pvirally"
 const CC_DEFAULT_GROUP_NAME = "def-smolesky"
 const CC_RRG_NAME = "rrg-smolesky"
-const CC_RRG_CLUSTERS = ["narval"]
+# const CC_RRG_CLUSTERS = ["narval"]
+const CC_RRG_CLUSTERS = [] # The RRG doesn't work anymore :(
 const CC_CODE_DIR = "/home/$(CC_UNAME)/Photonic-System-Channels/"
 const CC_PRELOAD_DIR = "/home/$(CC_UNAME)/scratch/preload/"
 const CC_SCRATCH_DIR = "/home/$(CC_UNAME)/scratch/Photonic-System-Channels/"
@@ -257,7 +258,8 @@ function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
         rsvd_time_s_A6000 = TIME_PADDING * (1.4917e-8 * (2 + 2q)*(k+p)*max_vol*log2(max_vol) + 71.3435)
         return rsvd_time_s_A6000 * num_pairs
     elseif job_type == ComputeBounds
-        bounds_time_s_A6000 = 0.0 # empirical formula
+        # bounds_time_s_A6000 = 0.0 # empirical formula
+        bounds_time_s_A6000 = 5*60 # It's like 1 minute, but 5 mins is fine
         return bounds_time_s_A6000
     end
     error("Unknown job type: $job_type")
@@ -273,7 +275,9 @@ function memory_GB(job_type::JobType, smr::SMRSystem, params::RSVDParams)
         memory_GB = ceil(Int, MEMORY_PADDING * (307.4977255*(k+p)*max_vol + 1.955629444e9) * 1e-9) # empirical formula
         return memory_GB
     elseif job_type == ComputeBounds
-        memory_GB = 0.0 # empirical formula
+        k = params.rank
+        p = params.oversamples
+        memory_GB = ceil(Int, MEMORY_PADDING * (307.4977255*(k+p)*max_vol + 1.955629444e9) * 1e-9) # empirical formula (just copied from RSVD, not actually tested)
         return memory_GB
     end
     error("Unknown job type: $job_type")
@@ -414,22 +418,23 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
     return script
 end
 
-num_experiments = 3
-separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
+# num_experiments = 101
+# separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
+separations = [4//32]
 num_experiments = length(separations)
 
 print(job_launcher_script(
-    [GenerateGreens, GenerateRSVD],
+    [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
     ClusterConfig("narval"),
-    repeat([(16, 64, 64)], num_experiments), # sender cells: 0.5×4×4 λ³
+    repeat([(16, 64, 64)], num_experiments), # sender cells: 0.5×2×2 λ³
     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
     repeat([(16, 64, 64)], num_experiments), # receiver cells, same as sender
     repeat([nothing], num_experiments), # sm separations (SR system)
     repeat([nothing], num_experiments), # mr separations (SR system)
     [(sep, 0//1, 0//1) for sep in separations], # rs separations
     repeat([1//32], num_experiments), # scales
-    repeat([14.6+0.05im], num_experiments), # chis
-    repeat([64], num_experiments), # RSVD target ranks
-    repeat([15], num_experiments), # RSVD oversamples
+    repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
+    repeat([510], num_experiments), # RSVD target ranks
+    repeat([50], num_experiments), # RSVD oversamples
     repeat([14], num_experiments) # RSVD power iters
 ))
