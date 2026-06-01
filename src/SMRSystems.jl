@@ -2,7 +2,7 @@ module SMRSystems
 
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
 export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
-export load_greens_function, file_prefix, fix_mask
+export load_greens_function, file_prefix
 
 using GilaElectromagnetics
 using Serialization
@@ -83,9 +83,9 @@ universe_regions(system::SMRSystem) = design_regions(system)
 susceptibility(system::SMRSystem) = χ(system)
 chi(system::SMRSystem) = χ(system)
 
-ms_separation(system::SMRSystem) = abs.(sender(system).org .- mediator(system).org)
-rm_separation(system::SMRSystem) = abs.(mediator(system).org .- receiver(system).org)
-rs_separation(system::SMRSystem) = abs.(sender(system).org .- receiver(system).org)
+ms_separation(system::SMRSystem) = sender(system).org .- mediator(system).org
+rm_separation(system::SMRSystem) = mediator(system).org .- receiver(system).org
+rs_separation(system::SMRSystem) = sender(system).org .- receiver(system).org
 
 function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3, Rational{Int}}, mediator_num_cells::NTuple{3, Int}, mr_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64)
     sender_center_wl = (0//1, 0//1, 0//1)
@@ -93,10 +93,10 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3,
     sm_dir = (1, 0, 0) # Assume separation along x-axis
 
     mediator_size_wl = mediator_num_cells .* scale
-    mediator_center_wl = sender_center_wl .+ (sender_size_wl .// 2) .* sm_dir .+ abs.(sm_separation_wl) .+ (mediator_size_wl .// 2) .* sm_dir # Silently ignore negative separations
+    mediator_center_wl = sender_center_wl .+ sender_size_wl .* sm_dir .+ sm_separation_wl
 
     mr_dir = (1, 0, 0) # Assume separation along x-axis
-    receiver_center_wl = mediator_center_wl .+ (mediator_size_wl .// 2) .* mr_dir .+ abs.(mr_separation_wl) .+ (receiver_num_cells .* scale .// 2) .* mr_dir # Silently ignore negative separations
+    receiver_center_wl = mediator_center_wl .+ mediator_size_wl .* mr_dir .+ mr_separation_wl
 
     sender_volume = GlaVol(sender_num_cells, (scale, scale, scale), sender_center_wl)
     mediator_volume = GlaVol(mediator_num_cells, (scale, scale, scale), mediator_center_wl)
@@ -123,8 +123,7 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
     sender_size_wl = sender_num_cells .* scale
     rs_dir = (1, 0, 0) # Assume separation along x-axis
 
-    receiver_size_wl = receiver_num_cells .* scale
-    receiver_center_wl = sender_center_wl .+ (sender_size_wl .// 2) .* rs_dir .+ abs.(rs_separation_wl) .+ (receiver_size_wl .// 2) .* rs_dir # Silently ignore negative separations
+    receiver_center_wl = sender_center_wl .+ sender_size_wl .* rs_dir .+ rs_separation_wl
 
     sender_volume = GlaVol(sender_num_cells, (scale, scale, scale), sender_center_wl)
     receiver_volume = GlaVol(receiver_num_cells, (scale, scale, scale), receiver_center_wl)
@@ -136,8 +135,6 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
             push!(design_volumes, sender_volume)
         elseif region == Receiver
             push!(design_volumes, receiver_volume)
-        else
-            @warn "Region $region cannot be part of the design because there is only a sender and receiver (no mediator) in this system. Ignoring region $region for design volume."
         end
     end
     design_volume = union(design_volumes...)
@@ -217,18 +214,6 @@ function volume_pairs(smr::SMRSystem)
     return pairs
 end
 
-function fix_mask(mask::StepRange{Int})
-    if mask.start > 0 && mask.stop > 0
-        return mask
-    end
-    @info string(now()) * " [rsvd::fix_mask] Detected mask with non-positive start or stop: $(mask). Fixing..."
-    new_start = max(1, abs(mask.start))
-    new_stop = max(1, abs(mask.stop))
-    new_step = abs(mask.step)
-    @info string(now()) * " [rsvd::fix_mask] New mask: $(new_start):$(new_step):$(new_stop)"
-    return new_start:new_step:new_stop
-end
-
 """
     load_greens_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol)
 
@@ -260,8 +245,6 @@ function load_greens_function(environment::ComputeEnvironment, system::SMRSystem
         if volumes_overlap
             source_mask = GilaElectromagnetics.GilaOperators.mskRng(target_volume, source_volume)
             target_mask = GilaElectromagnetics.GilaOperators.mskRng(source_volume, target_volume)
-            fixed_source_mask = fix_mask.(source_mask)
-            fixed_target_mask = fix_mask.(target_mask)
         else
             source_mask = (0:0, 0:0, 0:0)
             target_mask = (0:0, 0:0, 0:0)
