@@ -2,6 +2,22 @@ using Dates
 using Serialization
 using ArgParse
 
+function ArgParse.parse_item(::Type{GPUChoice}, x::AbstractString)
+    s = lowercase(String(x))
+
+    if s in ("true", "t", "yes", "y")
+        return GPUChoice(true, 0)
+    elseif s in ("false", "f", "no", "n")
+        return GPUChoice(false, -1)
+    else
+        try
+            return GPUChoice(true, parse(Int, s))
+        catch
+            error("Invalid GPU argument '$x'. Use true/false or an integer GPU device index.")
+        end
+    end
+end
+
 function parse_3tuple(s::AbstractString, conv::Function)
     inner = strip(s)
     inner = strip(inner, ['(', ')'])
@@ -62,9 +78,9 @@ function _default_scratch_dir(project_name::AbstractString)
 end
 function _default_gpu()
     if haskey(ENV, "MOLERING") || haskey(ENV, "CC_CLUSTER")
-        return true
+        return GPUChoice(true, 0)
     end
-    return false
+    return GPUChoice(false, -1)
 end
 
 function ArgParse.parse_args()
@@ -135,7 +151,7 @@ function ArgParse.parse_args()
 
         "--gpu"
             help = "Use GPU acceleration"
-            arg_type = Bool
+            arg_type = GPUChoice
             default = _default_gpu()
 
         "--components"
@@ -226,3 +242,6 @@ function run_gc()
     GC.gc()
     GC.gc()
 end
+
+asym(X) = (X - X') / (2im)
+sym(X) = (X + X') / 2
