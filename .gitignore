@@ -66,3 +66,4 @@ bench/*.png
 bench/*.jld2
 
 jobs/
+projects/
