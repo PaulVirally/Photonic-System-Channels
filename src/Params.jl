@@ -1,7 +1,12 @@
 module Params
 
-export RSVDParams, rank, oversamples, power_iter
-export ComputeEnvironment, preload_dir, project_dir, scratch_dir, use_gpu
+export RSVDParams, rank, oversamples, power_iter, GPUChoice
+export ComputeEnvironment, preload_dir, project_dir, scratch_dir, use_gpu, gpu_device
+
+struct GPUChoice
+    use_gpu::Bool
+    id::Int
+end
 
 """
     RSVDParams
@@ -38,12 +43,13 @@ struct ComputeEnvironment
     preload_dir::String
     project_dir::String
     scratch_dir::String
-    use_gpu::Bool
+    gpu_choice::GPUChoice
 end
 
 preload_dir(env::ComputeEnvironment) = env.preload_dir
 project_dir(env::ComputeEnvironment) = env.project_dir
 scratch_dir(env::ComputeEnvironment) = env.scratch_dir
-use_gpu(env::ComputeEnvironment) = env.use_gpu
+use_gpu(env::ComputeEnvironment) = env.gpu_choice.use_gpu
+gpu_device(env::ComputeEnvironment) = env.gpu_choice.id
 
 end # module
