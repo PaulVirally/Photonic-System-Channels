@@ -10,7 +10,7 @@ using Dates
 # `julia create_jobs.jl > job_launcher.sh` and copy it over to the cluster of
 # your choice to run it with `bash job_launcher.sh`.
 
-const PROJECT_NAME = "heat-transfer_sep_2x2x0p5"
+const PROJECT_NAME = "heat-transfer_sep_2x2x0p5_512comps"
 
 # Molering config
 const MOLERING_UNAME = "paulv"
@@ -112,7 +112,7 @@ function ClusterConfig(server::AbstractString)
                              9.7, # NVIDIA A100SXM4 40GB FP64 TFLOPS
                              40, # Max VRAM in GB
                              CC_PRELOAD_DIR,
-                             server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/",
+                             server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/",
                              CC_SCRATCH_DIR,
                              CC_CODE_DIR)
     elseif server == "fir"
@@ -122,7 +122,7 @@ function ClusterConfig(server::AbstractString)
                              34.0, # NVIDIA A40 FP64 TFLOPS
                              80, # Max VRAM in GB
                              CC_PRELOAD_DIR,
-                             server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/",
+                             server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/",
                              CC_SCRATCH_DIR,
                              CC_CODE_DIR)
     end
@@ -130,9 +130,9 @@ function ClusterConfig(server::AbstractString)
 end
 
 function gpu_string(cluster::ClusterConfig, memory_GB::Int)
-    if memory_GB > cluster.max_vram_GB
-        error("Requested memory $(memory_GB) GB exceeds max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)")
-    end
+    # if memory_GB > cluster.max_vram_GB
+    #     error("Requested memory $(memory_GB) GB exceeds max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)")
+    # end
     if cluster.name == "narval"
         if memory_GB < 5
             return "a100_1g.5gb"
@@ -325,7 +325,7 @@ function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSyste
     --chdir=$(cluster.code_dir) \\
 """
     if job in [GenerateRSVD, ComputeBounds] # Use GPU for RSVD generation and bounds computation
-        header *= """    --gres=gpu:$(gpu_string(cluster, memory_GB)):1 \\\n"""
+        header *= """    --gpus=$(gpu_string(cluster, memory_GB)):1 \\\n"""
     end
     header *= """    --export=ALL \\
     <<EOF
@@ -390,8 +390,11 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
 
         max_job_memory = maximum(max(4, ceil(Int, memory_GB(job_type, smr, rsvd_params))) for job_type in jobs) # Max memory across all jobs for this experiment
         if max_job_memory > cluster.max_vram_GB
-            @warn "Skipping experiment $(experiment_name(smr)) because required memory $(max_job_memory) GB exceeds max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)"
-            continue
+            # @warn "Skipping experiment $(experiment_name(smr)) because required memory $(max_job_memory) GB exceeds max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)"
+            # continue
+
+            @warn "VRAM for $(experiment_name(smr)) is $(max_job_memory) GB exceeding max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)"
+            max_job_memory = cluster.max_vram_GB
         end
 
         # For each job type, add the corresponding job submission command
@@ -399,6 +402,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
             if !(job_type in jobs) continue end
 
             memory = max(4, ceil(Int, memory_GB(job_type, smr, rsvd_params))) # We should always request at least 4 GB
+            memory = min(memory, cluster.max_vram_GB) # Cap memory at cluster max VRAM
             time = max(10*60, ceil(Int, time_s(job_type, smr, rsvd_params) * gpu_compute_fraction(gpu_string(cluster, memory)))) # Adjust time based on GPU compute fraction, minimum 10 minutes
             num_cores = cluster.name == "fir" ? 6 : 4 # fir has 6-core nodes, everything else works fine with 4 cores (molering runs with all available cores)
 
@@ -409,7 +413,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
             script *= header
 
             job_args = args(smr, rsvd_params)
-            script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args \n"
+	    script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/\n"
 
             script *= footer
         end
@@ -420,12 +424,15 @@ end
 
 # num_experiments = 101
 # separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
-separations = [4//32]
+separations = [1//32]
+# separations = collect(1:16) .// 32
 num_experiments = length(separations)
+# cluster = ClusterConfig("narval")
+cluster = ClusterConfig("molering")
 
-print(job_launcher_script(
+command = job_launcher_script(
     [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
-    ClusterConfig("narval"),
+    cluster,
     repeat([(16, 64, 64)], num_experiments), # sender cells: 0.5×2×2 λ³
     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
     repeat([(16, 64, 64)], num_experiments), # receiver cells, same as sender
@@ -434,7 +441,19 @@ print(job_launcher_script(
     [(sep, 0//1, 0//1) for sep in separations], # rs separations
     repeat([1//32], num_experiments), # scales
     repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
-    repeat([510], num_experiments), # RSVD target ranks
+    repeat([512], num_experiments), # RSVD target ranks
     repeat([50], num_experiments), # RSVD oversamples
     repeat([14], num_experiments) # RSVD power iters
-))
+)
+
+print(command)
+open("launch_$(PROJECT_NAME).sh", "w") do f
+    write(f, command)
+end
+println("Job launcher script written to launch_$(PROJECT_NAME).sh")
+if cluster.has_slurm
+    println("Copy the launch script to the cluster: `scp launch_$(PROJECT_NAME).sh \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(CC_CODE_DIR)jobs/\"`")
+    println("Then run it on the cluster with `bash launch_$(PROJECT_NAME).sh")
+else
+    println("Run the launch script with `bash launch_$(PROJECT_NAME).sh`")
+end
