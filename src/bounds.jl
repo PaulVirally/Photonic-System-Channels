@@ -1,6 +1,6 @@
 using GilaElectromagnetics
 using CUDA
-using Plots: right
+using Plots
 using Dates
 using LinearAlgebra
 using Roots
@@ -11,7 +11,7 @@ using Plots
 using KrylovKit
 using NLopt
 using Random
-using .Projectors
+# using .Projectors
 using MatrixFreeRandomizedLinearAlgebra
 
 function midpoint(left::T, right::T) where T <: Real
