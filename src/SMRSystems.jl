@@ -85,7 +85,15 @@ chi(system::SMRSystem) = χ(system)
 
 ms_separation(system::SMRSystem) = abs.(sender(system).org .- mediator(system).org)
 rm_separation(system::SMRSystem) = abs.(mediator(system).org .- receiver(system).org)
-rs_separation(system::SMRSystem) = abs.(sender(system).org .- receiver(system).org)
+function rs_separation(system::SMRSystem)
+    rs_dir = (1, 0, 0) # Assume separation along x-axis
+    snd, rcv = sender(system), receiver(system)
+    center_to_center = abs.(snd.org .- rcv.org)
+    snd_size = snd.cel .* snd.scl
+    rcv_size = rcv.cel .* rcv.scl
+    half_extents = ((snd_size .+ rcv_size) .// 2) .* rs_dir
+    return center_to_center .- half_extents
+end
 
 function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3, Rational{Int}}, mediator_num_cells::NTuple{3, Int}, mr_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64)
     sender_center_wl = (0//1, 0//1, 0//1)
