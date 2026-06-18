@@ -72,13 +72,13 @@ end
 #     return 1/(2im) * (u_projector * G₀ * r_projector - r_projector * G₀' * u_projector)
 # end
 
-function asym_ur(G₀_ru::MultiRegionVacuumGreenOperator, smr::SMRSystem)
+function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr::SMRSystem)
     # We want to compute the action of Asym(G⁰ᵣᵤ), but this operator is ambiguously defined. Here we write out it's definition.
     # Let ιᵣ be the inclusion of the receiver region into the universe, then define
     # Ĝ⁰ᵣᵤ = ιᵣ G⁰ᵣᵤ which is an operator that maps from the universe to the universe, but is zero outside of the receiver region:
     # Ĝ⁰ᵣᵤ = [0 0; G⁰ᵣₛ G⁰ᵣᵣ]
     # We can now formally define Asym(G⁰ᵣᵤ) = Asym(Ĝ⁰ᵣᵤ) = (Ĝ⁰ᵣᵤ - Ĝ⁰ᵣᵤ')/(2im):
-    # Asym(G⁰ᵣᵤ) = [0 -1/2im G⁰ᵣₛ'; G⁰ᵣₛ Asym(G⁰ᵣᵣ)]
+    # Asym(G⁰ᵣᵤ) = [0 -1/2im G⁰ᵣₛ'; 1/2im G⁰ᵣₛ Asym(G⁰ᵣᵣ)]
     # Here it is in code:
     s = sender(smr)
     r = receiver(smr)
@@ -93,19 +93,41 @@ function asym_ur(G₀_ru::MultiRegionVacuumGreenOperator, smr::SMRSystem)
         copyto!(view(r_included_in_u, sender_size .+ (1:receiver_size)), r_only)
         return r_included_in_u
     end
-    receiver_inclusion = LinearMap{ComplexF64}(receiver_inclusion_action!, receiver_inclusion_action!, sender_size + receiver_size, receiver_size; ismutating=true)
+
+    # Define ιₛ: the inclusion of the sender region into the universe
+    sender_inclusion_action!(s_included_in_u::AbstractVector{ComplexF64}, s_only::AbstractVector{ComplexF64}) = begin
+        fill!(s_included_in_u, zero(eltype(s_included_in_u)))
+        # our convention is [sender; receiver]
+        copyto!(view(s_included_in_u, 1:sender_size), s_only)
+        return s_included_in_u
+    end
 
     # Define the clipping operator that takes a vector defined on the universe and extracts only the receiver part
     receiver_clip_action!(r_clipped::AbstractVector{ComplexF64}, u_vec::AbstractVector{ComplexF64}) = begin
+        # our convention is [sender; receiver]
         copyto!(r_clipped, view(u_vec, 1:receiver_size))
         return r_clipped
     end
-    receiver_clip = LinearMap{ComplexF64}(receiver_clip_action!, receiver_clip_action!, receiver_size, sender_size + receiver_size; ismutating=true)
 
-    G₀_ru_adj = LinearMap(adjoint(G₀_ru)) # Maps from receiver to universe
-    G₀_ru = LinearMap(G₀_ru) # Also maps from receiver to universe
+    # Define the clipping operator that takes a vector defined on the universe and extracts only the sender part
+    sender_clip_action!(s_clipped::AbstractVector{ComplexF64}, u_vec::AbstractVector{ComplexF64}) = begin
+        # our convention is [sender; receiver]
+        copyto!(s_clipped, view(u_vec, sender_size .+ (1:receiver_size)))
+        return s_clipped
+    end
 
-    asym_G₀_ru = 1/2im * (receiver_inclusion * G₀_ru - G₀_ru_adj * receiver_clip)
+    receiver_inclusion = LinearMap{ComplexF64}(receiver_inclusion_action!, receiver_clip_action!, sender_size + receiver_size, receiver_size; ismutating=true)
+    sender_inclusion = LinearMap{ComplexF64}(sender_inclusion_action!, sender_clip_action!, sender_size + receiver_size, sender_size; ismutating=true)
+    receiver_clip = LinearMap{ComplexF64}(receiver_clip_action!, receiver_inclusion_action!, receiver_size, sender_size + receiver_size; ismutating=true)
+    sender_clip = LinearMap{ComplexF64}(sender_clip_action!, sender_inclusion_action!, sender_size, sender_size + receiver_size; ismutating=true)
+
+    G₀_rs = LinearMap(G₀_rs) # Maps from sender to receiver
+    Π_s = sender_clip # Projects from universe to sender
+    Π_r = receiver_clip # Projects from universe to receiver
+    ι_r = receiver_inclusion # Includes receiver into universe
+
+    asym_G₀_rr = LinearMap(AsymVacuumGreenOperator(G₀_rr)) # twice as efficient as (G₀_rr - G₀_rr')/(2im)
+    asym_G₀_ru = asym(ι_r * G₀_rs * Π_s) + ι_r * asym_G₀_rr * Π_r
     return asym_G₀_ru
 end
 
@@ -169,8 +191,10 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
     @info string(now()) * " [rsvd::generate_rsvd] Loading G₀ operators"
     # G₀_uu = load_green_function(compute_env, smr, Design, Design) # universe -> universe
     # G₀_ur_asym = asym_ur(G₀_uu, smr)
-    G₀_ru = load_green_function(compute_env, smr, [Receiver], [Sender, Receiver]) # universe -> receiver
-    G₀_ur_asym = asym_ur(G₀_ru, smr)
+    # G₀_ru = load_green_function(compute_env, smr, [Receiver], [Sender, Receiver]) # universe -> receiver
+    G₀_rs = load_green_function(compute_env, smr, Receiver, Sender) # sender -> receiver
+    G₀_rr = load_green_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
+    G₀_ur_asym = asym_ur(G₀_rs, G₀_rr, smr)
     sample_vec = zeros(ComplexF64, 0)
     if use_gpu(compute_env)
         sample_vec = CuArray(sample_vec)
