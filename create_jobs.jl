@@ -10,7 +10,15 @@ using Dates
 # `julia create_jobs.jl > job_launcher.sh` and copy it over to the cluster of
 # your choice to run it with `bash job_launcher.sh`.
 
-const PROJECT_NAME = "heat-transfer_sep_2x2x0p5_512comps"
+# const PROJECT_NAME = "heat-transfer_sep_2x2x0p5_512comps"
+# const PROJECT_NAME = "SM_metasurface_2x2x0p5_400comps"
+
+# const PROJECT_NAME = "metasurface_1x2x2_700comps_50oversamples"
+# const PROJECT_NAME = "metasurface_1x3x3_115comps_50oversamples"
+# const PROJECT_NAME = "metasurface_1x2x2_320comps_50oversamples"
+const PROJECT_NAME = "metasurface_1x1x1_1350comps_50oversamples"
+
+# const PROJECT_NAME = "waveguide_0p25x1x1_@0p125_800comps_50oversamples"
 
 # Molering config
 const MOLERING_UNAME = "paulv"
@@ -41,7 +49,7 @@ const ORDERED_JOBS = [GenerateGreens, GenerateRSVD, ComputeBounds]
 
 function main_file(job::JobType)
     if job == GenerateGreens
-        return "generate_greens.jl"
+        return "generate_green.jl"
     elseif job == GenerateRSVD
         return "generate_rsvd.jl"
     elseif job == ComputeBounds
@@ -210,7 +218,7 @@ function heat_transfer_args(smr::SMRSystem, params::RSVDParams)
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "rs" # Design the entire region
-    return "--sender $(sender_string) --receiver $(receiver_string) --rs-sep $(rs_sep_string) --scale $(scale_string) --chi $(chi_string) --design $(design_string) --gpu true --components $(params.rank) --oversamples $(params.oversamples) --power-iterations $(params.power_iter) --name $(name_string)"
+    return "--sender $(sender_string) --receiver $(receiver_string) --rs-sep $(rs_sep_string) --scale $(scale_string) --chi $(chi_string) --design $(design_string) --components $(params.rank) --oversamples $(params.oversamples) --power-iterations $(params.power_iter) --name $(name_string)"
 end
 
 function smr_args(smr::SMRSystem, params::RSVDParams)
@@ -228,7 +236,7 @@ function smr_args(smr::SMRSystem, params::RSVDParams)
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "m" # Design the mediator region
-    return "--sender $(sender_string) --mediator $(mediator_string) --receiver $(receiver_string) --sm-sep $(sm_sep_string) --mr-sep $(mr_sep_string) --scale $(scale_string) --chi $(chi_string) --design $(design_string) --gpu true --components $(params.rank) --oversamples $(params.oversamples) --power-iterations $(params.power_iter) --name $(name_string)"
+    return "--sender $(sender_string) --mediator $(mediator_string) --receiver $(receiver_string) --sm-sep $(sm_sep_string) --mr-sep $(mr_sep_string) --scale $(scale_string) --chi $(chi_string) --design $(design_string) --components $(params.rank) --oversamples $(params.oversamples) --power-iterations $(params.power_iter) --name $(name_string)"
 end
 
 function args(smr::SMRSystem, params::RSVDParams)
@@ -250,7 +258,7 @@ function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
     num_pairs = length(volume_pairs(smr)) # Number of source-target volume pairs
     if job_type == GenerateGreens
         g0_time_s_A6000 = TIME_PADDING * (max_vol * log2(max_vol) * 2.147823889114151e-6 + 37.68202102148491) # empirical formula
-        return g0_time_s_A6000 * num_pairs
+	return g0_time_s_A6000 * num_pairs + 30*60 # throw in an extra 30 mins to G0 generation because why not (it runs only on CPU so the digitial alliance people don't send angry e-mails to me about these types of jobs, so we can just throw in more time)
     elseif job_type == GenerateRSVD
         q = params.power_iter
         k = params.rank
@@ -259,7 +267,7 @@ function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
         return rsvd_time_s_A6000 * num_pairs
     elseif job_type == ComputeBounds
         # bounds_time_s_A6000 = 0.0 # empirical formula
-        bounds_time_s_A6000 = 5*60 # It's like 1 minute, but 5 mins is fine
+        bounds_time_s_A6000 = 20*60 # It's like 1 minute, but 20 mins is fine
         return bounds_time_s_A6000
     end
     error("Unknown job type: $job_type")
@@ -330,8 +338,8 @@ function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSyste
     header *= """    --export=ALL \\
     <<EOF
 #!/bin/bash
-module load StdEnv/2023 julia/1.11.3 cuda/12.2
-srun """
+module load StdEnv/2023 julia/1.12.5 cuda/12.2
+srun julia --project=. -E 'using CUDA; CUDA.set_runtime_version!(v"12.2", local_toolkit=true)'; """
     footer = """EOF
 )
 $var_name=\${$var_name##* }
@@ -403,7 +411,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
 
             memory = max(4, ceil(Int, memory_GB(job_type, smr, rsvd_params))) # We should always request at least 4 GB
             memory = min(memory, cluster.max_vram_GB) # Cap memory at cluster max VRAM
-            time = max(10*60, ceil(Int, time_s(job_type, smr, rsvd_params) * gpu_compute_fraction(gpu_string(cluster, memory)))) # Adjust time based on GPU compute fraction, minimum 10 minutes
+	    time = max(10*60, ceil(Int, time_s(job_type, smr, rsvd_params) * (job_type == GenerateGreens ? 1 : gpu_compute_fraction(gpu_string(cluster, memory))))) # Adjust time based on GPU compute fraction, minimum 10 minutes
             num_cores = cluster.name == "fir" ? 6 : 4 # fir has 6-core nodes, everything else works fine with 4 cores (molering runs with all available cores)
 
             header, footer = "", ""
@@ -413,6 +421,11 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
             script *= header
 
             job_args = args(smr, rsvd_params)
+	    if job_type == GenerateGreens
+                job_args *= " --gpu false"
+	    else
+                job_args *= " --gpu true"
+	    end
 	    script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/\n"
 
             script *= footer
@@ -422,29 +435,52 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
     return script
 end
 
+cluster = ClusterConfig("narval")
+# cluster = ClusterConfig("molering")
+
+### Meta surface
 # num_experiments = 101
 # separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
-separations = [1//32]
-# separations = collect(1:16) .// 32
+# separations = [1//32]
+separations = reverse(collect(1:32) .// 16)
+# separations = [1//4, 2//4, 3//4, 4//4, 5//4, 6//4, 7//4, 8//4]
 num_experiments = length(separations)
-# cluster = ClusterConfig("narval")
-cluster = ClusterConfig("molering")
 
 command = job_launcher_script(
     [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
     cluster,
-    repeat([(16, 64, 64)], num_experiments), # sender cells: 0.5×2×2 λ³
+    repeat([(1*32, 1*32, 1*32)], num_experiments), # sender cells: 0.5×2×2 λ³
     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
-    repeat([(16, 64, 64)], num_experiments), # receiver cells, same as sender
+    repeat([(1*32, 1*32, 1*32)], num_experiments), # receiver cells, same as sender
     repeat([nothing], num_experiments), # sm separations (SR system)
     repeat([nothing], num_experiments), # mr separations (SR system)
     [(sep, 0//1, 0//1) for sep in separations], # rs separations
     repeat([1//32], num_experiments), # scales
     repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
-    repeat([512], num_experiments), # RSVD target ranks
+    repeat([1350], num_experiments), # RSVD target ranks
     repeat([50], num_experiments), # RSVD oversamples
     repeat([14], num_experiments) # RSVD power iters
 )
+
+### Waveguide
+
+# lengths = 8 .+ 0:2:(6*32)
+# num_experiments = length(lengths)
+# command = job_launcher_script(
+#     [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
+#     cluster,
+#     [(l, 1*32, 1*32) for l in lengths],
+#     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
+#     repeat([(8, 1*32, 1*32)], num_experiments), # receiver cells, same as sender
+#     repeat([nothing], num_experiments), # sm separations (SR system)
+#     repeat([nothing], num_experiments), # mr separations (SR system)
+#     repeat([(1//8, 0//1, 0//1)], num_experiments), # rs separation
+#     repeat([1//32], num_experiments), # scales
+#     repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
+#     repeat([800], num_experiments), # RSVD target ranks
+#     repeat([50], num_experiments), # RSVD oversamples
+#     repeat([14], num_experiments) # RSVD power iters
+# )
 
 print(command)
 open("launch_$(PROJECT_NAME).sh", "w") do f

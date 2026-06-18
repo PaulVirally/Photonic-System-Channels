@@ -2,7 +2,7 @@ module SMRSystems
 
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
 export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
-export load_greens_function, file_prefix, fix_mask
+export load_green_function, file_prefix, fix_mask
 
 using GilaElectromagnetics
 using Serialization
@@ -163,10 +163,10 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, mediator_num_cells::Union{N
 end
 
 # Generate the filename for the Green's function between the target and source volumes.
-function greens_fname(target_volume::GlaVol, source_volume::GlaVol)
+function green_fname(target_volume::GlaVol, source_volume::GlaVol)
     rational2str(r::Rational) = string(numerator(r), "ss", denominator(r))
     if target_volume == source_volume
-         # Self greens function
+         # Self green function
          which = "self"
          size = join(target_volume.cel, "x")
          scale = join(map(rational2str, target_volume.scl), "x")
@@ -238,7 +238,7 @@ function fix_mask(mask::StepRange{Int})
 end
 
 """
-    load_greens_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol)
+    load_green_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol)
 
 Load or generate the vacuum Green's function operator G₀ between the target and source volumes in the given SMR system, using the specified compute environment for file paths and GPU usage.
 
@@ -254,13 +254,13 @@ Load or generate the vacuum Green's function operator G₀ between the target an
 - `save_to_disk::Bool=true`: If true, saves the generated Green's function to disk.
 
 # Return
-- `G₀::VacuumGreensOperator`: The vacuum Green's function operator between the target and source volumes.
+- `G₀::VacuumGreenOperator`: The vacuum Green's function operator between the target and source volumes.
 """
-function load_greens_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol; force_generate::Bool=false, save_to_disk::Bool=true)
+function load_green_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol; force_generate::Bool=false, save_to_disk::Bool=true)
     target_volume = volume(system, target)
     source_volume = volume(system, source)
 
-    fname = greens_fname(target_volume, source_volume)
+    fname = green_fname(target_volume, source_volume)
     fpath = joinpath(preload_dir(environment), fname)
 
     if isfile(fpath) && !force_generate
@@ -274,33 +274,80 @@ function load_greens_function(environment::ComputeEnvironment, system::SMRSystem
             source_mask = (0:0, 0:0, 0:0)
             target_mask = (0:0, 0:0, 0:0)
         end
-        @info string(now()) * " [SMRSystem::load_greens_function] Loading G₀ from $(fpath)"
+        @info string(now()) * " [SMRSystem::load_green_function] Loading G₀ from $(fpath)"
         io = open(fpath, "r")
-        G₀ = VacuumGreensOperator(deserialize(io, VacuumGreensOperator).mem, source_mask, target_mask)
-        @info string(now()) * " [SMRSystem::load_greens_function] Loaded G₀"
+        G₀ = VacuumGreenOperator(deserialize(io, VacuumGreenOperator).mem, source_mask, target_mask)
+        @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
         close(io)
         if use_gpu(environment)
-            @info string(now()) * " [SMRSystem::load_greens_function] Moving G₀ to GPU"
+            @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
             useGpu!(G₀)
         end
-        @info string(now()) * " [SMRSystem::load_greens_function] Using G₀:" G₀
+        @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
         return G₀
     end
-    @info string(now()) * " [SMRSystem::load_greens_function] Generating G₀"
-    G₀ = VacuumGreensOperator(target_volume, source_volume)
-    @info string(now()) * " [SMRSystem::load_greens_function] Loaded G₀"
+    @info string(now()) * " [SMRSystem::load_green_function] Generating G₀"
+    G₀ = VacuumGreenOperator(target_volume, source_volume)
+    @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
     if save_to_disk
         mkpath(dirname(fpath))
-        @info string(now()) * " [SMRSystem::load_greens_function] Saving G₀ to $(fpath)"
+        @info string(now()) * " [SMRSystem::load_green_function] Saving G₀ to $(fpath)"
         io = open(fpath, "w")
         serialize(io, G₀)
         close(io)
     end
     if use_gpu(environment)
-        @info string(now()) * " [SMRSystem::load_greens_function] Moving G₀ to GPU"
+        @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
         useGpu!(G₀)
     end
-    @info string(now()) * " [SMRSystem::load_greens_function] Using G₀:" G₀
+    @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
+    return G₀
+end
+function load_green_function(environment::ComputeEnvironment, system::SMRSystem, targets::Vector{SMRVolumeSymbol}, source::Vector{SMRVolumeSymbol}; force_generate::Bool=false, save_to_disk::Bool=true)
+    target_is_design = false
+    if length(targets) > 1
+        target_is_design = true
+    end
+    source_is_design = false
+    if length(source) > 1
+        source_is_design = true
+    end
+    target_volume = target_is_design ? volume(system, Design) : volume(system, targets[1])
+    source_volume = source_is_design ? volume(system, Design) : volume(system, source[1])
+
+    fname = green_fname(target_volume, source_volume)
+    fpath = joinpath(preload_dir(environment), fname)
+
+    if isfile(fpath) && !force_generate
+        @info string(now()) * " [SMRSystem::load_green_function] Loading G₀ from $(fpath)"
+        io = open(fpath, "r")
+        G₀ = MultiRegionVacuumGreenOperator(deserialize(io))
+        @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
+        close(io)
+        if use_gpu(environment)
+            @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
+            useGpu!(G₀)
+        end
+        @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
+        return G₀
+    end
+    @info string(now()) * " [SMRSystem::load_green_function] Generating G₀"
+    target_volumes = [volume(system, t) for t in targets]
+    source_volumes = [volume(system, s) for s in source]
+    G₀ = MultiRegionVacuumGreenOperator(target_volumes, source_volumes)
+    @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
+    if save_to_disk
+        mkpath(dirname(fpath))
+        @info string(now()) * " [SMRSystem::load_green_function] Saving G₀ to $(fpath)"
+        io = open(fpath, "w")
+        serialize(io, G₀)
+        close(io)
+    end
+    if use_gpu(environment)
+        @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
+        useGpu!(G₀)
+    end
+    @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
     return G₀
 end
 

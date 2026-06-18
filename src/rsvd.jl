@@ -10,10 +10,10 @@ function generate_rsvd()
     compute_env, smr, rsvd_params = parse_args()
 
     if use_gpu(compute_env)
-        @info string(now()) * " [generate_greens::generate_greens] Using GPU acceleration on device $(gpu_device(compute_env))"
+        @info string(now()) * " [generate_green::generate_green] Using GPU acceleration on device $(gpu_device(compute_env))"
         CUDA.device!(gpu_device(compute_env))
     else
-        @info string(now()) * " [generate_greens::generate_greens] Using CPU computation"
+        @info string(now()) * " [generate_green::generate_green] Using CPU computation"
     end
 
     if isnothing(mediator(smr))
@@ -26,53 +26,90 @@ function generate_rsvd()
     return nothing
 end
 
-function asym_ur(G₀_uu::VacuumGreensOperator, smr::SMRSystem)
+# function asym_ur(G₀_uu::VacuumGreenOperator, smr::SMRSystem)
+#     s = sender(smr)
+#     r = receiver(smr)
+#     G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
+#     union_volume = G₀_uu.mem.srcVol # srcVol == trgVol
+#     if union(s, r) != union_volume
+#         @error "union_volume should be union(s, r) but it is not"
+#     end
+#     sender_mask = GilaElectromagnetics.GilaOperators.mskRng(s, union_volume) # Mask for sender region within the union volume
+#     sender_mask = fix_mask.(sender_mask)
+#     receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, union_volume) # Mask for receiver region within the union volume
+#     receiver_mask = fix_mask.(receiver_mask)
+#     disjoint_union_projector_action(x_union::AbstractArray{ComplexF64, 4}) = begin
+#         x = similar(x_union)
+#         fill!(x, zero(eltype(x)))
+#         copyto!(view(x, sender_mask..., :), view(x_union, sender_mask..., :))
+#         copyto!(view(x, receiver_mask..., :), view(x_union, receiver_mask..., :))
+#         # The output x now has nonzero entries only in the sender and receiver regions
+#         # that is, we've zeroed out the gap between s and r
+#         return x
+#     end
+#     vec_disjoint_union_projector_action!(w, v) = begin
+#         v_tens = reshape(v, glaSze(G₀_uu)[2])
+#         out_tens = disjoint_union_projector_action(v_tens)
+#         copyto!(w, vec(out_tens))
+#         return w
+#     end
+#     u_projector = LinearMap{ComplexF64}(vec_disjoint_union_projector_action!, vec_disjoint_union_projector_action!, size(G₀_uu)...; ismutating=true)
+#     r_projector_action(x_union::AbstractArray{ComplexF64, 4}) = begin
+#         x = similar(x_union)
+#         fill!(x, zero(eltype(x)))
+#         copyto!(view(x, receiver_mask..., :), view(x_union, receiver_mask..., :))
+#         # The output x now has nonzero entries only in the receiver region
+#         return x
+#     end
+#     vec_r_projector_action!(w, v) = begin
+#         v_tens = reshape(v, glaSze(G₀_uu)[2])
+#         out_tens = r_projector_action(v_tens)
+#         copyto!(w, vec(out_tens))
+#         return w
+#     end
+#     r_projector = LinearMap{ComplexF64}(vec_r_projector_action!, vec_r_projector_action!, size(G₀_uu)...; ismutating=true)
+#     G₀ = LinearMap(G₀_uu)
+#     return 1/(2im) * (u_projector * G₀ * r_projector - r_projector * G₀' * u_projector)
+# end
+
+function asym_ur(G₀_ru::MultiRegionVacuumGreenOperator, smr::SMRSystem)
+    # We want to compute the action of Asym(G⁰ᵣᵤ), but this operator is ambiguously defined. Here we write out it's definition.
+    # Let ιᵣ be the inclusion of the receiver region into the universe, then define
+    # Ĝ⁰ᵣᵤ = ιᵣ G⁰ᵣᵤ which is an operator that maps from the universe to the universe, but is zero outside of the receiver region:
+    # Ĝ⁰ᵣᵤ = [0 0; G⁰ᵣₛ G⁰ᵣᵣ]
+    # We can now formally define Asym(G⁰ᵣᵤ) = Asym(Ĝ⁰ᵣᵤ) = (Ĝ⁰ᵣᵤ - Ĝ⁰ᵣᵤ')/(2im):
+    # Asym(G⁰ᵣᵤ) = [0 -1/2im G⁰ᵣₛ'; G⁰ᵣₛ Asym(G⁰ᵣᵣ)]
+    # Here it is in code:
     s = sender(smr)
     r = receiver(smr)
-    G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
-    union_volume = G₀_uu.mem.srcVol # srcVol == trgVol
-    if union(s, r) != union_volume
-        @error "union_volume should be union(s, r) but it is not"
+
+    sender_size = prod(s.cel)*3
+    receiver_size = prod(r.cel)*3
+
+    # Define ιᵣ: the inclusion of the receiver region into the universe
+    receiver_inclusion_action!(r_included_in_u::AbstractVector{ComplexF64}, r_only::AbstractVector{ComplexF64}) = begin
+        fill!(r_included_in_u, zero(eltype(r_included_in_u)))
+        # our convention is [sender; receiver]
+        copyto!(view(r_included_in_u, sender_size .+ (1:receiver_size)), r_only)
+        return r_included_in_u
     end
-    sender_mask = GilaElectromagnetics.GilaOperators.mskRng(s, union_volume) # Mask for sender region within the union volume
-    sender_mask = fix_mask.(sender_mask)
-    receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, union_volume) # Mask for receiver region within the union volume
-    receiver_mask = fix_mask.(receiver_mask)
-    disjoint_union_projector_action(x_union::AbstractArray{ComplexF64, 4}) = begin
-        x = similar(x_union)
-        fill!(x, zero(eltype(x)))
-        copyto!(view(x, sender_mask..., :), view(x_union, sender_mask..., :))
-        copyto!(view(x, receiver_mask..., :), view(x_union, receiver_mask..., :))
-        # The output x now has nonzero entries only in the sender and receiver regions
-        # that is, we've zeroed out the gap between s and r
-        return x
+    receiver_inclusion = LinearMap{ComplexF64}(receiver_inclusion_action!, receiver_inclusion_action!, sender_size + receiver_size, receiver_size; ismutating=true)
+
+    # Define the clipping operator that takes a vector defined on the universe and extracts only the receiver part
+    receiver_clip_action!(r_clipped::AbstractVector{ComplexF64}, u_vec::AbstractVector{ComplexF64}) = begin
+        copyto!(r_clipped, view(u_vec, 1:receiver_size))
+        return r_clipped
     end
-    vec_disjoint_union_projector_action!(w, v) = begin
-        v_tens = reshape(v, glaSze(G₀_uu)[2])
-        out_tens = disjoint_union_projector_action(v_tens)
-        copyto!(w, vec(out_tens))
-        return w
-    end
-    u_projector = LinearMap{ComplexF64}(vec_disjoint_union_projector_action!, vec_disjoint_union_projector_action!, size(G₀_uu)...; ismutating=true)
-    r_projector_action(x_union::AbstractArray{ComplexF64, 4}) = begin
-        x = similar(x_union)
-        fill!(x, zero(eltype(x)))
-        copyto!(view(x, receiver_mask..., :), view(x_union, receiver_mask..., :))
-        # The output x now has nonzero entries only in the receiver region
-        return x
-    end
-    vec_r_projector_action!(w, v) = begin
-        v_tens = reshape(v, glaSze(G₀_uu)[2])
-        out_tens = r_projector_action(v_tens)
-        copyto!(w, vec(out_tens))
-        return w
-    end
-    r_projector = LinearMap{ComplexF64}(vec_r_projector_action!, vec_r_projector_action!, size(G₀_uu)...; ismutating=true)
-    G₀ = LinearMap(G₀_uu)
-    return 1/(2im) * (u_projector * G₀ * r_projector - r_projector * G₀' * u_projector)
+    receiver_clip = LinearMap{ComplexF64}(receiver_clip_action!, receiver_clip_action!, receiver_size, sender_size + receiver_size; ismutating=true)
+
+    G₀_ru_adj = LinearMap(adjoint(G₀_ru)) # Maps from receiver to universe
+    G₀_ru = LinearMap(G₀_ru) # Also maps from receiver to universe
+
+    asym_G₀_ru = 1/2im * (receiver_inclusion * G₀_ru - G₀_ru_adj * receiver_clip)
+    return asym_G₀_ru
 end
 
-function uu_disjoint_union(G₀_uu::VacuumGreensOperator, smr::SMRSystem)
+function uu_disjoint_union(G₀_uu::VacuumGreenOperator, smr::SMRSystem)
     s = sender(smr)
     r = receiver(smr)
     G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
@@ -130,8 +167,10 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing RSVD for UR_asym"
     @info string(now()) * " [rsvd::generate_rsvd] Loading G₀ operators"
-    G₀_uu = load_greens_function(compute_env, smr, Design, Design) # universe -> universe
-    G₀_ur_asym = asym_ur(G₀_uu, smr)
+    # G₀_uu = load_green_function(compute_env, smr, Design, Design) # universe -> universe
+    # G₀_ur_asym = asym_ur(G₀_uu, smr)
+    G₀_ru = load_green_function(compute_env, smr, [Receiver], [Sender, Receiver]) # universe -> receiver
+    G₀_ur_asym = asym_ur(G₀_ru, smr)
     sample_vec = zeros(ComplexF64, 0)
     if use_gpu(compute_env)
         sample_vec = CuArray(sample_vec)
@@ -159,7 +198,7 @@ function _save_constraint_asym(compute_env::ComputeEnvironment, smr::SMRSystem, 
     end
     @info string(now()) * " [rsvd::generate_rsvd] Computing eigendecomposition for Asym(χ⁻¹ - G₀_rr)"
     @info string(now()) * " [rsvd::generate_rsvd] Loading G₀_rr operator"
-    G₀_rr = load_greens_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
+    G₀_rr = load_green_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
     sample_vec = zeros(ComplexF64, 0)
     if use_gpu(compute_env)
         sample_vec = CuArray(sample_vec)
@@ -188,7 +227,7 @@ function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd
     # _run_rsvd(compute_env, smr, rsvd_params, "UU/")
 
     # χ = susceptibility(smr)
-    # G₀_uu = load_greens_function(compute_env, smr, Design, Design)
+    # G₀_uu = load_green_function(compute_env, smr, Design, Design)
     # Ga = asym(I*inv(χ) - LinearMap(G₀_uu))
     # sample_vec = zeros(ComplexF64, 0)
     # if use_gpu(compute_env)
@@ -198,7 +237,7 @@ function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd
     # _save_reigen_hermitian(out.vectors, out.values, joinpath(scratch_dir(compute_env), "$(file_prefix(smr)).jld"), "A")
 
     # @info string(now()) * " [rsvd::generate_rsvd] Computing RSVD for Asym(G₀_uu)"
-    # G₀_uu_union = load_greens_function(compute_env, smr, Design, Design)
+    # G₀_uu_union = load_green_function(compute_env, smr, Design, Design)
     # G₀_uu_disjoint = uu_disjoint_union(G₀_uu_union, smr) # For the universe -> universe case, we need to zero out the gap to get a basis that is more useful in the bounds
     # sample_vec = zeros(ComplexF64, 0)
     # if use_gpu(compute_env)
@@ -226,7 +265,7 @@ function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params:
     @info string(now()) * " [rsvd::_run_rsvd] Loading G₀ operator"
     target = char2volume_symbol(jld_key[1]) # First character indicates target
     source = char2volume_symbol(jld_key[2]) # Second character indicates source
-    G₀_ab = load_greens_function(compute_env, smr, target, source)
+    G₀_ab = load_green_function(compute_env, smr, target, source)
     if target == Design && source == Design
         @info string(now()) * " [rsvd::_run_rsvd] Applying disjoint union projector to G₀_uu for universe -> universe case"
         G₀_ab = uu_disjoint_union(G₀_ab, smr) # For the universe -> universe case, we need to zero out the gap to get a basis that is more useful in the bounds
@@ -263,7 +302,7 @@ function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
     @info string(now()) * " [rsvd::_run_rsvdvals] Loading G₀ operator"
     target = char2volume_symbol(jld_key[1]) # First character indicates target
     source = char2volume_symbol(jld_key[2]) # Second character indicates source
-    G₀_ab = load_greens_function(compute_env, smr, target, source)
+    G₀_ab = load_green_function(compute_env, smr, target, source)
     if target == Design && source == Design
         @info string(now()) * " [rsvd::_run_rsvdvals] Applying disjoint union projector to G₀_uu for universe -> universe case"
         G₀_ab = uu_disjoint_union(G₀_ab, smr) # For the universe -> universe case, we need to zero out the gap to get a basis that is more useful in the bounds

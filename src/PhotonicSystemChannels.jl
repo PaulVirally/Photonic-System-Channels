@@ -12,12 +12,12 @@ using .SMRSystems
 
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
 export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
-export load_greens_function, fix_mask, file_prefix
+export load_green_function, fix_mask, file_prefix
 
 include("common.jl")
 
-include("generate_greens.jl")
-export generate_greens
+include("generate_green.jl")
+export generate_green
 
 include("rsvd.jl")
 export generate_rsvd

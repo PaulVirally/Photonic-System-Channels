@@ -2,4 +2,4 @@
 
 using PhotonicSystemChannels
 
-generate_greens()
+generate_green()

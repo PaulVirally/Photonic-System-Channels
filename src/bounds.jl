@@ -154,54 +154,66 @@ function bicgstab_gpu(op, b::AbstractVector; preconditioner=nothing, max_iter::I
 	return bicgstab_gpu!(x, op, b; preconditioner=preconditioner, max_iter=max_iter, atol=atol, rtol=rtol, verbose=verbose, initial_zero=true)
 end
 
-function projected_operators(G₀_uu::VacuumGreensOperator, smr::SMRSystem, env::ComputeEnvironment)
+function projected_operators(G₀_uu::AbstractGlaOpr, smr::SMRSystem, env::ComputeEnvironment)
     s = sender(smr)
     r = receiver(smr)
-    G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
-    union_volume = G₀_uu.mem.srcVol # srcVol == trgVol
-    if union(s, r) != union_volume
-        @error "union_volume should be union(s, r) but it is not"
-    end
-    sender_mask = GilaElectromagnetics.GilaOperators.mskRng(s, union_volume) # Mask for sender region within the union volume
-    receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, union_volume) # Mask for receiver region within the union volume
+    # G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
+    # union_volume = G₀_uu.mem.srcVol # srcVol == trgVol
+    # if union(s, r) != union_volume
+    #     @error "union_volume should be union(s, r) but it is not"
+    # end
+    # sender_mask = GilaElectromagnetics.GilaOperators.mskRng(s, union_volume) # Mask for sender region within the union volume
+    # receiver_mask = GilaElectromagnetics.GilaOperators.mskRng(r, union_volume) # Mask for receiver region within the union volume
 
     # Zero out the gap between sender and receiver by creating a projector that keeps the sender and receiver regions but zeros out everything else in the union volume (including the gap between s and r)
-    disjoint_union_indicator = zeros(eltype(G₀_uu), glaSze(G₀_uu)[2])
-    if use_gpu(env)
-        disjoint_union_indicator = CuArray(disjoint_union_indicator)
-    end
-    fill!(view(disjoint_union_indicator, sender_mask..., :), one(eltype(disjoint_union_indicator)))
-    fill!(view(disjoint_union_indicator, receiver_mask..., :), one(eltype(disjoint_union_indicator)))
-    disjoint_union_projector_action!(w, v) = begin
-        w .= vec(disjoint_union_indicator .* reshape(v, size(disjoint_union_indicator)))
-        return w
-    end
-    u_projector = LinearMap{ComplexF64}(disjoint_union_projector_action!, disjoint_union_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
+    # disjoint_union_indicator = zeros(eltype(G₀_uu), glaSze(G₀_uu)[2])
+    # if use_gpu(env)
+    #     disjoint_union_indicator = CuArray(disjoint_union_indicator)
+    # end
+    # fill!(view(disjoint_union_indicator, sender_mask..., :), one(eltype(disjoint_union_indicator)))
+    # fill!(view(disjoint_union_indicator, receiver_mask..., :), one(eltype(disjoint_union_indicator)))
+    # disjoint_union_projector_action!(w, v) = begin
+    #     w .= vec(disjoint_union_indicator .* reshape(v, size(disjoint_union_indicator)))
+    #     return w
+    # end
+    # u_projector = LinearMap{ComplexF64}(disjoint_union_projector_action!, disjoint_union_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
 
-    sender_indicator = zeros(eltype(G₀_uu), glaSze(G₀_uu)[2])
-    if use_gpu(env)
-        sender_indicator = CuArray(sender_indicator)
-    end
-    fill!(view(sender_indicator, sender_mask..., :), one(eltype(sender_indicator)))
-    s_projector_action!(w, v) = begin
-        w .= vec(sender_indicator .* reshape(v, size(sender_indicator)))
-        return w
-    end
-    s_projector = LinearMap{ComplexF64}(s_projector_action!, s_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
+    # sender_indicator = zeros(eltype(G₀_uu), glaSze(G₀_uu)[2])
+    # if use_gpu(env)
+    #     sender_indicator = CuArray(sender_indicator)
+    # end
+    # fill!(view(sender_indicator, sender_mask..., :), one(eltype(sender_indicator)))
+    # s_projector_action!(w, v) = begin
+    #     w .= vec(sender_indicator .* reshape(v, size(sender_indicator)))
+    #     return w
+    # end
+    # s_projector = LinearMap{ComplexF64}(s_projector_action!, s_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
 
-    receiver_indicator = zeros(eltype(G₀_uu), glaSze(G₀_uu)[2])
-    if use_gpu(env)
-        receiver_indicator = CuArray(receiver_indicator)
+    sender_size = prod(s.cel)*3
+    receiver_size = prod(r.cel)*3
+    sender_projector_action!(s_included_in_u::AbstractVector{ComplexF64}, u::AbstractVector{ComplexF64}) = begin
+        # our convention is [sender; receiver]
+        fill!(s_included_in_u, zero(eltype(s_included_in_u)))
+        copyto!(view(s_included_in_u, 1:sender_size), view(u, 1:sender_size))
+        return s_included_in_u
     end
-    fill!(view(receiver_indicator, receiver_mask..., :), one(eltype(receiver_indicator)))
-    r_projector_action!(w, v) = begin
-        w .= vec(receiver_indicator .* reshape(v, size(receiver_indicator)))
-        return w
-    end
-    r_projector = LinearMap{ComplexF64}(r_projector_action!, r_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
+    s_projector = LinearMap{ComplexF64}(sender_projector_action!, sender_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
 
-    G₀ = LinearMap(G₀_uu)
-    return r_projector, s_projector, u_projector, (u_projector * G₀ * u_projector)
+    # receiver_indicator = zeros(eltype(G₀_uu), glaSze(G₀_uu)[2])
+    # if use_gpu(env)
+    #     receiver_indicator = CuArray(receiver_indicator)
+    # end
+    # fill!(view(receiver_indicator, receiver_mask..., :), one(eltype(receiver_indicator)))
+    # r_projector_action!(w, v) = begin
+    #     w .= vec(receiver_indicator .* reshape(v, size(receiver_indicator)))
+    #     return w
+    # end
+    # r_projector = LinearMap{ComplexF64}(r_projector_action!, r_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
+    #
+    # G₀ = LinearMap(G₀_uu)
+    # return r_projector, s_projector, u_projector, (u_projector * G₀ * u_projector)
+
+    return s_projector
 end
 
 opmat(A::LinearMap, b::AbstractVector) = A*b
@@ -283,15 +295,19 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     end
     close(jld_out)
 
-    G₀_uu = load_greens_function(compute_env, smr, Design, Design)
-    r_projector, s_projector, u_projector, G₀_uu_disjoint = projected_operators(G₀_uu, smr, compute_env)
-    G⁰ᵤᵤ_asym = u_projector * asym(LinearMap(G₀_uu)) * u_projector
+    G₀_uu = load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver]) # universe -> universe
+    # r_projector, s_projector, u_projector, G₀_uu_disjoint = projected_operators(G₀_uu, smr, compute_env)
+    s_projector = projected_operators(G₀_uu, smr, compute_env)
+    # G⁰ᵤᵤ_asym = u_projector * asym(LinearMap(G₀_uu)) * u_projector
+    G⁰ᵤᵤ_asym = asym(LinearMap(G₀_uu))
 
     @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Finished reading data from disk; closing JLD file and freeing memory"
     close(jld_in)
     GC.gc()
     GC.gc()
     GC.gc()
+
+    @info "hello" size(Vur_asym) size(G₀_uu) size(s_projector) size(Γ) size(Γrs)
 
     χ = susceptibility(smr)
     ζ = abs(χ)^2/imag(χ)
