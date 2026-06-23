@@ -128,7 +128,8 @@ function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr
 
     asym_G₀_rr = LinearMap(AsymVacuumGreenOperator(G₀_rr)) # twice as efficient as (G₀_rr - G₀_rr')/(2im)
     asym_G₀_ru = asym(ι_r * G₀_rs * Π_s) + ι_r * asym_G₀_rr * Π_r
-    return asym_G₀_ru
+    positive_seeder = -asym(ι_r * G₀_rs * Π_s) # -1 because we want the negative contributions of this operator becuase of the enless -1 problems
+    return asym_G₀_ru, positive_seeder
 end
 
 function uu_disjoint_union(G₀_uu::VacuumGreenOperator, smr::SMRSystem)
@@ -194,14 +195,22 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
     # G₀_ru = load_green_function(compute_env, smr, [Receiver], [Sender, Receiver]) # universe -> receiver
     G₀_rs = load_green_function(compute_env, smr, Receiver, Sender) # sender -> receiver
     G₀_rr = load_green_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
-    G₀_ur_asym = asym_ur(G₀_rs, G₀_rr, smr)
+    G₀_ur_asym, positive_seeder = asym_ur(G₀_rs, G₀_rr, smr)
     sample_vec = zeros(ComplexF64, 0)
     if use_gpu(compute_env)
         sample_vec = CuArray(sample_vec)
     end
 
+    @info string(now()) * " [rsvd::generate_rsvd] Performing rSVD of off diagonals of Asym(G0_ur) to seed Asym(G0_ur) rSVD"
+    @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(positive_seeder)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+    out = reigen_hermitian(positive_seeder, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+    seed_Q = out.vectors
+    
+    @info string(now()) * " [rsvd::generate_rsvd] Saving reigen to $(jld_path)"
+    _save_reigen_hermitian(out.vectors, out.values, jld_path, "UR_asym_offdiagonal/")
+
     @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(G₀_ur_asym)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
-    out = reigen_hermitian(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+    out = reigen_hermitian(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec, seed_Q=seed_Q)
 
     @info string(now()) * " [rsvd::generate_rsvd] Saving reigen to $(jld_path)"
     _save_reigen_hermitian(out.vectors, out.values, jld_path, jld_key)
