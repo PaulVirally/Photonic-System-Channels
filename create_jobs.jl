@@ -15,8 +15,19 @@ using Dates
 
 # const PROJECT_NAME = "metasurface_1x2x2_700comps_50oversamples"
 # const PROJECT_NAME = "metasurface_1x3x3_115comps_50oversamples"
-# const PROJECT_NAME = "metasurface_1x2x2_320comps_50oversamples"
-const PROJECT_NAME = "metasurface_1x1x1_1350comps_50oversamples"
+# const PROJECT_NAME = "fir_metasurface_1x1x1_2750comps_50oversamples"
+# const PROJECT_NAME = "fir_metasurface_1x1x1_470comps_50oversamples_64scale"
+# const PROJECT_NAME = "metasurface_1x2x2_340comps_50oversamples"
+# const PROJECT_NAME = "metasurface_1x2x2_1350comps_50oversamples_coarse"
+# const PROJECT_NAME = "metasurface_1x1x1_1350comps_50oversamples"
+# const PROJECT_NAME = "fir_metasurface_2x2x2_1350comps_50oversamples_aniso"
+# const PROJECT_NAME = "fir_metasurface_3x3x3_800comps_50oversamples_aniso"
+# const PROJECT_NAME = "fir_metasurface_4x4x4_600comps_50oversamples_aniso"
+# const PROJECT_NAME = "metasurface_1x1x1_400comps_50oversamples_64scale"
+# const PROJECT_NAME = "metasurface_1x1x1_400comps_50oversamples_32scale"
+# const PROJECT_NAME = "metasurface_0p25x0p25x0p25_1350comps_50oversamples_128scale"
+const PROJECT_NAME = "metasurface_0p5x0p5x0p25_1350comps_50oversamples_64scale"
+# const PROJECT_NAME = "metasurface_0p125x0p125x0p125_1350comps_50oversamples_256scale"
 
 # const PROJECT_NAME = "waveguide_0p25x1x1_@0p125_800comps_50oversamples"
 
@@ -214,7 +225,7 @@ function heat_transfer_args(smr::SMRSystem, params::RSVDParams)
     receiver_string = "\\($(join(r.cel, ","))\\)"
     sep = rs_separation(smr)[1] # Assume only x-separation for heat transfer
     rs_sep_string = "\\($(rational2string(sep)),0//1,0//1\\)"
-    scale_string = "$(rational2string(s.scl[1]))"
+    scale_string = allequal(s.scl) ? rational2string(s.scl[1]) : rational2string(-s.scl[2]) # anisotropic hack
     chi_string = "$(real(χ(smr)))+$(imag(χ(smr)))im"
     name_string = experiment_name(smr)
     design_string = "rs" # Design the entire region
@@ -255,6 +266,7 @@ end
 
 function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
     max_vol = biggest_volume_voxels_cubed(smr)
+    max_vol = isnothing(mediator(smr)) ? max_vol : (3 * max(prod(sender(smr).cel), prod(receiver(smr).cel)))
     num_pairs = length(volume_pairs(smr)) # Number of source-target volume pairs
     if job_type == GenerateGreens
         g0_time_s_A6000 = TIME_PADDING * (max_vol * log2(max_vol) * 2.147823889114151e-6 + 37.68202102148491) # empirical formula
@@ -264,7 +276,7 @@ function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
         k = params.rank
         p = params.oversamples
         rsvd_time_s_A6000 = TIME_PADDING * (1.4917e-8 * (2 + 2q)*(k+p)*max_vol*log2(max_vol) + 71.3435)
-        return rsvd_time_s_A6000 * num_pairs
+	return min(rsvd_time_s_A6000, one(rsvd_time_s_A6000)*60*60) * num_pairs
     elseif job_type == ComputeBounds
         # bounds_time_s_A6000 = 0.0 # empirical formula
         bounds_time_s_A6000 = 20*60 # It's like 1 minute, but 20 mins is fine
@@ -275,6 +287,7 @@ end
 
 function memory_GB(job_type::JobType, smr::SMRSystem, params::RSVDParams)
     max_vol = biggest_volume_voxels_cubed(smr)
+    max_vol = isnothing(mediator(smr)) ? max_vol : (3 * max(prod(sender(smr).cel), prod(receiver(smr).cel)))
     if job_type == GenerateGreens
         return ceil(Int, MEMORY_PADDING * (1.722879361316178e9 + 798.4151595299923 * max_vol) * 1e-9) # empirical formula
     elseif job_type == GenerateRSVD
@@ -339,7 +352,7 @@ function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSyste
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
-srun julia --project=. -E 'using CUDA; CUDA.set_runtime_version!(v"12.2", local_toolkit=true)'; """
+srun """
     footer = """EOF
 )
 $var_name=\${$var_name##* }
@@ -425,6 +438,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
                 job_args *= " --gpu false"
 	    else
                 job_args *= " --gpu true"
+                # job_args *= " --gpu 1"
 	    end
 	    script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/\n"
 
@@ -435,29 +449,34 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
     return script
 end
 
+# cluster = ClusterConfig("fir")
 cluster = ClusterConfig("narval")
 # cluster = ClusterConfig("molering")
 
 ### Meta surface
+# scale = -8
+scale = 64
+
 # num_experiments = 101
 # separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
 # separations = [1//32]
-separations = reverse(collect(1:32) .// 16)
-# separations = [1//4, 2//4, 3//4, 4//4, 5//4, 6//4, 7//4, 8//4]
+# separations = collect(2:(2*scale)) .// scale # collect(2:32) .// scale
+separations = vcat(collect(0:(3*32)) .// 32, Rational.(collect(10:5:300)))
+# separations = collect(0:16) .// 32
 num_experiments = length(separations)
 
 command = job_launcher_script(
     [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
     cluster,
-    repeat([(1*32, 1*32, 1*32)], num_experiments), # sender cells: 0.5×2×2 λ³
+    repeat([(64, 64, 64)], num_experiments), # sender cells: 2×2×2 λ³
     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
-    repeat([(1*32, 1*32, 1*32)], num_experiments), # receiver cells, same as sender
+    repeat([(64, 64, 64)], num_experiments), # receiver cells, same as sender
     repeat([nothing], num_experiments), # sm separations (SR system)
     repeat([nothing], num_experiments), # mr separations (SR system)
     [(sep, 0//1, 0//1) for sep in separations], # rs separations
-    repeat([1//32], num_experiments), # scales
+    repeat([1//scale], num_experiments), # scales
     repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
-    repeat([1350], num_experiments), # RSVD target ranks
+    repeat([600], num_experiments), # RSVD target ranks
     repeat([50], num_experiments), # RSVD oversamples
     repeat([14], num_experiments) # RSVD power iters
 )
