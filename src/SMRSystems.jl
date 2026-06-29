@@ -127,6 +127,14 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3,
 end
 
 function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64)
+
+    if scale > zero(typeof(scale))
+        scale = (scale, scale, scale)
+    else
+        # This is a hack to give us differently sized cells. I was too lazy to change the code, so a negative scale means anisotropic
+        scale = (1//32, abs(scale), abs(scale))
+    end
+
     sender_center_wl = (0//1, 0//1, 0//1)
     sender_size_wl = sender_num_cells .* scale
     rs_dir = (1, 0, 0) # Assume separation along x-axis
@@ -134,8 +142,8 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
     receiver_size_wl = receiver_num_cells .* scale
     receiver_center_wl = sender_center_wl .+ (sender_size_wl .// 2) .* rs_dir .+ abs.(rs_separation_wl) .+ (receiver_size_wl .// 2) .* rs_dir # Silently ignore negative separations
 
-    sender_volume = GlaVol(sender_num_cells, (scale, scale, scale), sender_center_wl)
-    receiver_volume = GlaVol(receiver_num_cells, (scale, scale, scale), receiver_center_wl)
+    sender_volume = GlaVol(sender_num_cells, scale, sender_center_wl)
+    receiver_volume = GlaVol(receiver_num_cells, scale, receiver_center_wl)
 
     isempty(design_regions) && throw(ArgumentError("Design regions cannot be empty. You must specify at least one of Sender or Receiver for the design region."))
     design_volumes = GlaVol[]
