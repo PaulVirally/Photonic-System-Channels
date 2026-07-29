@@ -403,16 +403,27 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
         bounds_dual_basis[n] = sqrt(dual)
     end
 
-    analytical_bounds(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
-    old_κ = ζ^2 .* (Γrs .^ 2)
-    new_κ = ζ^2 .* (max.(Γ, zero(eltype(Γ))))
-    old_analytical_bounds = analytical_bounds.(old_κ)
-    new_analytical_bounds = analytical_bounds.(new_κ)
+    analytical_bounds_old_form(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
+    analytical_bounds_new_form(κ̃) = ifelse(2κ̃ >= one(eltype(κ̃)), one(eltype(κ̃)), sqrt(4κ̃*(1-κ̃)))
+    κ = ζ^2 .* (Γrs .^ 2)
+    κ̃ = ζ .* (max.(Γ, zero(eltype(Γ))))
+    old_analytical_bounds = analytical_bounds_old_form.(κ)
+    new_analytical_bounds = analytical_bounds_new_form.(κ̃)
     new_analytical_bounds[new_analytical_bounds .<= zero(eltype(new_analytical_bounds))] .= NaN
     old_analytical_bounds[old_analytical_bounds .<= zero(eltype(old_analytical_bounds))] .= NaN
 
     ks = 1:min(length(old_analytical_bounds), length(new_analytical_bounds), length(bounds_dual_basis))
-    true_bounds = min.(old_analytical_bounds[ks], new_analytical_bounds[ks], bounds_dual_basis[ks])
+    which_bounds = argmin.((old_analytical_bounds[ks], new_analytical_bounds[ks], bounds_dual_basis[ks]))
+    # true_bounds = min.(old_analytical_bounds[ks], new_analytical_bounds[ks], bounds_dual_basis[ks])
+    true_bounds = map(i -> begin # Save which bound is the minimum for each k to see where the flips happen
+        if which_bounds[i] == 1
+            return old_analytical_bounds[ks[i]]
+        elseif which_bounds[i] == 2
+            return new_analytical_bounds[ks[i]]
+        else
+            return bounds_dual_basis[ks[i]]
+        end
+    end, 1:length(ks))
 
     # plt = plot(eachindex(bounds_dual_basis), bounds_dual_basis, label="Dual (RSVD basis)")
     # plot!(plt, eachindex(old_analytical_bounds), old_analytical_bounds, label="Passivity [γᵣₛ]")
@@ -446,6 +457,9 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     end
     if !haskey(jld_out, "true_bounds")
         jld_out["true_bounds"] = true_bounds
+    end
+    if !haskey(jld_out, "which_bounds")
+        jld_out["which_bounds"] = which_bounds
     end
     close(jld_out)
 end
