@@ -203,13 +203,14 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
         sample_vec = CuArray(sample_vec)
     end
 
-    @info string(now()) * " [rsvd::generate_rsvd] Performing rSVD of off diagonals of Asym(G0_ur) to seed Asym(G0_ur) rSVD"
-    @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(positive_seeder)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
-    out = reigen_hermitian(positive_seeder, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
-    seed_Q = out.vectors
-    
-    @info string(now()) * " [rsvd::generate_rsvd] Saving reigen to $(jld_path)"
-    _save_reigen_hermitian(out.vectors, out.values, jld_path, "UR_asym_offdiagonal/")
+    # @info string(now()) * " [rsvd::generate_rsvd] Performing rSVD of off diagonals of Asym(G0_ur) to seed Asym(G0_ur) rSVD"
+    # @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(positive_seeder)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+    # out = reigen_hermitian(positive_seeder, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+    # seed_Q = out.vectors
+    #
+    # @info string(now()) * " [rsvd::generate_rsvd] Saving reigen to $(jld_path)"
+    # _save_reigen_hermitian(out.vectors, out.values, jld_path, "UR_asym_offdiagonal/")
+    seed_Q = nothing # We tried this seeding technique, but it didn't help and just costs us an extra rSVD so we skip it
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(G₀_ur_asym)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
     out = reigen_hermitian(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec, seed_Q=seed_Q)
