@@ -8,11 +8,11 @@ function _generate_green_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
     load_green_function(compute_env, smr, Receiver, Sender)
     run_gc() # relieve some memory pressure that CUDA sometimes introduces
 
-    # universe -> receiver
-    @info string(now()) * " [generate_green::_generate_green_sr] Generating universe -> receiver Green function"
-    load_green_function(compute_env, smr, [Receiver], [Sender, Receiver]) # universe -> receiver
+    # receiver -> receiver
+    @info string(now()) * " [generate_green::_generate_green_sr] Generating receiver -> receiver Green function"
+    load_green_function(compute_env, smr, Receiver, Receiver)
     run_gc()
-    
+
     # universe -> universe
     @info string(now()) * " [generate_green::_generate_green_sr] Generating universe -> universe Green function"
     # load_green_function(compute_env, smr, Design, Design)
