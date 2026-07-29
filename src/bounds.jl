@@ -259,50 +259,77 @@ function _compute_bounds_smr(::ComputeEnvironment, ::SMRSystem, ::RSVDParams)
     throw("Not implemented yet")
 end
 
-function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
-    @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Computing bounds for SR system"
+"""
+    load_bounds_inputs(compute_env, smr)
 
+Read everything `bounds_from_spectrum` needs out of the RSVD output written to
+scratch by `generate_rsvd`, already sign-corrected and sorted by descending Γ.
+
+Split out from `_compute_bounds_sr` so that the cost-model calibration in
+`bench/` can drive the bounds computation with synthetic spectra instead of
+having to run a full RSVD first.
+"""
+function load_bounds_inputs(compute_env::ComputeEnvironment, smr::SMRSystem)
     jld_in_path = joinpath(scratch_dir(compute_env), "$(file_prefix(smr)).jld")
     jld_in = jldopen(jld_in_path, "r")
 
     Γ = read_array(jld_in, "UR_asym/D", use_gpu(compute_env))
     Γ .*= -one(eltype(Γ)) # Sign typo in the original notes
     Vur_asym = read_array(jld_in, "UR_asym/V", use_gpu(compute_env))
-    jld_out = jldopen(joinpath(project_dir(compute_env), "$(file_prefix(smr)).jld"), "w")
 
-    # Sort the singular values and vectors according to the ordering_idxs
-    sorted_idxs = sortperm(Γ, rev=true) # Sort in descending order
+    # Sort the singular values and vectors in descending order
+    sorted_idxs = sortperm(Γ, rev=true)
     Vur_asym = Vur_asym[:, sorted_idxs]
     Γ = Array(Γ[sorted_idxs])
-    # Γ_pos = Γ[Γ .> zero(eltype(Γ))]
+    Γrs = Array(jld_in["RS/D"])
 
+    close(jld_in)
+    return (Γ=Γ, Vur_asym=Vur_asym, Γrs=Γrs, sorted_idxs=Array(sorted_idxs))
+end
+
+"""
+    bounds_from_spectrum(compute_env, smr, Γ, Vur_asym, Γrs; kwargs...)
+
+Compute the σₙ(Pᵣₛ) bounds from an already-loaded `Asym(G⁰ᵤᵣ)` spectrum. `Γ` must
+be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
+
+Pure computation: reads nothing and writes nothing.
+
+# Keyword arguments
+- `basis_size`: how many leading eigenvectors to use as the projection basis.
+- `G₀_uu`: pre-loaded universe operator, loaded here if not supplied.
+- `outer_indices`: which `n` of the outer `σₙ` loop to actually evaluate.
+  `nothing` (the default) means all of them, which is the only setting that
+  produces valid bounds; the benchmark harness passes a subset to sample the
+  per-`n` cost without paying for the whole `O(num_pos²)` loop, and the returned
+  `complete` flag is `false` in that case.
+
+# Returns
+A named tuple with the bounds, the bookkeeping needed to save them, and
+`stage_times` / `outer_times` for calibration.
+"""
+function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
+                              Γ::AbstractVector, Vur_asym::AbstractMatrix,
+                              Γrs::AbstractVector;
+                              basis_size::Int=size(Vur_asym, 2),
+                              G₀_uu=nothing,
+                              outer_indices::Union{Nothing,AbstractVector{Int}}=nothing)
     # U_uu = read_array(jld_in, "UU/U", use_gpu(compute_env)) # TODO: could use this as basis too
-    # RSVD_BASIS_SIZE = 256
-    RSVD_BASIS_SIZE = size(Vur_asym, 2)
+    RSVD_BASIS_SIZE = min(basis_size, size(Vur_asym, 2))
     basis = copy(Vur_asym)
-    # basis = Vur_asym
     # basis = cat(U_uu, Vur_asym; dims=2)
     # basis = qthin!(basis) # Orthonormalize the basis using QR factorization
     basis = basis[:, 1:RSVD_BASIS_SIZE] # Restrict the basis to the top RSVD_BASIS_SIZE singular vectors
-    @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Using RSVD_BASIS_SIZE = $RSVD_BASIS_SIZE"
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Using RSVD_BASIS_SIZE = $RSVD_BASIS_SIZE"
 
-    Γrs = jld_in["RS/D"]
-    if !haskey(jld_out, "Γrs")
-        jld_out["Γrs"] = Array(Γrs)
+    if isnothing(G₀_uu)
+        G₀_uu = load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver]) # universe -> universe
     end
-    if !haskey(jld_out, "ordering_idxs")
-        jld_out["ordering_idxs"] = Array(sorted_idxs)
-    end
-    close(jld_out)
-
-    G₀_uu = load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver]) # universe -> universe
     # r_projector, s_projector, u_projector, G₀_uu_disjoint = projected_operators(G₀_uu, smr, compute_env)
     s_projector = projected_operators(G₀_uu, smr, compute_env)
     # G⁰ᵤᵤ_asym = u_projector * asym(LinearMap(G₀_uu)) * u_projector
     G⁰ᵤᵤ_asym = asym(LinearMap(G₀_uu))
 
-    @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Finished reading data from disk; closing JLD file and freeing memory"
-    close(jld_in)
     GC.gc()
     GC.gc()
     GC.gc()
@@ -318,7 +345,8 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     gs_pos = Vur_asym[:, 1:num_pos] # These have been sorted in descending order of the corresponding Γ values; keep only the eigenvectors with positive eigenvalues
 
     # Reverse Gram-Schmidt
-    @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Performing reverse Gram-Schmidt to construct the ss basis"
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Performing reverse Gram-Schmidt to construct the ss basis"
+    t_gram_schmidt = time_ns()
     ss = similar(gs_pos, size(gs_pos, 1), num_pos)
     for i in num_pos:-1:1
         gᵢ = view(gs_pos, :, i)
@@ -330,11 +358,15 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
         end
         nrm = norm(wᵢ)
         if nrm < 1e-12
-            @warn string(now()) * " [bounds_bargaining::_compute_bounds_sr] Warning: vector $i is nearly linearly dependent on the later vectors, norm after orthogonalization is $nrm (we should stop the basis generation here, but I'm too lazy to fix the code right now; hopfully we never see this warning)"
+            @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] Warning: vector $i is nearly linearly dependent on the later vectors, norm after orthogonalization is $nrm (we should stop the basis generation here, but I'm too lazy to fix the code right now; hopfully we never see this warning)"
         end
         ss[:, i] .= wᵢ ./ nrm
     end
+    t_gram_schmidt = (time_ns() - t_gram_schmidt) / 1e9
+
+    t_ss_basis = time_ns()
     ss_basis = basis' * ss
+    t_ss_basis = (time_ns() - t_ss_basis) / 1e9
 
     B_matvec(n::Int, v::AbstractVector) = begin
         idxs = n:num_pos
@@ -358,15 +390,21 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
         return out
     end
     C = LinearMap(C_matvec, size(G₀_uu)...; ishermitian=true)
-    @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Projecting C into the basis of size $(size(basis, 2))"
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Projecting C into the basis of size $(size(basis, 2))"
+    t_c_projection = time_ns()
     C_basis = basis' * opmat(C, basis)
+    t_c_projection = (time_ns() - t_c_projection) / 1e9
 
     B_basis_diagonal = similar_fill(C_basis, (size(C_basis, 1),), zero(eltype(C_basis)))
 
     bounds_dual_basis = zeros(Float64, num_pos)
     B_basis_n = similar(C_basis)
-    for n in 1:num_pos # Compute bounds on σₙ(Pᵣₛ)
-        @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] [$n/$(num_pos)] Computing σₙ(Pᵣₛ) bound"
+    ns = isnothing(outer_indices) ? (1:num_pos) : filter(n -> 1 <= n <= num_pos, outer_indices)
+    complete = length(ns) == num_pos
+    outer_times = Tuple{Int,Float64}[]
+    for n in ns # Compute bounds on σₙ(Pᵣₛ)
+        t_outer = time_ns()
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] [$n/$(num_pos)] Computing σₙ(Pᵣₛ) bound"
 
         @info string(now()) * " [$n/$(num_pos)] Projecting Bₙ into the basis of size $(size(basis, 2))"
         # B_basis_n = B_basis(n)
@@ -401,6 +439,7 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
         dual = best_dual
         @info string(now()) * " [$n/$(num_pos)] Dual is $dual, which gives a bound of $(sqrt(dual)) on σₙ(Pᵣₛ)"
         bounds_dual_basis[n] = sqrt(dual)
+        push!(outer_times, (n, (time_ns() - t_outer) / 1e9))
     end
 
     analytical_bounds_old_form(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
@@ -434,8 +473,38 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     # println("Press Enter to continue...")
     # readline()
 
-    # Save data to disk
+    stage_times = (gram_schmidt=t_gram_schmidt, ss_basis=t_ss_basis,
+                   c_projection=t_c_projection,
+                   outer_total=sum(last.(outer_times); init=0.0))
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Stage times [s]:" stage_times
+
+    return (num_pos=num_pos, complete=complete,
+            bounds_dual_basis=bounds_dual_basis,
+            old_analytical_bounds=old_analytical_bounds,
+            new_analytical_bounds=new_analytical_bounds,
+            true_bounds=true_bounds, which_bounds=which_bounds, ks=ks,
+            basis_size=RSVD_BASIS_SIZE,
+            stage_times=stage_times, outer_times=outer_times)
+end
+
+function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
+    @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Computing bounds for SR system"
+
+    inputs = load_bounds_inputs(compute_env, smr)
+    Γ, Vur_asym, Γrs, sorted_idxs = inputs.Γ, inputs.Vur_asym, inputs.Γrs, inputs.sorted_idxs
+
+    # Written up front (truncating any previous run's file) so that the ordering
+    # is on disk even if the bounds loop below is cut short by a time limit.
     jld_out_path = joinpath(project_dir(compute_env), "$(file_prefix(smr)).jld")
+    jld_out = jldopen(jld_out_path, "w")
+    jld_out["Γrs"] = Array(Γrs)
+    jld_out["ordering_idxs"] = sorted_idxs
+    close(jld_out)
+
+    result = bounds_from_spectrum(compute_env, smr, Γ, Vur_asym, Γrs)
+    result.complete || error("bounds_from_spectrum returned an incomplete result; refusing to save partial bounds")
+
+    # Save data to disk
     jld_out = jldopen(jld_out_path, "a")
     if !haskey(jld_out, "χ")
         jld_out["χ"] = susceptibility(smr)
@@ -447,21 +516,22 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
         jld_out["Γrs"] = Array(Γrs)
     end
     if !haskey(jld_out, "bounds_dual_basis")
-        jld_out["bounds_dual_basis"] = bounds_dual_basis
+        jld_out["bounds_dual_basis"] = result.bounds_dual_basis
     end
     if !haskey(jld_out, "old_analytical_bounds")
-        jld_out["old_analytical_bounds"] = old_analytical_bounds
+        jld_out["old_analytical_bounds"] = result.old_analytical_bounds
     end
     if !haskey(jld_out, "new_analytical_bounds")
-        jld_out["new_analytical_bounds"] = new_analytical_bounds
+        jld_out["new_analytical_bounds"] = result.new_analytical_bounds
     end
     if !haskey(jld_out, "true_bounds")
-        jld_out["true_bounds"] = true_bounds
+        jld_out["true_bounds"] = result.true_bounds
     end
     if !haskey(jld_out, "which_bounds")
-        jld_out["which_bounds"] = which_bounds
+        jld_out["which_bounds"] = result.which_bounds
     end
     close(jld_out)
+    return result
 end
 
 function compute_bounds()
