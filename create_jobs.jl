@@ -26,8 +26,12 @@ using Dates
 # const PROJECT_NAME = "metasurface_1x1x1_400comps_50oversamples_64scale"
 # const PROJECT_NAME = "metasurface_1x1x1_400comps_50oversamples_32scale"
 # const PROJECT_NAME = "metasurface_0p25x0p25x0p25_1350comps_50oversamples_128scale"
-const PROJECT_NAME = "metasurface_0p5x0p5x0p25_1350comps_50oversamples_64scale"
+const PROJECT_NAME = "metasurface_0p25x0p25x0p25_1350comps_50oversamples_32scale"
+# const PROJECT_NAME = "metasurface_0p5x0p5x0p25_2750comps_50oversamples_32scale"
+# const PROJECT_NAME = "metasurface_0p5x0p5x0p5_1350comps_50oversamples_32scale"
 # const PROJECT_NAME = "metasurface_0p125x0p125x0p125_1350comps_50oversamples_256scale"
+# const PROJECT_NAME = "spherecomp_1x1x1_1350comps_50_oversamples_silica"
+# const PROJECT_NAME = "fir_spherecomp_2x2x2_1350comps_50_oversamples_silica_aniso"
 
 # const PROJECT_NAME = "waveguide_0p25x1x1_@0p125_800comps_50oversamples"
 
@@ -276,7 +280,7 @@ function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
         k = params.rank
         p = params.oversamples
         rsvd_time_s_A6000 = TIME_PADDING * (1.4917e-8 * (2 + 2q)*(k+p)*max_vol*log2(max_vol) + 71.3435)
-	return min(rsvd_time_s_A6000, one(rsvd_time_s_A6000)*60*60) * num_pairs
+	return min(rsvd_time_s_A6000, 4*one(rsvd_time_s_A6000)*60*60) * num_pairs
     elseif job_type == ComputeBounds
         # bounds_time_s_A6000 = 0.0 # empirical formula
         bounds_time_s_A6000 = 20*60 # It's like 1 minute, but 20 mins is fine
@@ -437,8 +441,8 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
 	    if job_type == GenerateGreens
                 job_args *= " --gpu false"
 	    else
-                job_args *= " --gpu true"
-                # job_args *= " --gpu 1"
+                # job_args *= " --gpu true"
+                job_args *= " --gpu 0"
 	    end
 	    script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/\n"
 
@@ -450,36 +454,44 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
 end
 
 # cluster = ClusterConfig("fir")
-cluster = ClusterConfig("narval")
-# cluster = ClusterConfig("molering")
+# cluster = ClusterConfig("narval")
+cluster = ClusterConfig("molering")
 
 ### Meta surface
 # scale = -8
-scale = 64
+scale = 32
 
 # num_experiments = 101
 # separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
 # separations = [1//32]
 # separations = collect(2:(2*scale)) .// scale # collect(2:32) .// scale
-separations = vcat(collect(0:(3*32)) .// 32, Rational.(collect(10:5:300)))
+# separations = vcat(collect(0:(3*32)) .// 32, Rational.(collect(10:5:300)))
 # separations = collect(0:16) .// 32
+# separations = unique(round.(Int, logrange(1, 1000*32, 117))) .// 32 # 117 produces 100 sample points
+# separations = unique(round.(Int, logrange(1, 300*32, 250))) .// 32 
+# separations = unique(round.(Int, logrange(1, 300*32, 300))) .// 32 
+# separations = [11, 13, 15, 17, 19, 21, 23] .// 1
+separations = [10, 12, 14, 16, 18, 20, 22] .// 1
 num_experiments = length(separations)
 
 command = job_launcher_script(
     [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
     cluster,
-    repeat([(64, 64, 64)], num_experiments), # sender cells: 2×2×2 λ³
+    repeat([(8, 8, 8)], num_experiments), # sender cells: 2×2×2 λ³
     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
-    repeat([(64, 64, 64)], num_experiments), # receiver cells, same as sender
+    repeat([(8, 8, 8)], num_experiments), # receiver cells, same as sender
     repeat([nothing], num_experiments), # sm separations (SR system)
     repeat([nothing], num_experiments), # mr separations (SR system)
     [(sep, 0//1, 0//1) for sep in separations], # rs separations
     repeat([1//scale], num_experiments), # scales
-    repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
-    repeat([600], num_experiments), # RSVD target ranks
+    repeat([13.6 + 0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
+    repeat([700], num_experiments), # RSVD target ranks
     repeat([50], num_experiments), # RSVD oversamples
     repeat([14], num_experiments) # RSVD power iters
 )
+
+# whatever it is we are doing for the paper: 13.6 + 0.05im
+# silica: -2.30466271 + 1.478912im
 
 ### Waveguide
 
