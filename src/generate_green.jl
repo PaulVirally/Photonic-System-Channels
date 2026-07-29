@@ -54,7 +54,7 @@ function generate_green()
 
     if use_gpu(compute_env)
         @info string(now()) * " [generate_green::generate_green] Using GPU acceleration on device $(gpu_device(compute_env))"
-        if !haskey(ENV, "CC_CLUSTER") # This breaks on computer canada
+        if !haskey(ENV, "CC_CLUSTER") # This breaks on compute canada
             CUDA.device!(gpu_device(compute_env))
         end
     else
