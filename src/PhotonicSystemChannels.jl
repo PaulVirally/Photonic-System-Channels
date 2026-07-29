@@ -22,16 +22,7 @@ export generate_green
 include("rsvd.jl")
 export generate_rsvd
 
-# include("projectors.jl")
-# export ProjectiveConstraint, sample_projective_constraint, schur_complement_op, AbstractQuadrature, SymQuadrature, AsymQuadrature, multiplier_boundary
-
 include("bounds.jl")
-# include("bounds_denial.jl")
-# include("bounds_bargaining.jl")
-# include("bounds_acceptance.jl")
-export compute_bounds
-
-# include("verlan2.jl")
-# export verlan
+export compute_bounds, load_bounds_inputs, bounds_from_spectrum
 
 end # module

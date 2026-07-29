@@ -2,7 +2,7 @@ module SMRSystems
 
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
 export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
-export load_green_function, file_prefix, fix_mask
+export load_green_function, file_prefix, fix_mask, serialize_atomic
 
 using GilaElectromagnetics
 using Serialization
@@ -233,6 +233,39 @@ function volume_pairs(smr::SMRSystem)
     return pairs
 end
 
+"""
+    serialize_atomic(fpath, obj)
+
+Serialize `obj` to `fpath` via a process-unique temporary file plus a rename.
+
+Green function filenames depend only on the geometry, so a self operator is
+shared by every separation in a sweep. Launching N jobs at once means N
+processes serializing to the same path. This function ensures that only one
+process writes to the final path at a time, and that the file is not corrupted
+if multiple processes try to write at once.
+
+# Arguments
+- `fpath::AbstractString`: The file path to serialize to.
+- `obj`: The object to serialize.
+
+# Return
+- `fpath::AbstractString`: The file path that was serialized to.
+"""
+function serialize_atomic(fpath::AbstractString, obj)
+    mkpath(dirname(fpath))
+    tmppath = "$(fpath).tmp.$(getpid()).$(rand(UInt32))"
+    try
+        open(tmppath, "w") do io
+            serialize(io, obj)
+        end
+        mv(tmppath, fpath; force=true)
+    catch err
+        rm(tmppath; force=true)
+        rethrow(err)
+    end
+    return fpath
+end
+
 function fix_mask(mask::StepRange{Int})
     if mask.start > 0 && mask.stop > 0
         return mask
@@ -298,11 +331,8 @@ function load_green_function(environment::ComputeEnvironment, system::SMRSystem,
     G₀ = VacuumGreenOperator(target_volume, source_volume)
     @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
     if save_to_disk
-        mkpath(dirname(fpath))
         @info string(now()) * " [SMRSystem::load_green_function] Saving G₀ to $(fpath)"
-        io = open(fpath, "w")
-        serialize(io, G₀)
-        close(io)
+        serialize_atomic(fpath, G₀)
     end
     if use_gpu(environment)
         @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
@@ -345,11 +375,8 @@ function load_green_function(environment::ComputeEnvironment, system::SMRSystem,
     G₀ = MultiRegionVacuumGreenOperator(target_volumes, source_volumes)
     @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
     if save_to_disk
-        mkpath(dirname(fpath))
         @info string(now()) * " [SMRSystem::load_green_function] Saving G₀ to $(fpath)"
-        io = open(fpath, "w")
-        serialize(io, G₀)
-        close(io)
+        serialize_atomic(fpath, G₀)
     end
     if use_gpu(environment)
         @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
