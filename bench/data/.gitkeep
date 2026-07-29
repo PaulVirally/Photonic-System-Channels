@@ -1,0 +1,2 @@
+Drop the calibration CSVs from each cluster here; `julia bench/fit.jl` picks up
+every *.csv in this directory.
