@@ -259,16 +259,6 @@ function _compute_bounds_smr(::ComputeEnvironment, ::SMRSystem, ::RSVDParams)
     throw("Not implemented yet")
 end
 
-"""
-    load_bounds_inputs(compute_env, smr)
-
-Read everything `bounds_from_spectrum` needs out of the RSVD output written to
-scratch by `generate_rsvd`, already sign-corrected and sorted by descending Γ.
-
-Split out from `_compute_bounds_sr` so that the cost-model calibration in
-`bench/` can drive the bounds computation with synthetic spectra instead of
-having to run a full RSVD first.
-"""
 function load_bounds_inputs(compute_env::ComputeEnvironment, smr::SMRSystem)
     jld_in_path = joinpath(scratch_dir(compute_env), "$(file_prefix(smr)).jld")
     jld_in = jldopen(jld_in_path, "r")
@@ -293,16 +283,11 @@ end
 Compute the σₙ(Pᵣₛ) bounds from an already-loaded `Asym(G⁰ᵤᵣ)` spectrum. `Γ` must
 be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
 
-Pure computation: reads nothing and writes nothing.
-
 # Keyword arguments
 - `basis_size`: how many leading eigenvectors to use as the projection basis.
 - `G₀_uu`: pre-loaded universe operator, loaded here if not supplied.
 - `outer_indices`: which `n` of the outer `σₙ` loop to actually evaluate.
-  `nothing` (the default) means all of them, which is the only setting that
-  produces valid bounds; the benchmark harness passes a subset to sample the
-  per-`n` cost without paying for the whole `O(num_pos²)` loop, and the returned
-  `complete` flag is `false` in that case.
+  `nothing` (the default) means all of them.
 
 # Returns
 A named tuple with the bounds, the bookkeeping needed to save them, and
