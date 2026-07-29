@@ -88,8 +88,13 @@ function ClusterSpec(name::AbstractString)
     name == "narval" && return ClusterSpec("narval", true, CC_CODE_DIR, CC_CAL_ROOT, CC_ACCOUNT,
                                            "module load StdEnv/2023 julia/1.12.5 cuda/12.2",
                                            "a100:1", 12, 240, 40)
+    # 128 logical threads (64 physical cores with SMT): molering is an AMD Ryzen
+    # Threadripper Pro 5995WX, and production jobs there get all of them via
+    # `-t auto`. The scan therefore has to reach 128, and note that the second
+    # hyperthread on each core adds little for FFT and quadrature work -- expect
+    # the measured scaling to flatten or reverse between 64 and 128.
     name == "molering" && return ClusterSpec("molering", false, MOLERING_CODE_DIR,
-                                             MOLERING_CAL_ROOT, "", "", "a6000", 32, 480, 48)
+                                             MOLERING_CAL_ROOT, "", "", "a6000", 128, 480, 48)
     error("Unknown cluster '$name'. Known: fir, narval, molering.")
 end
 
@@ -120,7 +125,16 @@ const BODIES = [
 const SEPARATIONS = [0 // 1, 1 // 32, 8 // 32, 1 // 1, 1000 // 1]
 const QUICK_SEPARATIONS = [0 // 1, 8 // 32, 1000 // 1]
 
-const THREAD_SCAN = [1, 2, 4, 8]
+#=
+Thread counts for the scan, filtered to the cluster's core count. This has to
+reach as far as the production jobs actually go, or the fitted efficiency
+`eta(T) = 1 + s(T - 1)` gets extrapolated instead of interpolated -- and a linear
+efficiency model does not survive that. On fir and narval the filter leaves
+[1, 2, 4, 8], which is exactly the range `choose_cores` picks from. On molering
+production runs with `-t auto`, i.e. every core, so the scan has to go all the way
+up.
+=#
+const THREAD_SCAN = [1, 2, 4, 8, 16, 32, 64, 128]
 
 "Sketch widths for the dense points, spanning the ranks actually in use."
 const DENSE_WIDTHS = [128, 512, 1400, 2800]

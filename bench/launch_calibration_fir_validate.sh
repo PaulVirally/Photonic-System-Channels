@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cost-model calibration for fir, tier=validate.
-# Generated 2026-07-29T11:44:32.320 by bench/plan.jl. Do not edit; regenerate instead.
+# Generated 2026-07-29T12:26:43.146 by bench/plan.jl. Do not edit; regenerate instead.
 #
 # Every point is its own job: one point running out of memory or time must
 # not take the rest of the calibration with it. Rows are appended to

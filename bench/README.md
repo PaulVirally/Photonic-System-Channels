@@ -151,3 +151,11 @@ Worth knowing before you trust a number:
 - **MIG slices are approximated.** The calibration runs on a whole GPU, and a
   slice's time is scaled by the inverse of its SM fraction. Memory bandwidth does
   not scale with SM count, so this over-estimates — in the safe direction.
+- **Thread counts are pinned, not `auto`.** Every point runs at a fixed `-t`,
+  because the parallel efficiency `eta(T) = 1 + s(T-1)` is fitted from the scan
+  and `-t auto` would collapse the scan. The scan has to reach as far as
+  production actually runs: on fir and narval that is 8 (`choose_cores` never
+  picks more, since `max_cores` is 12), on molering it is every core because
+  `create_jobs.jl` emits `-t auto` there. `ClusterSpec` assumes 64 cores on
+  molering; if `julia -e 'println(Sys.CPU_THREADS)'` there says more, raise it and
+  regenerate, otherwise the largest jobs get an extrapolated efficiency.

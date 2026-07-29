@@ -192,6 +192,47 @@ function has_thread_variation(rows::Vector{Row})
 end
 
 """
+    thread_scan_report(rows) -> Vector{String}
+
+The raw scan: measured time and speedup versus one thread, per body.
+
+Printed rather than only fitted because `eta(T) = 1 + s(T - 1)` cannot represent a
+plateau, and on a machine with SMT the scan will very likely flatten (or reverse)
+once it passes the physical core count. If it does, the single fitted `s` is a
+compromise across the whole range, and the right response is to stop asking for
+threads past the knee -- which you can only see by looking at the numbers.
+"""
+function thread_scan_report(rows::Vector{Row})
+    groups = Dict{Any,Vector{Row}}()
+    for row in rows
+        row["kind"] in ("g0_ext", "g0_self") || continue
+        key = (row["kind"], row["n_x"], row["n_y"], row["n_z"], row["sep_num"], row["sep_den"])
+        push!(get!(groups, key, Row[]), row)
+    end
+    lines = String[]
+    for (key, group) in sort(collect(groups); by=first)
+        points = [(int(r, "threads"), num(r, "time_s")) for r in group]
+        points = [(t, s) for (t, s) in points if t !== nothing && s !== nothing]
+        length(unique(first, points)) >= 3 || continue
+        sort!(points; by=first)
+        base = last(points[1])
+        push!(lines, "thread scan, $(key[1]) $(key[2])x$(key[3])x$(key[4]):")
+        for (threads, seconds) in points
+            push!(lines, @sprintf("    t=%-4d %8.2f s   speedup %5.2fx   efficiency %4.0f%%",
+                                  threads, seconds, base / seconds,
+                                  100 * (base / seconds) / threads))
+        end
+        best_threads = first(argmin(last, points))
+        max_threads = first(points[end])
+        push!(lines, best_threads < max_threads ?
+              @sprintf("    fastest at t=%d, slower by t=%d: do not ask for more than %d",
+                       best_threads, max_threads, best_threads) :
+              @sprintf("    still improving at t=%d (the largest sampled)", max_threads))
+    end
+    return lines
+end
+
+"""
     fit_greens_time(rows, s) -> NamedTuple
 
 Non-negative least squares for the Green-block construction coefficients. The
@@ -494,6 +535,7 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         fields[:g0_thread_scaling] = s
         push!(report, @sprintf("%-26s %.2f  (jointly with the block-time fit)",
                                "g0_thread_scaling", s))
+        append!(report, thread_scan_report(rows))
     else
         push!(missing_fits, "g0_thread_scaling (all g0 points ran at one thread count)")
     end

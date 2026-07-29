@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cost-model calibration for molering, tier=full.
-# Generated 2026-07-29T11:44:42.446 by bench/plan.jl. Do not edit; regenerate instead.
+# Generated 2026-07-29T12:26:52.685 by bench/plan.jl. Do not edit; regenerate instead.
 #
 # No scheduler here, so points run one at a time in the foreground. Each is
 # allowed to fail without stopping the run; check the logs afterwards for
@@ -20,7 +20,7 @@ cd $CODE_DIR
 
 export PSC_CLUSTER=molering
 
-total=121
+total=125
 index=0
 
 index=$((index + 1))
@@ -442,6 +442,34 @@ export PSC_T0=$(date +%s)
 julia --project=. -t 8 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $OUT --cluster molering --note 'tier=full;label=g0threads_l1_t8' \
     > $CAL_ROOT/logs/g0threads_l1_t8.out 2>&1 \
     || echo "  FAILED: g0threads_l1_t8 (see $CAL_ROOT/logs/g0threads_l1_t8.out)"
+
+index=$((index + 1))
+echo "[$index/$total] g0threads_l1_t16"
+export PSC_T0=$(date +%s)
+julia --project=. -t 16 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $OUT --cluster molering --note 'tier=full;label=g0threads_l1_t16' \
+    > $CAL_ROOT/logs/g0threads_l1_t16.out 2>&1 \
+    || echo "  FAILED: g0threads_l1_t16 (see $CAL_ROOT/logs/g0threads_l1_t16.out)"
+
+index=$((index + 1))
+echo "[$index/$total] g0threads_l1_t32"
+export PSC_T0=$(date +%s)
+julia --project=. -t 32 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $OUT --cluster molering --note 'tier=full;label=g0threads_l1_t32' \
+    > $CAL_ROOT/logs/g0threads_l1_t32.out 2>&1 \
+    || echo "  FAILED: g0threads_l1_t32 (see $CAL_ROOT/logs/g0threads_l1_t32.out)"
+
+index=$((index + 1))
+echo "[$index/$total] g0threads_l1_t64"
+export PSC_T0=$(date +%s)
+julia --project=. -t 64 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $OUT --cluster molering --note 'tier=full;label=g0threads_l1_t64' \
+    > $CAL_ROOT/logs/g0threads_l1_t64.out 2>&1 \
+    || echo "  FAILED: g0threads_l1_t64 (see $CAL_ROOT/logs/g0threads_l1_t64.out)"
+
+index=$((index + 1))
+echo "[$index/$total] g0threads_l1_t128"
+export PSC_T0=$(date +%s)
+julia --project=. -t 128 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $OUT --cluster molering --note 'tier=full;label=g0threads_l1_t128' \
+    > $CAL_ROOT/logs/g0threads_l1_t128.out 2>&1 \
+    || echo "  FAILED: g0threads_l1_t128 (see $CAL_ROOT/logs/g0threads_l1_t128.out)"
 
 index=$((index + 1))
 echo "[$index/$total] mvself_l0p25"
