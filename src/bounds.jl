@@ -455,7 +455,9 @@ function compute_bounds()
 
     if use_gpu(compute_env)
         @info string(now()) * " [bounds_bargaining::compute_bounds] Using GPU acceleration on device $(gpu_device(compute_env))"
-        CUDA.device!(gpu_device(compute_env))
+        if !haskey(ENV, "CC_CLUSTER") # This breaks on computer canada
+            CUDA.device!(gpu_device(compute_env))
+        end
     else
         @info string(now()) * " [bounds_bargaining::compute_bounds] Using CPU computation"
     end
