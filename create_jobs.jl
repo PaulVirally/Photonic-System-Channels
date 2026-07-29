@@ -1,39 +1,42 @@
 using PhotonicSystemChannels
 using GilaElectromagnetics
 using Dates
+using Printf
 
-# CreateJobs.jl
-# -------------
-# Change the project name below and your compute canada / molering settings
-# first, then go to the bottom of the file to set up your desired parameter
-# combinations. Finally, run this script with
-# `julia create_jobs.jl > job_launcher.sh` and copy it over to the cluster of
-# your choice to run it with `bash job_launcher.sh`.
+# create_jobs.jl
+# --------------
+# Set PROJECT_NAME and the cluster below, define your experiments at the bottom
+# of the file, then run
+#
+#     julia create_jobs.jl
+#
+# which writes `jobs/launch_<PROJECT_NAME>.sh` and prints the command to copy it
+# over. Run that script on the cluster to submit everything.
+#
+# Time and memory requests come from `bench/cost_model.jl`, calibrated per cluster
+# by the harness in `bench/` (see bench/README.md). If a cluster has no
+# `bench/coeffs_<cluster>.jl` yet, the model falls back to uncalibrated analytic
+# guesses and says so loudly -- treat those requests as placeholders.
 
-# const PROJECT_NAME = "heat-transfer_sep_2x2x0p5_512comps"
-# const PROJECT_NAME = "SM_metasurface_2x2x0p5_400comps"
+include(joinpath(@__DIR__, "bench", "cost_model.jl"))
+using .CostModel
 
-# const PROJECT_NAME = "metasurface_1x2x2_700comps_50oversamples"
-# const PROJECT_NAME = "metasurface_1x3x3_115comps_50oversamples"
-# const PROJECT_NAME = "fir_metasurface_1x1x1_2750comps_50oversamples"
-# const PROJECT_NAME = "fir_metasurface_1x1x1_470comps_50oversamples_64scale"
-# const PROJECT_NAME = "metasurface_1x2x2_340comps_50oversamples"
-# const PROJECT_NAME = "metasurface_1x2x2_1350comps_50oversamples_coarse"
-# const PROJECT_NAME = "metasurface_1x1x1_1350comps_50oversamples"
-# const PROJECT_NAME = "fir_metasurface_2x2x2_1350comps_50oversamples_aniso"
-# const PROJECT_NAME = "fir_metasurface_3x3x3_800comps_50oversamples_aniso"
-# const PROJECT_NAME = "fir_metasurface_4x4x4_600comps_50oversamples_aniso"
-# const PROJECT_NAME = "metasurface_1x1x1_400comps_50oversamples_64scale"
-# const PROJECT_NAME = "metasurface_1x1x1_400comps_50oversamples_32scale"
-# const PROJECT_NAME = "metasurface_0p25x0p25x0p25_1350comps_50oversamples_128scale"
 const PROJECT_NAME = "metasurface_0p25x0p25x0p25_1350comps_50oversamples_32scale"
-# const PROJECT_NAME = "metasurface_0p5x0p5x0p25_2750comps_50oversamples_32scale"
-# const PROJECT_NAME = "metasurface_0p5x0p5x0p5_1350comps_50oversamples_32scale"
-# const PROJECT_NAME = "metasurface_0p125x0p125x0p125_1350comps_50oversamples_256scale"
-# const PROJECT_NAME = "spherecomp_1x1x1_1350comps_50_oversamples_silica"
-# const PROJECT_NAME = "fir_spherecomp_2x2x2_1350comps_50_oversamples_silica_aniso"
 
-# const PROJECT_NAME = "waveguide_0p25x1x1_@0p125_800comps_50oversamples"
+# Previous project names:
+#   heat-transfer_sep_2x2x0p5_512comps
+#   SM_metasurface_2x2x0p5_400comps
+#   metasurface_1x2x2_700comps_50oversamples
+#   fir_metasurface_1x1x1_2750comps_50oversamples
+#   fir_metasurface_2x2x2_1350comps_50oversamples_aniso
+#   fir_metasurface_3x3x3_800comps_50oversamples_aniso
+#   fir_metasurface_4x4x4_600comps_50oversamples_aniso
+#   fir_spherecomp_2x2x2_1350comps_50_oversamples_silica_aniso
+#   waveguide_0p25x1x1_@0p125_800comps_50oversamples
+#
+# Susceptibilities in use:
+#   paper: 13.6 + 0.05im (TODO: use 11.098 + 0.05im?)
+#   silica: -2.30466271 + 1.478912im
 
 # Molering config
 const MOLERING_UNAME = "paulv"
@@ -46,64 +49,93 @@ const MOLERING_SCRATCH_DIR = "/home/molering/fatmole/$(MOLERING_UNAME)/Photonic-
 const CC_UNAME = "pvirally"
 const CC_DEFAULT_GROUP_NAME = "def-smolesky"
 const CC_RRG_NAME = "rrg-smolesky"
-# const CC_RRG_CLUSTERS = ["narval"]
 const CC_RRG_CLUSTERS = [] # The RRG doesn't work anymore :(
 const CC_CODE_DIR = "/home/$(CC_UNAME)/Photonic-System-Channels/"
 const CC_PRELOAD_DIR = "/home/$(CC_UNAME)/scratch/preload/"
 const CC_SCRATCH_DIR = "/home/$(CC_UNAME)/scratch/Photonic-System-Channels/"
 
-const MEMORY_PADDING = 1.2 # Factor to pad memory estimates by to avoid OOM errors
-const TIME_PADDING = 1.5 # Factor to pad time estimates by to avoid time limit exceeded errors
+"""
+    NUM_POS_FRACTION
+
+Assumed fraction of the computed rank that has a positive `Asym(G⁰ᵤᵣ)` eigenvalue.
+The bounds job runs one dense `k x k` generalized eigendecomposition per positive
+eigenvalue and an `O(num_pos²)` inner loop on top, so this number matters a lot
+and is only known after the RSVD has run.
+
+Measured across `data analysis/data`: 0.22-0.52, clustering near 0.50 for the
+larger runs. 0.60 is deliberately on the high side so the bounds job does not run out of memory.
+"""
+const NUM_POS_FRACTION = 0.60
+
+"""
+    MIN_MEMORY_GB, MIN_TIME_S
+
+Floors on every request. 4 GB because nothing useful runs in less and the
+scheduler does not reward shaving it; 10 minutes because process startup and
+package loading alone can eat several minutes on a cold shared filesystem.
+"""
+const MIN_MEMORY_GB = 4
+const MIN_TIME_S = 10 * 60
+
+"""
+    TARGET_WALL_TIME_S
+
+Wall time the core-count heuristic aims to come in under for the CPU job. Alliance
+schedulers backfill short jobs aggressively, so a job that fits in a few hours
+starts sooner than one that asks for a day. Only used to pick `--cpus-per-task`.
+"""
+const TARGET_WALL_TIME_S = 3 * 3600
+
+const CORE_CANDIDATES = [1, 2, 4, 8, 16]
 
 @enum JobType begin
-    GenerateGreens
-    GenerateRSVD
-    ComputeBounds
+    GenerateGreensJob
+    GenerateRSVDJob
+    ComputeBoundsJob
 end
-const ORDERED_JOBS = [GenerateGreens, GenerateRSVD, ComputeBounds]
+const ORDERED_JOBS = [GenerateGreensJob, GenerateRSVDJob, ComputeBoundsJob]
+
+cost_job(job::JobType) = job == GenerateGreensJob ? CostModel.GenerateGreens :
+                         job == GenerateRSVDJob ? CostModel.GenerateRSVD :
+                         CostModel.ComputeBounds
 
 function main_file(job::JobType)
-    if job == GenerateGreens
-        return "generate_green.jl"
-    elseif job == GenerateRSVD
-        return "generate_rsvd.jl"
-    elseif job == ComputeBounds
-        return "compute_bounds.jl"
-    end
+    job == GenerateGreensJob && return "generate_green.jl"
+    job == GenerateRSVDJob && return "generate_rsvd.jl"
+    job == ComputeBoundsJob && return "compute_bounds.jl"
     error("Unknown job type: $job")
 end
 
 function job_var_name(job::JobType)
-    if job == GenerateGreens
-        return "g0_job"
-    elseif job == GenerateRSVD
-        return "rsvd_job"
-    elseif job == ComputeBounds
-        return "bounds_job"
-    end
+    job == GenerateGreensJob && return "g0_job"
+    job == GenerateRSVDJob && return "rsvd_job"
+    job == ComputeBoundsJob && return "bounds_job"
     error("Unknown job type: $job")
 end
 
 function previous_job(job::JobType)
-    if job == GenerateGreens
-        return nothing
-    elseif job == GenerateRSVD
-        return GenerateGreens
-    elseif job == ComputeBounds
-        return GenerateRSVD
-    end
+    job == GenerateGreensJob && return nothing
+    job == GenerateRSVDJob && return GenerateGreensJob
+    job == ComputeBoundsJob && return GenerateRSVDJob
     error("Unknown job type: $job")
 end
 
-const CPU_TURBO_GHZ_REFERENCE = 4.5 # Benchmarks for CPU workloads were done on an AMD Ryzen Threadripper Pro 5995WX, which turbos to 4.5 GHz
-const GPU_FP64_TFLOPS_REFERENCE = 0.6 # Benchmarks for (double precision) GPU workloads were done on an NVIDIA A6000, which (I'm estimating here) can do roughly 0.6 TFLOPS
+function Base.string(job::JobType)
+    job == GenerateGreensJob && return "Greens function generation"
+    job == GenerateRSVDJob && return "RSVD generation"
+    job == ComputeBoundsJob && return "bounds computation"
+    error("Unknown job type: $job")
+end
+
+"Does this job run on the GPU? The Green function job deliberately does not."
+uses_gpu(job::JobType) = job != GenerateGreensJob
 
 struct ClusterConfig
     name::String
     has_slurm::Bool
-    cpu_turbo_GHz::Float64
-    gpu_fp64_TFLOPS::Float64
-    max_vram_GB::Int64
+    max_vram_GB::Int
+    max_host_GB::Int
+    max_cores::Int
     preload_dir::String
     project_dir::String
     scratch_dir::String
@@ -112,98 +144,293 @@ end
 
 num_threads(config::ClusterConfig) = config.has_slurm ? "\\\$SLURM_CPUS_PER_TASK" : "auto"
 
-function cpu2turbo(cpu::String)
-    if cpu == "Epyc 7413" return 4.6 end
-    return error("Unknown CPU: $cpu")
-end
+cc_project_dir(server) =
+    server in CC_RRG_CLUSTERS ?
+    "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/" :
+    "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/"
 
 function ClusterConfig(server::AbstractString)
     if server == "molering"
-        return ClusterConfig(server,
-                             false, # Does not run slurm
-                             4.5, # AMD Ryzen Threadripper Pro 5995WX turbo frequency
-                             0.6, # NVIDIA A6000 FP64 TFLOPS
-                             48, # Max VRAM in GB
-                             MOLERING_PRELOAD_DIR,
-                             MOLERING_PROJECT_DIR,
-                             MOLERING_SCRATCH_DIR,
-                             MOLERING_CODE_DIR)
+        return ClusterConfig(server, false,
+                             48,  # NVIDIA A6000
+                             480, # host RAM
+                             32,
+                             MOLERING_PRELOAD_DIR, MOLERING_PROJECT_DIR,
+                             MOLERING_SCRATCH_DIR, MOLERING_CODE_DIR)
     elseif server == "narval"
-        return ClusterConfig(server,
-                             true, # Runs slurm
-                             3.6, # AMD EPYC 7413 turbo frequency
-                             9.7, # NVIDIA A100SXM4 40GB FP64 TFLOPS
-                             40, # Max VRAM in GB
-                             CC_PRELOAD_DIR,
-                             server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/",
-                             CC_SCRATCH_DIR,
-                             CC_CODE_DIR)
+        return ClusterConfig(server, true,
+                             40,  # NVIDIA A100-SXM4-40GB
+                             240,
+                             12,
+                             CC_PRELOAD_DIR, cc_project_dir(server),
+                             CC_SCRATCH_DIR, CC_CODE_DIR)
     elseif server == "fir"
-        return ClusterConfig(server,
-                             true, # Runs slurm
-                             3.8, # AMD EPYC 9454 turbo frequency
-                             34.0, # NVIDIA A40 FP64 TFLOPS
-                             80, # Max VRAM in GB
-                             CC_PRELOAD_DIR,
-                             server in CC_RRG_CLUSTERS ? "/home/$(CC_UNAME)/projects/$(CC_RRG_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/" : "/home/$(CC_UNAME)/projects/$(CC_DEFAULT_GROUP_NAME)/$(CC_UNAME)/Photonic-System-Channels/projects/",
-                             CC_SCRATCH_DIR,
-                             CC_CODE_DIR)
+        return ClusterConfig(server, true,
+                             80,  # NVIDIA H100 80GB HBM3
+                             240,
+                             12,
+                             CC_PRELOAD_DIR, cc_project_dir(server),
+                             CC_SCRATCH_DIR, CC_CODE_DIR)
     end
     error("Unknown server: $server")
 end
 
-function gpu_string(cluster::ClusterConfig, memory_GB::Int)
-    # if memory_GB > cluster.max_vram_GB
-    #     error("Requested memory $(memory_GB) GB exceeds max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)")
-    # end
+"""
+    gpu_options(cluster) -> Vector{(name, vram_GB, compute_fraction)}
+
+The GPU allocations available on a cluster, smallest first. MIG slices get a
+fraction of the streaming multiprocessors as well as a fraction of the memory.
+"""
+function gpu_options(cluster::ClusterConfig)
     if cluster.name == "narval"
-        if memory_GB < 5
-            return "a100_1g.5gb"
-        elseif memory_GB < 10
-            return "a100_2g.10gb"
-        elseif memory_GB < 20
-            return "a100_3g.20gb"
-        end
-        return "a100"
+        return [("a100_1g.5gb", 5, 1 / 8), ("a100_2g.10gb", 10, 2 / 8),
+                ("a100_3g.20gb", 20, 3 / 8), ("a100", 40, 1.0)]
     elseif cluster.name == "fir"
-        if memory_GB < 10
-            return "nvidia_h100_80gb_hbm3_1g.10gb"
-        elseif memory_GB < 20
-            return "nvidia_h100_80gb_hbm3_2g.20gb"
-        elseif memory_GB < 40
-            return "nvidia_h100_80gb_hbm3_3g.40gb"
-        end
-        return "h100"
+        return [("nvidia_h100_80gb_hbm3_1g.10gb", 10, 1 / 8),
+                ("nvidia_h100_80gb_hbm3_2g.20gb", 20, 2 / 8),
+                ("nvidia_h100_80gb_hbm3_3g.40gb", 40, 3 / 8),
+                ("h100", 80, 1.0)]
     elseif cluster.name == "molering"
-        return "a6000"
+        return [("a6000", 48, 1.0)]
     end
-    error("GPU string not implemented for cluster: $(cluster.name)")
+    error("GPU options not implemented for cluster: $(cluster.name)")
 end
 
-function gpu_compute_fraction(gpu_str::AbstractString)
-    if gpu_str == "a100_1g.5gb"
-        return 1/8
-    elseif gpu_str == "a100_2g.10gb"
-        return 2/8
-    elseif gpu_str == "a100_3g.20gb"
-        return 3/8
-    elseif gpu_str == "a100_4g.20gb"
-        return 4/8
-    elseif gpu_str == "a100"
-        return 1.0
-    elseif gpu_str == "nvidia_h100_80gb_hbm3_1g.10gb"
-        return 1/8
-    elseif gpu_str == "nvidia_h100_80gb_hbm3_2g.20gb"
-        return 2/8
-    elseif gpu_str == "nvidia_h100_80gb_hbm3_3g.40gb"
-        return 3/8
-    elseif gpu_str == "h100"
-        return 1.0
-    elseif gpu_str == "a6000"
-        return 1.0
+"""
+    choose_gpu(cluster, vram_GB) -> (name, compute_fraction)
+
+Smallest allocation whose memory fits. A slice is cheaper to schedule but slower,
+so `compute_fraction` is used to stretch the time request.
+"""
+function choose_gpu(cluster::ClusterConfig, vram_GB::Real)
+    options = gpu_options(cluster)
+    for (name, capacity, fraction) in options
+        vram_GB <= capacity && return (name, fraction)
     end
-    error("GPU compute fraction not implemented for GPU string: $gpu_str")
+    return (options[end][1], options[end][3])
 end
+
+"""
+    Experiment
+
+One parameter combination. The sender/receiver form (`mediator === nothing`) is
+the one the cost model covers; a mediator is still accepted so old sweeps can be
+reproduced, but its resources fall back to a crude heuristic.
+
+`separation` is the surface-to-surface gap along x in wavelengths, which is what
+`--rs-sep` takes.
+"""
+struct Experiment
+    sender_cells::NTuple{3,Int}
+    mediator_cells::Union{Nothing,NTuple{3,Int}}
+    receiver_cells::NTuple{3,Int}
+    separation::Union{Nothing,Rational{Int}}
+    sm_separation::Union{Nothing,NTuple{3,Rational{Int}}}
+    mr_separation::Union{Nothing,NTuple{3,Rational{Int}}}
+    scale::Rational{Int}
+    chi::ComplexF64
+    rank::Int
+    oversamples::Int
+    power_iters::Int
+end
+
+"""
+    sr_experiment(; cells, separation, scale, chi, rank, oversamples, power_iters,
+                    receiver_cells=cells)
+
+A single sender/receiver experiment. `scale` follows `SMRSystem`'s convention: a
+positive rational is the isotropic cell size in wavelengths, and a *negative* one
+means anisotropic cells of `(1//32, |scale|, |scale|)`.
+"""
+sr_experiment(; cells::NTuple{3,Int}, separation::Rational{Int},
+              scale::Rational{Int}=1 // 32, chi::ComplexF64=13.6 + 0.05im,
+              rank::Int, oversamples::Int=50, power_iters::Int=14,
+              receiver_cells::NTuple{3,Int}=cells) =
+    Experiment(cells, nothing, receiver_cells, separation, nothing, nothing,
+               scale, chi, rank, oversamples, power_iters)
+
+"""
+    sr_sweep(; separations, kwargs...)
+
+One `Experiment` per separation, everything else held fixed. This is what replaces
+the old `repeat([...], num_experiments)` columns: the sweep variable is written
+once and nothing else has to be kept in sync with its length.
+"""
+sr_sweep(; separations::AbstractVector{Rational{Int}}, kwargs...) =
+    [sr_experiment(; separation=sep, kwargs...) for sep in separations]
+
+"""
+    smr_experiment(; sender_cells, mediator_cells, receiver_cells,
+                     sm_separation, mr_separation, scale, chi, rank, ...)
+
+A sender/mediator/receiver experiment. The calibrated cost model does not cover
+these -- only the `mediator === nothing` pipeline was measured -- so their requests
+come from `fallback_resources`, which is a deliberately generous guess off the
+largest volume. Fine for reproducing an old sweep; do not expect the requests to
+be tight.
+"""
+smr_experiment(; sender_cells::NTuple{3,Int}, mediator_cells::NTuple{3,Int},
+               receiver_cells::NTuple{3,Int},
+               sm_separation::NTuple{3,Rational{Int}},
+               mr_separation::NTuple{3,Rational{Int}},
+               scale::Rational{Int}=1 // 32, chi::ComplexF64=13.6 + 0.05im,
+               rank::Int, oversamples::Int=50, power_iters::Int=14) =
+    Experiment(sender_cells, mediator_cells, receiver_cells, nothing,
+               sm_separation, mr_separation, scale, chi, rank, oversamples, power_iters)
+
+is_sr(exp::Experiment) = isnothing(exp.mediator_cells)
+
+function to_smr_system(exp::Experiment)
+    return SMRSystem(exp.sender_cells, exp.mediator_cells, exp.receiver_cells,
+                     exp.sm_separation, exp.mr_separation,
+                     is_sr(exp) ? (exp.separation, 0 // 1, 0 // 1) : nothing,
+                     exp.scale, exp.chi)
+end
+
+to_rsvd_params(exp::Experiment) = RSVDParams(exp.rank, exp.oversamples, exp.power_iters)
+
+"""
+    to_cost_point(exp, threads)
+
+The cost model's view of an experiment. Note what is *not* here: the union of the
+sender and receiver volumes. Nothing in the sender/receiver pipeline builds an
+operator on that bounding box -- the "universe" is the concatenated
+`[sender; receiver]` vector and a four-block multi-region operator -- so the gap
+between the bodies contributes nothing to cost. Using `prod(union.cel)` is what
+made a 10000-wavelength separation ask for terabytes.
+"""
+function to_cost_point(exp::Experiment, threads::Int)
+    scale = exp.scale < 0 ? (1 // 32, abs(exp.scale), abs(exp.scale)) :
+            (exp.scale, exp.scale, exp.scale)
+    return SRPoint(exp.sender_cells, exp.receiver_cells;
+                   scale=scale, separation=exp.separation,
+                   rank=exp.rank, oversamples=exp.oversamples,
+                   power_iters=exp.power_iters, threads=threads,
+                   num_pos=ceil(Int, NUM_POS_FRACTION * exp.rank))
+end
+
+# --------------------------------------------------------------------------- #
+# Resources
+# --------------------------------------------------------------------------- #
+
+"""
+    Resources
+
+What one job asks the scheduler for, plus the raw predictions it came from so the
+summary table can show its work.
+"""
+struct Resources
+    time_s::Int
+    host_GB::Int
+    vram_GB::Int
+    cores::Int
+    gpu_name::String
+    gpu_fraction::Float64
+    over_vram::Bool
+end
+
+"""
+    GPU_JOB_CORES
+
+Cores for the GPU jobs. They are not CPU-bound, but they are not single-threaded
+either: the RSVD job pulls an `N_u x k` eigenvector block back to the host and
+writes it through JLD2, and the bounds job reads one back. A couple of cores keeps
+that and the garbage collector from serialising against the device work, and asking
+for more would burn allocation on idle cores.
+"""
+const GPU_JOB_CORES = 2
+
+"""
+    choose_cores(job, exp, cluster, coeffs) -> Int
+
+For the Green-function job: the fewest cores that bring the predicted wall time
+under `TARGET_WALL_TIME_S`. Compute Canada charges core-seconds and the quadrature
+loops scale sublinearly, so asking for more cores than the wall-time target needs
+spends allocation without buying priority. For the GPU jobs: a fixed small count.
+"""
+function choose_cores(job::JobType, exp::Experiment, cluster::ClusterConfig,
+                      coeffs::Coefficients)
+    uses_gpu(job) && return min(GPU_JOB_CORES, cluster.max_cores)
+    is_sr(exp) || return min(4, cluster.max_cores)
+    candidates = filter(<=(cluster.max_cores), CORE_CANDIDATES)
+    isempty(candidates) && return cluster.max_cores
+    for cores in candidates
+        t = predict(CostModel.GenerateGreens, to_cost_point(exp, cores), coeffs).time_s
+        t <= TARGET_WALL_TIME_S && return cores
+    end
+    return last(candidates)
+end
+
+"""
+    fallback_resources(job, exp, cluster)
+
+Resources for a mediator system, which the calibrated model does not cover. Scales
+off the largest single volume with the old empirical constants; deliberately
+generous, and warned about at generation time.
+"""
+function fallback_resources(job::JobType, exp::Experiment, cluster::ClusterConfig)
+    volume = 3 * maximum(prod, filter(!isnothing,
+                                      [exp.sender_cells, exp.mediator_cells, exp.receiver_cells]))
+    c = exp.rank + exp.oversamples
+    if job == GenerateGreensJob
+        time_s = ceil(Int, 2.15e-6 * volume * log2(volume) * 4 + 30 * 60)
+        host_GB = ceil(Int, (1.7e9 + 800 * volume) * 1e-9 * 1.5)
+        vram_GB = 0
+    else
+        time_s = ceil(Int, 1.5e-8 * (2 + 2 * exp.power_iters) * c * volume * log2(volume) + 3600)
+        host_GB = ceil(Int, (2.0e9 + 320 * c * volume) * 1e-9 * 1.5)
+        vram_GB = ceil(Int, (1.5e9 + 320 * c * volume) * 1e-9 * 1.5)
+    end
+    return time_s, host_GB, vram_GB
+end
+
+function resources_for(job::JobType, exp::Experiment, cluster::ClusterConfig,
+                       coeffs::Coefficients, cores::Int)
+    if is_sr(exp)
+        p = predict(cost_job(job), to_cost_point(exp, cores), coeffs)
+        time_s, host_bytes, vram_bytes = p.time_s, p.host_bytes, p.vram_bytes
+        host_GB = ceil(Int, host_bytes / 1e9)
+        vram_GB = ceil(Int, vram_bytes / 1e9)
+    else
+        time_s, host_GB, vram_GB = fallback_resources(job, exp, cluster)
+    end
+
+    over_vram = false
+    gpu_name, fraction = "", 1.0
+    if uses_gpu(job)
+        if vram_GB > cluster.max_vram_GB
+            over_vram = true
+        end
+        gpu_name, fraction = choose_gpu(cluster, vram_GB)
+        # A MIG slice has a fraction of the compute as well as a fraction of the
+        # memory, and the calibration was taken on a whole GPU.
+        time_s /= fraction
+    end
+
+    host_GB = max(MIN_MEMORY_GB, min(host_GB, cluster.max_host_GB))
+    return Resources(max(MIN_TIME_S, ceil(Int, time_s)), host_GB, vram_GB,
+                     cores, gpu_name, fraction, over_vram)
+end
+
+function seconds2string(seconds::Real)
+    hours = floor(Int, seconds / 3600)
+    mins = floor(Int, (seconds - hours * 3600) / 60)
+    secs = round(Int, seconds - hours * 3600 - mins * 60)
+    if secs >= 60
+        mins += div(secs, 60)
+        secs = mod(secs, 60)
+    end
+    if mins >= 60
+        hours += div(mins, 60)
+        mins = mod(mins, 60)
+    end
+    with_zeros(x) = lpad(string(x), 2, '0')
+    return "$(with_zeros(hours)):$(with_zeros(mins)):$(with_zeros(secs))"
+end
+
+# --------------------------------------------------------------------------- #
+# Naming and command line arguments
+# --------------------------------------------------------------------------- #
 
 rational2string(r::Rational, separator="//") = "$(numerator(r))$separator$(denominator(r))"
 
@@ -254,88 +481,15 @@ function smr_args(smr::SMRSystem, params::RSVDParams)
     return "--sender $(sender_string) --mediator $(mediator_string) --receiver $(receiver_string) --sm-sep $(sm_sep_string) --mr-sep $(mr_sep_string) --scale $(scale_string) --chi $(chi_string) --design $(design_string) --components $(params.rank) --oversamples $(params.oversamples) --power-iterations $(params.power_iter) --name $(name_string)"
 end
 
-function args(smr::SMRSystem, params::RSVDParams)
-    if isnothing(mediator(smr))
-        return heat_transfer_args(smr, params)
-    end
-    return smr_args(smr, params)
-end
+args(smr::SMRSystem, params::RSVDParams) =
+    isnothing(mediator(smr)) ? heat_transfer_args(smr, params) : smr_args(smr, params)
 
-# Compute the biggest volume (in voxels cubed) among the source and target regions in the SMR system
-function biggest_volume_voxels_cubed(smr::SMRSystem)
-    pairs = volume_pairs(smr)
-    volume(pair) = 3*max(prod(pair.source.cel), prod(pair.target.cel)) # 3x for polarizations
-    return maximum(volume.(pairs))
-end
+# --------------------------------------------------------------------------- #
+# Script generation
+# --------------------------------------------------------------------------- #
 
-function time_s(job_type::JobType, smr::SMRSystem, params::RSVDParams)
-    max_vol = biggest_volume_voxels_cubed(smr)
-    max_vol = isnothing(mediator(smr)) ? max_vol : (3 * max(prod(sender(smr).cel), prod(receiver(smr).cel)))
-    num_pairs = length(volume_pairs(smr)) # Number of source-target volume pairs
-    if job_type == GenerateGreens
-        g0_time_s_A6000 = TIME_PADDING * (max_vol * log2(max_vol) * 2.147823889114151e-6 + 37.68202102148491) # empirical formula
-	return g0_time_s_A6000 * num_pairs + 30*60 # throw in an extra 30 mins to G0 generation because why not (it runs only on CPU so the digitial alliance people don't send angry e-mails to me about these types of jobs, so we can just throw in more time)
-    elseif job_type == GenerateRSVD
-        q = params.power_iter
-        k = params.rank
-        p = params.oversamples
-        rsvd_time_s_A6000 = TIME_PADDING * (1.4917e-8 * (2 + 2q)*(k+p)*max_vol*log2(max_vol) + 71.3435)
-	return min(rsvd_time_s_A6000, 4*one(rsvd_time_s_A6000)*60*60) * num_pairs
-    elseif job_type == ComputeBounds
-        # bounds_time_s_A6000 = 0.0 # empirical formula
-        bounds_time_s_A6000 = 20*60 # It's like 1 minute, but 20 mins is fine
-        return bounds_time_s_A6000
-    end
-    error("Unknown job type: $job_type")
-end
-
-function memory_GB(job_type::JobType, smr::SMRSystem, params::RSVDParams)
-    max_vol = biggest_volume_voxels_cubed(smr)
-    max_vol = isnothing(mediator(smr)) ? max_vol : (3 * max(prod(sender(smr).cel), prod(receiver(smr).cel)))
-    if job_type == GenerateGreens
-        return ceil(Int, MEMORY_PADDING * (1.722879361316178e9 + 798.4151595299923 * max_vol) * 1e-9) # empirical formula
-    elseif job_type == GenerateRSVD
-        k = params.rank
-        p = params.oversamples
-        memory_GB = ceil(Int, MEMORY_PADDING * (307.4977255*(k+p)*max_vol + 1.955629444e9) * 1e-9) # empirical formula
-        return memory_GB
-    elseif job_type == ComputeBounds
-        k = params.rank
-        p = params.oversamples
-        memory_GB = ceil(Int, MEMORY_PADDING * (307.4977255*(k+p)*max_vol + 1.955629444e9) * 1e-9) # empirical formula (just copied from RSVD, not actually tested)
-        return memory_GB
-    end
-    error("Unknown job type: $job_type")
-end
-
-function seconds2string(seconds::Real)
-    hours = floor(Int, seconds / 3600)
-    mins = floor(Int, (seconds - hours * 3600) / 60)
-    secs = round(Int, seconds - hours * 3600 - mins * 60)
-    if secs >= 60
-        mins += div(secs, 60)
-        secs = mod(secs, 60)
-    end
-    if mins >= 60
-        hours += div(mins, 60)
-        mins = mod(mins, 60)
-    end
-    with_zeros(x) = lpad(string(x), 2, '0')
-    return "$(with_zeros(hours)):$(with_zeros(mins)):$(with_zeros(secs))"
-end
-
-function Base.string(job::JobType)
-    if job == GenerateGreens
-        return "Greens function generation"
-    elseif job == GenerateRSVD
-        return "RSVD generation"
-    elseif job == ComputeBounds
-        return "bounds computation"
-    end
-    error("Unknown job type: $job")
-end
-
-function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSystem, time_s::Int, cores::Int, memory_GB::Int, dependency::Union{Nothing, JobType}=nothing)
+function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSystem,
+                             res::Resources, dependency::Union{Nothing,JobType}=nothing)
     var_name = job_var_name(job)
     header = "$var_name=\$(sbatch \\\n"
     if !isnothing(dependency)
@@ -344,13 +498,13 @@ function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSyste
     header *= """    --job-name=$(PROJECT_NAME)_$(experiment_name(smr)) \\
     --output=$(cluster.project_dir)/$(PROJECT_NAME)/logs/$(experiment_name(smr))_%j.out \\
     --account=$(cluster.name in CC_RRG_CLUSTERS ? CC_RRG_NAME : CC_DEFAULT_GROUP_NAME) \\
-    --time=$(seconds2string(time_s)) \\
-    --cpus-per-task=$cores \\
-    --mem=$(memory_GB)G \\
+    --time=$(seconds2string(res.time_s)) \\
+    --cpus-per-task=$(res.cores) \\
+    --mem=$(res.host_GB)G \\
     --chdir=$(cluster.code_dir) \\
 """
-    if job in [GenerateRSVD, ComputeBounds] # Use GPU for RSVD generation and bounds computation
-        header *= """    --gpus=$(gpu_string(cluster, memory_GB)):1 \\\n"""
+    if uses_gpu(job)
+        header *= """    --gpus=$(res.gpu_name):1 \\\n"""
     end
     header *= """    --export=ALL \\
     <<EOF
@@ -365,27 +519,26 @@ sleep 0.05
     return header, footer
 end
 
-function job_launcher_script(jobs::AbstractVector{JobType},
-        cluster::ClusterConfig,
-        sender_cells::AbstractVector{NTuple{3, Int}},
-        mediator_cells::AbstractVector{<:Union{Nothing, NTuple{3, Int}}},
-        receiver_cells::AbstractVector{NTuple{3, Int}},
-        sm_separations::AbstractVector{<:Union{Nothing, NTuple{3, Rational{Int}}}},
-        mr_separations::AbstractVector{<:Union{Nothing, NTuple{3, Rational{Int}}}},
-        rs_separations::AbstractVector{<:Union{Nothing, NTuple{3, Rational{Int}}}},
-        scales::AbstractVector{Rational{Int}},
-        chis::AbstractVector{ComplexF64},
-        target_ranks::AbstractVector{Int},
-        num_oversamples::AbstractVector{Int},
-        num_power_iters::AbstractVector{Int})
+"""
+    job_launcher_script(jobs, cluster, experiments) -> (script, plan)
+
+Build the launcher. Returns the script text and the per-experiment resource plan
+so the caller can print a summary.
+"""
+function job_launcher_script(jobs::AbstractVector{JobType}, cluster::ClusterConfig,
+                             experiments::AbstractVector{Experiment})
+    coeffs = coefficients_for(cluster.name)
+    coeffs.calibrated ||
+        @warn "Cluster '$(cluster.name)' has no calibrated cost model; requests are analytic guesses. Run the harness in bench/ (see bench/README.md)."
 
     script = """
 #!/bin/bash
 
 # Job launcher generated on $(now()) by create_jobs.jl
+# Cost model: $(coeffs.calibrated ? "calibrated for $(coeffs.name)" : "UNCALIBRATED defaults")
 
 echo Running job launcher for $(join(string.(jobs), ", "))
-echo There $(length(sender_cells) > 1 ? "are" : "is") $(length(sender_cells)) job$(length(sender_cells) > 1 ? "s" : "") to launch
+echo There $(length(experiments) > 1 ? "are" : "is") $(length(experiments)) experiment$(length(experiments) > 1 ? "s" : "") to launch
 echo We are expecting to be on $(cluster.name)
 
 # Change to code directory
@@ -401,126 +554,143 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
     end
     script *= "\n# Job submission commands follow\n\n"
 
-    # For each parameter combination, create the corresponding submission command
-    for (sender_num_cells, mediator_num_cells, receiver_num_cells, sm_separation, mr_separation, rs_separation, scale, χ, target_rank, num_oversample, num_power_iter) in zip(sender_cells, mediator_cells, receiver_cells, sm_separations, mr_separations, rs_separations, scales, chis, target_ranks, num_oversamples, num_power_iters)
-        smr = SMRSystem(sender_num_cells,
-            mediator_num_cells,
-            receiver_num_cells,
-            sm_separation,
-            mr_separation,
-            rs_separation,
-            scale,
-            χ)
-        rsvd_params = RSVDParams(target_rank, num_oversample, num_power_iter)
+    plan = Tuple{Experiment,Dict{JobType,Resources}}[]
+    for exp in experiments
+        smr = to_smr_system(exp)
+        params = to_rsvd_params(exp)
 
-        max_job_memory = maximum(max(4, ceil(Int, memory_GB(job_type, smr, rsvd_params))) for job_type in jobs) # Max memory across all jobs for this experiment
-        if max_job_memory > cluster.max_vram_GB
-            # @warn "Skipping experiment $(experiment_name(smr)) because required memory $(max_job_memory) GB exceeds max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)"
-            # continue
-
-            @warn "VRAM for $(experiment_name(smr)) is $(max_job_memory) GB exceeding max VRAM $(cluster.max_vram_GB) GB on cluster $(cluster.name)"
-            max_job_memory = cluster.max_vram_GB
+        resources = Dict{JobType,Resources}()
+        for job in ORDERED_JOBS
+            job in jobs || continue
+            cores = choose_cores(job, exp, cluster, coeffs)
+            resources[job] = resources_for(job, exp, cluster, coeffs, cores)
         end
+        push!(plan, (exp, resources))
 
-        # For each job type, add the corresponding job submission command
-        for job_type in ORDERED_JOBS
-            if !(job_type in jobs) continue end
-
-            memory = max(4, ceil(Int, memory_GB(job_type, smr, rsvd_params))) # We should always request at least 4 GB
-            memory = min(memory, cluster.max_vram_GB) # Cap memory at cluster max VRAM
-	    time = max(10*60, ceil(Int, time_s(job_type, smr, rsvd_params) * (job_type == GenerateGreens ? 1 : gpu_compute_fraction(gpu_string(cluster, memory))))) # Adjust time based on GPU compute fraction, minimum 10 minutes
-            num_cores = cluster.name == "fir" ? 6 : 4 # fir has 6-core nodes, everything else works fine with 4 cores (molering runs with all available cores)
+        for job in ORDERED_JOBS
+            job in jobs || continue
+            res = resources[job]
+            if res.over_vram
+                @warn "$(experiment_name(smr)) $(string(job)) needs about $(res.vram_GB) GB of VRAM, more than the $(cluster.max_vram_GB) GB on $(cluster.name). Submitting anyway on a whole GPU; expect an out-of-memory failure."
+            end
 
             header, footer = "", ""
             if cluster.has_slurm
-                header, footer = slurm_header_footer(job_type, cluster, smr, time, num_cores, memory, previous_job(job_type) in jobs ? previous_job(job_type) : nothing)
+                dependency = previous_job(job) in jobs ? previous_job(job) : nothing
+                header, footer = slurm_header_footer(job, cluster, smr, res, dependency)
             end
             script *= header
 
-            job_args = args(smr, rsvd_params)
-	    if job_type == GenerateGreens
-                job_args *= " --gpu false"
-	    else
-                # job_args *= " --gpu true"
-                job_args *= " --gpu 0"
-	    end
-	    script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job_type)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/\n"
+            job_args = args(smr, params)
+            job_args *= uses_gpu(job) ? " --gpu 0" : " --gpu false"
+            script *= "julia --project=. -t $(num_threads(cluster)) $(main_file(job)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/\n"
 
             script *= footer
         end
         script *= "\n"
     end
-    return script
+    return script, plan
 end
 
+"""
+    print_plan(plan, jobs, cluster)
+
+Summary table of what was requested and why. Worth reading before submitting: it
+is where a rank that does not fit in VRAM, or a bounds job that has quietly become
+the expensive one, becomes obvious.
+"""
+function print_plan(plan, jobs::AbstractVector{JobType}, cluster::ClusterConfig)
+    println(stderr)
+    println(stderr, "Resource plan for $(length(plan)) experiments on $(cluster.name):")
+    println(stderr, "  ", rpad("experiment", 30), rpad("job", 8), rpad("time", 11),
+            rpad("cores", 6), rpad("host", 8), "gpu")
+    totals = Dict{JobType,Float64}()
+    core_seconds = 0.0
+    for (exp, resources) in plan
+        label = is_sr(exp) ?
+                "$(join(exp.sender_cells, "x")) sep=$(rational2string(exp.separation)) k=$(exp.rank)" :
+                "$(join(exp.sender_cells, "x")) +mediator k=$(exp.rank)"
+        first_row = true
+        for job in ORDERED_JOBS
+            job in jobs || continue
+            res = resources[job]
+            totals[job] = get(totals, job, 0.0) + res.time_s
+            core_seconds += res.time_s * res.cores
+            short = job == GenerateGreensJob ? "greens" :
+                    job == GenerateRSVDJob ? "rsvd" : "bounds"
+            gpu = uses_gpu(job) ? "$(res.gpu_name) ($(res.vram_GB) GB)" : "-"
+            println(stderr, "  ", rpad(first_row ? label : "", 30), rpad(short, 8),
+                    rpad(seconds2string(res.time_s), 11), rpad(res.cores, 6),
+                    rpad("$(res.host_GB)G", 8), gpu)
+            first_row = false
+        end
+    end
+    println(stderr)
+    for job in ORDERED_JOBS
+        haskey(totals, job) || continue
+        @printf(stderr, "  total requested %-24s %8.1f h\n", string(job), totals[job] / 3600)
+    end
+    @printf(stderr, "  total core-hours requested %13.1f\n", core_seconds / 3600)
+    println(stderr, "  (requests, not predictions: they include the padding factors)")
+    return nothing
+end
+
+# =========================================================================== #
+# Experiment definitions
+# =========================================================================== #
+
+load_coefficients!(joinpath(@__DIR__, "bench"))
+
+cluster = ClusterConfig("molering")
 # cluster = ClusterConfig("fir")
 # cluster = ClusterConfig("narval")
-cluster = ClusterConfig("molering")
 
-### Meta surface
-# scale = -8
-scale = 32
-
-# num_experiments = 101
-# separations = unique(collect(round.(Int, logrange(8, 8*32, num_experiments)))) .// 32 # from 8//32 λ to 8//1 λ in log-spaced steps
-# separations = [1//32]
-# separations = collect(2:(2*scale)) .// scale # collect(2:32) .// scale
-# separations = vcat(collect(0:(3*32)) .// 32, Rational.(collect(10:5:300)))
-# separations = collect(0:16) .// 32
-# separations = unique(round.(Int, logrange(1, 1000*32, 117))) .// 32 # 117 produces 100 sample points
-# separations = unique(round.(Int, logrange(1, 300*32, 250))) .// 32 
-# separations = unique(round.(Int, logrange(1, 300*32, 300))) .// 32 
-# separations = [11, 13, 15, 17, 19, 21, 23] .// 1
-separations = [10, 12, 14, 16, 18, 20, 22] .// 1
-num_experiments = length(separations)
-
-command = job_launcher_script(
-    [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
-    cluster,
-    repeat([(8, 8, 8)], num_experiments), # sender cells: 2×2×2 λ³
-    repeat([nothing], num_experiments), # mediator cells (this is an SR system)
-    repeat([(8, 8, 8)], num_experiments), # receiver cells, same as sender
-    repeat([nothing], num_experiments), # sm separations (SR system)
-    repeat([nothing], num_experiments), # mr separations (SR system)
-    [(sep, 0//1, 0//1) for sep in separations], # rs separations
-    repeat([1//scale], num_experiments), # scales
-    repeat([13.6 + 0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
-    repeat([700], num_experiments), # RSVD target ranks
-    repeat([50], num_experiments), # RSVD oversamples
-    repeat([14], num_experiments) # RSVD power iters
+### Metasurface: lambda/4 cubes at lambda/32 cells, swept in separation
+experiments = sr_sweep(
+    cells=(8, 8, 8),
+    separations=[10, 12, 14, 16, 18, 20, 22] .// 1,
+    scale=1 // 32,
+    chi=13.6 + 0.05im,
+    rank=1350,
+    oversamples=50,
+    power_iters=14,
 )
 
-# whatever it is we are doing for the paper: 13.6 + 0.05im
-# silica: -2.30466271 + 1.478912im
+# Other sweeps that have been run, for reference:
+#
+#   # log-spaced separations from 1/32 to 300 wavelengths, ~250 points
+#   separations = unique(round.(Int, logrange(1, 300 * 32, 250))) .// 32
+#
+#   # every cell separation from touching to 3 wavelengths, then coarse out to 300
+#   separations = vcat(collect(0:(3 * 32)) .// 32, Rational.(collect(10:5:300)))
+#
+#   # 3-lambda cubes with anisotropic cells (1/32, 1/8, 1/8)
+#   experiments = sr_sweep(cells=(96, 32, 32), separations=..., scale=-1//8, rank=800)
+#
+#   # waveguide: sender length swept instead of separation
+#   experiments = [sr_experiment(cells=(l, 32, 32), receiver_cells=(8, 32, 32),
+#                                separation=1//8, scale=1//32, rank=800)
+#                  for l in 8:2:(6 * 32)]
 
-### Waveguide
-
-# lengths = 8 .+ 0:2:(6*32)
-# num_experiments = length(lengths)
-# command = job_launcher_script(
-#     [GenerateGreens, GenerateRSVD, ComputeBounds], # jobs to run for each parameter combination
-#     cluster,
-#     [(l, 1*32, 1*32) for l in lengths],
-#     repeat([nothing], num_experiments), # mediator cells (this is an SR system)
-#     repeat([(8, 1*32, 1*32)], num_experiments), # receiver cells, same as sender
-#     repeat([nothing], num_experiments), # sm separations (SR system)
-#     repeat([nothing], num_experiments), # mr separations (SR system)
-#     repeat([(1//8, 0//1, 0//1)], num_experiments), # rs separation
-#     repeat([1//32], num_experiments), # scales
-#     repeat([13.6+0.05im], num_experiments), # chis (TODO: use 11.098 + 0.05?)
-#     repeat([800], num_experiments), # RSVD target ranks
-#     repeat([50], num_experiments), # RSVD oversamples
-#     repeat([14], num_experiments) # RSVD power iters
-# )
+command, plan = job_launcher_script(
+    [GenerateGreensJob, GenerateRSVDJob, ComputeBoundsJob],
+    cluster,
+    experiments,
+)
 
 print(command)
-open("launch_$(PROJECT_NAME).sh", "w") do f
+print_plan(plan, [GenerateGreensJob, GenerateRSVDJob, ComputeBoundsJob], cluster)
+
+mkpath(joinpath(@__DIR__, "jobs"))
+script_path = joinpath(@__DIR__, "jobs", "launch_$(PROJECT_NAME).sh")
+open(script_path, "w") do f
     write(f, command)
 end
-println("Job launcher script written to launch_$(PROJECT_NAME).sh")
+println(stderr, "\nJob launcher script written to $(script_path)")
 if cluster.has_slurm
-    println("Copy the launch script to the cluster: `scp launch_$(PROJECT_NAME).sh \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(CC_CODE_DIR)jobs/\"`")
-    println("Then run it on the cluster with `bash launch_$(PROJECT_NAME).sh")
+    println(stderr, "Copy it over:  scp \"$(script_path)\" \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(cluster.code_dir)jobs/\"")
+    println(stderr, "Then run it:   ssh $(CC_UNAME)@$(cluster.name).alliancecan.ca 'cd $(cluster.code_dir) && bash jobs/launch_$(PROJECT_NAME).sh'")
 else
-    println("Run the launch script with `bash launch_$(PROJECT_NAME).sh`")
+    println(stderr, "Copy it over:  scp \"$(script_path)\" \"$(MOLERING_UNAME)@molering:$(cluster.code_dir)jobs/\"")
+    println(stderr, "Then run it:   ssh $(MOLERING_UNAME)@molering 'cd $(cluster.code_dir) && bash jobs/launch_$(PROJECT_NAME).sh'")
 end
