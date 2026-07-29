@@ -154,7 +154,7 @@ function ClusterConfig(server::AbstractString)
         return ClusterConfig(server, false,
                              48,  # NVIDIA A6000
                              480, # host RAM
-                             32,
+                             128, # 64-core Threadripper Pro 5995WX with SMT
                              MOLERING_PRELOAD_DIR, MOLERING_PROJECT_DIR,
                              MOLERING_SCRATCH_DIR, MOLERING_CODE_DIR)
     elseif server == "narval"
@@ -309,10 +309,6 @@ function to_cost_point(exp::Experiment, threads::Int)
                    num_pos=ceil(Int, NUM_POS_FRACTION * exp.rank))
 end
 
-# --------------------------------------------------------------------------- #
-# Resources
-# --------------------------------------------------------------------------- #
-
 """
     Resources
 
@@ -350,6 +346,7 @@ spends allocation without buying priority. For the GPU jobs: a fixed small count
 """
 function choose_cores(job::JobType, exp::Experiment, cluster::ClusterConfig,
                       coeffs::Coefficients)
+    cluster.has_slurm || return cluster.max_cores
     uses_gpu(job) && return min(GPU_JOB_CORES, cluster.max_cores)
     is_sr(exp) || return min(4, cluster.max_cores)
     candidates = filter(<=(cluster.max_cores), CORE_CANDIDATES)
@@ -634,10 +631,6 @@ function print_plan(plan, jobs::AbstractVector{JobType}, cluster::ClusterConfig)
     println(stderr, "  (requests, not predictions: they include the padding factors)")
     return nothing
 end
-
-# =========================================================================== #
-# Experiment definitions
-# =========================================================================== #
 
 load_coefficients!(joinpath(@__DIR__, "bench"))
 
