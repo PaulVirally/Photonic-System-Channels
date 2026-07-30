@@ -107,14 +107,14 @@ function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr
     # Define the clipping operator that takes a vector defined on the universe and extracts only the receiver part
     receiver_clip_action!(r_clipped::AbstractVector{ComplexF64}, u_vec::AbstractVector{ComplexF64}) = begin
         # our convention is [sender; receiver]
-        copyto!(r_clipped, view(u_vec, 1:receiver_size))
+        copyto!(r_clipped, view(u_vec, sender_size .+ (1:receiver_size)))
         return r_clipped
     end
 
     # Define the clipping operator that takes a vector defined on the universe and extracts only the sender part
     sender_clip_action!(s_clipped::AbstractVector{ComplexF64}, u_vec::AbstractVector{ComplexF64}) = begin
         # our convention is [sender; receiver]
-        copyto!(s_clipped, view(u_vec, sender_size .+ (1:receiver_size)))
+        copyto!(s_clipped, view(u_vec, 1:sender_size))
         return s_clipped
     end
 
@@ -129,8 +129,8 @@ function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr
     ι_r = receiver_inclusion # Includes receiver into universe
 
     asym_G₀_rr = LinearMap(AsymVacuumGreenOperator(G₀_rr)) # twice as efficient as (G₀_rr - G₀_rr')/(2im)
-    asym_G₀_ru = asym(ι_r * G₀_rs * Π_s) + ι_r * asym_G₀_rr * Π_r
-    positive_seeder = -asym(ι_r * G₀_rs * Π_s) # -1 because we want the negative contributions of this operator becuase of the enless -1 problems
+    asym_G₀_ru = -(asym(ι_r * G₀_rs * Π_s) + ι_r * asym_G₀_rr * Π_r) # minus sign becuase the paper uses (-G⁰ᵣᵤ)ᵃ everywhere instead of( G⁰ᵣᵤ)ᵃ
+    positive_seeder = -asym(ι_r * G₀_rs * Π_s) # -1 for the same reason
     return asym_G₀_ru, positive_seeder
 end
 

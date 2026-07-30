@@ -264,7 +264,8 @@ function load_bounds_inputs(compute_env::ComputeEnvironment, smr::SMRSystem)
     jld_in = jldopen(jld_in_path, "r")
 
     Γ = read_array(jld_in, "UR_asym/D", use_gpu(compute_env))
-    Γ .*= -one(eltype(Γ)) # Sign typo in the original notes
+    # NO MORE SIGN TYPO (this is fixed in rsvd.jl)
+    # Γ .*= -one(eltype(Γ)) # Sign typo in the original notes
     Vur_asym = read_array(jld_in, "UR_asym/V", use_gpu(compute_env))
 
     # Sort the singular values and vectors in descending order
@@ -451,7 +452,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     end
 
     analytical_bounds_old_form(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
-    analytical_bounds_new_form(κ̃) = ifelse(2κ̃ >= one(eltype(κ̃)), one(eltype(κ̃)), sqrt(4κ̃*(1-κ̃)))
+    analytical_bounds_new_form(κ̃) = ifelse(2κ̃ >= one(eltype(κ̃)), one(eltype(κ̃)), sqrt(4κ̃*abs(1-κ̃)))
     κ = ζ^2 .* (Γrs .^ 2)
     κ̃ = ζ .* (max.(Γ, zero(eltype(Γ))))
     old_analytical_bounds = analytical_bounds_old_form.(κ)
@@ -460,7 +461,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     old_analytical_bounds[old_analytical_bounds .<= zero(eltype(old_analytical_bounds))] .= NaN
 
     ks = 1:min(length(old_analytical_bounds), length(new_analytical_bounds), length(bounds_dual_basis))
-    which_bounds = argmin.((old_analytical_bounds[ks], new_analytical_bounds[ks], bounds_dual_basis[ks]))
+    which_bounds = [argmin((old_analytical_bounds[k], new_analytical_bounds[k],
+                            bounds_dual_basis[k])) for k in ks]
     # true_bounds = min.(old_analytical_bounds[ks], new_analytical_bounds[ks], bounds_dual_basis[ks])
     true_bounds = map(i -> begin # Save which bound is the minimum for each k to see where the flips happen
         if which_bounds[i] == 1
