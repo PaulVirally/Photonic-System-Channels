@@ -288,6 +288,12 @@ be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
 - `G₀_uu`: pre-loaded universe operator, loaded here if not supplied.
 - `outer_indices`: which `n` of the outer `σₙ` loop to actually evaluate.
   `nothing` (the default) means all of them.
+- `on_outer_error`: `:throw` (the default) or `:stop`. With `:stop`, a failure in
+  the outer loop is recorded in the returned `outer_error` and the function
+  returns with `complete = false` rather than propagating. The benchmark harness
+  passes `:stop` so that the setup-stage timings, which are measured before the
+  loop and are useful on their own, survive a loop that cannot run on synthetic
+  input.
 
 # Returns
 A named tuple with the bounds, the bookkeeping needed to save them, and
@@ -298,7 +304,10 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γrs::AbstractVector;
                               basis_size::Int=size(Vur_asym, 2),
                               G₀_uu=nothing,
-                              outer_indices::Union{Nothing,AbstractVector{Int}}=nothing)
+                              outer_indices::Union{Nothing,AbstractVector{Int}}=nothing,
+                              on_outer_error::Symbol=:throw)
+    on_outer_error in (:throw, :stop) ||
+        throw(ArgumentError("on_outer_error must be :throw or :stop, got :$on_outer_error"))
     # U_uu = read_array(jld_in, "UU/U", use_gpu(compute_env)) # TODO: could use this as basis too
     RSVD_BASIS_SIZE = min(basis_size, size(Vur_asym, 2))
     basis = copy(Vur_asym)
@@ -387,7 +396,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     ns = isnothing(outer_indices) ? (1:num_pos) : filter(n -> 1 <= n <= num_pos, outer_indices)
     complete = length(ns) == num_pos
     outer_times = Tuple{Int,Float64}[]
+    outer_error = nothing
     for n in ns # Compute bounds on σₙ(Pᵣₛ)
+     try
         t_outer = time_ns()
         @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] [$n/$(num_pos)] Computing σₙ(Pᵣₛ) bound"
 
@@ -425,6 +436,18 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         @info string(now()) * " [$n/$(num_pos)] Dual is $dual, which gives a bound of $(sqrt(dual)) on σₙ(Pᵣₛ)"
         bounds_dual_basis[n] = sqrt(dual)
         push!(outer_times, (n, (time_ns() - t_outer) / 1e9))
+     catch err
+        on_outer_error === :throw && rethrow(err)
+        # :stop records where it failed and keep whatever has been measured
+        frames = stacktrace(catch_backtrace())
+        where_str = isempty(frames) ? "unknown" :
+                    join(["$(f.func)@$(basename(String(f.file))):$(f.line)"
+                          for f in Iterators.take(frames, 3)], "<-")
+        outer_error = (n=n, exception=sprint(showerror, err), location=where_str)
+        @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] outer loop failed at n=$n; stopping" exception = err location = where_str
+        complete = false
+        break
+     end
     end
 
     analytical_bounds_old_form(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
@@ -463,7 +486,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                    outer_total=sum(last.(outer_times); init=0.0))
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Stage times [s]:" stage_times
 
-    return (num_pos=num_pos, complete=complete,
+    return (num_pos=num_pos, complete=complete, outer_error=outer_error,
             bounds_dual_basis=bounds_dual_basis,
             old_analytical_bounds=old_analytical_bounds,
             new_analytical_bounds=new_analytical_bounds,
