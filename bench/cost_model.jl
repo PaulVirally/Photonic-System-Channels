@@ -259,8 +259,15 @@ and nothing else.
   circulant, single-threaded in Gila -- FFTW's threads are never enabled).
 - `g0_self_cell`, `g0_ext_cell`: seconds per circulant cell of quadrature work,
   at one thread. Divided by `thread_efficiency`.
-- `g0_contact_cell`: *extra* seconds per circulant cell for an external block
-  between touching bodies.
+- `g0_contact_fft`, `g0_contact_cell`, `g0_contact_fixed`: the same triple for an
+  external block between *touching* bodies, which is a different code path rather
+  than a surcharge on the ordinary one. `genEgoCrcExt!` detects contact, builds a
+  self Green function on a small contact volume (paying the expensive `O(1)`
+  Gauss-Legendre setup), and then evaluates cells against that table instead of
+  through `egoFunOut!`'s adaptive cubature. Measured consequence: contact costs a
+  large fixed amount and very little per cell, so it dominates at small sizes and
+  is *cheaper* than the ordinary path by 32 cells a side. Modelling it as
+  `ext + surcharge` cannot represent that and mispredicts by 3-5x.
 - `g0_self_fixed`, `g0_ext_fixed`: per-block fixed cost. Split by block kind
   because they are not remotely similar: a self block pays for the
   Gauss-Legendre setup and the weakly-singular coincident/adjacent-cell
@@ -306,7 +313,9 @@ Base.@kwdef struct Coefficients
     g0_ext_fft::Float64 = 1.2e-7
     g0_self_cell::Float64 = 4.0e-6
     g0_ext_cell::Float64 = 5.0e-6
-    g0_contact_cell::Float64 = 5.0e-6
+    g0_contact_fft::Float64 = 0.0
+    g0_contact_cell::Float64 = 2.0e-7
+    g0_contact_fixed::Float64 = 20.0
     g0_self_fixed::Float64 = 12.0
     g0_ext_fixed::Float64 = 2.0
     g0_thread_scaling::Float64 = 0.7
@@ -432,24 +441,32 @@ function greens_counts(pt::SRPoint)
     multiregion = [(s, s, true), (s, r, false), (r, s, false), (r, r, true)]
     append!(blocks, multiregion)
 
+    # Three block kinds, not two plus a surcharge: an external block between
+    # touching bodies runs a different branch of `genEgoCrcExt!` with a large
+    # fixed cost and a small per-cell cost.
     self_work = 0.0        # sum of M*log2(M) over self blocks
     self_cells = 0         # sum of M over self blocks
     ext_work = 0.0
     ext_cells = 0
-    contact_cells = 0      # circulant cells on external blocks taking the contact path
+    contact_work = 0.0
+    contact_cells = 0
     n_self = 0
     n_ext = 0
+    n_contact = 0
     for (trg, src, isself) in blocks
         M = circulant_cells(trg, src)
         if isself
             self_work += fft_work(M)
             self_cells += M
             n_self += 1
+        elseif contact
+            contact_work += fft_work(M)
+            contact_cells += M
+            n_contact += 1
         else
             ext_work += fft_work(M)
             ext_cells += M
             n_ext += 1
-            contact && (contact_cells += M)
         end
     end
 
@@ -473,20 +490,22 @@ function greens_counts(pt::SRPoint)
     # Serialisation of the finished multi-region operator buffers a copy.
     peak_bytes = max(peak_bytes, sum(retained) * 2)
 
-    return (n_self_blocks=n_self, n_ext_blocks=n_ext,
-            self_fft_work=self_work, ext_fft_work=ext_work,
-            self_cells=self_cells, ext_cells=ext_cells,
-            contact_cells=contact_cells, n_blocks=n_self + n_ext,
+    return (n_self_blocks=n_self, n_ext_blocks=n_ext, n_contact_blocks=n_contact,
+            self_fft_work=self_work, ext_fft_work=ext_work, contact_fft_work=contact_work,
+            self_cells=self_cells, ext_cells=ext_cells, contact_cells=contact_cells,
+            n_blocks=n_self + n_ext + n_contact,
             bytes_written=bytes_written, peak_bytes=peak_bytes)
 end
 
 function greens_time_s(pt::SRPoint, c::Coefficients)
     counts = greens_counts(pt)
     eta = thread_efficiency(c, pt.threads)
-    t = c.g0_self_fft * counts.self_fft_work + c.g0_ext_fft * counts.ext_fft_work
+    t = c.g0_self_fft * counts.self_fft_work + c.g0_ext_fft * counts.ext_fft_work +
+        c.g0_contact_fft * counts.contact_fft_work
     t += (c.g0_self_cell * counts.self_cells + c.g0_ext_cell * counts.ext_cells +
           c.g0_contact_cell * counts.contact_cells) / eta
-    t += c.g0_self_fixed * counts.n_self_blocks + c.g0_ext_fixed * counts.n_ext_blocks
+    t += c.g0_self_fixed * counts.n_self_blocks + c.g0_ext_fixed * counts.n_ext_blocks +
+         c.g0_contact_fixed * counts.n_contact_blocks
     t += counts.bytes_written / c.disk_write_rate
     return t + c.g0_startup_s
 end

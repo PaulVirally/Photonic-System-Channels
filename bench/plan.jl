@@ -370,7 +370,7 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
             <<EOF
         #!/bin/bash
         $(cluster.modules)
-        export PSC_T0=\$(date +%s)
+        export PSC_T0=\\\$(date +%s)
         srun $(point_command(cluster, point, tier))
         EOF
         sleep 0.05

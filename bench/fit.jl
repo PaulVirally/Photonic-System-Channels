@@ -240,7 +240,9 @@ per-cell (quadrature) columns are divided by the thread efficiency so that point
 taken at different core counts can be pooled.
 """
 function fit_greens_time(rows::Vector{Row}, s::Float64)
-    A = Matrix{Float64}(undef, 0, 7)
+    # Nine columns: an (fft, cell, fixed) triple for each of the three block
+    # kinds. Contact is a kind, not a surcharge -- see `Coefficients`.
+    A = Matrix{Float64}(undef, 0, 9)
     b = Float64[]
     used = Row[]
     for row in rows
@@ -251,24 +253,22 @@ function fit_greens_time(rows::Vector{Row}, s::Float64)
         (M === nothing || t === nothing || threads === nothing || t <= 0) && continue
         W = fft_work(M)
         eta = 1 + s * (threads - 1)
-        selfblock = row["kind"] == "g0_self"
-        contact = !selfblock && is_contact(row)
+        kind = row["kind"] == "g0_self" ? 1 : (is_contact(row) ? 3 : 2)
         push!(used, row)
-        A = vcat(A, [selfblock ? W : 0.0,
-                     selfblock ? M / eta : 0.0,
-                     selfblock ? 0.0 : W,
-                     selfblock ? 0.0 : M / eta,
-                     contact ? M / eta : 0.0,
-                     selfblock ? 1.0 : 0.0,
-                     selfblock ? 0.0 : 1.0]')
+        cols = zeros(9)
+        cols[3 * (kind - 1) + 1] = W
+        cols[3 * (kind - 1) + 2] = M / eta
+        cols[3 * (kind - 1) + 3] = 1.0
+        A = vcat(A, cols')
         push!(b, t)
     end
     isempty(b) && return nothing
     x = nnls_relative(A, b)
     predicted = A * x
-    return (self_fft=x[1], self_cell=x[2], ext_fft=x[3], ext_cell=x[4],
-            contact_cell=x[5], self_fixed=x[6], ext_fixed=x[7], n=length(b),
-            predicted=predicted, measured=b, rows=used,
+    return (self_fft=x[1], self_cell=x[2], self_fixed=x[3],
+            ext_fft=x[4], ext_cell=x[5], ext_fixed=x[6],
+            contact_fft=x[7], contact_cell=x[8], contact_fixed=x[9],
+            n=length(b), predicted=predicted, measured=b, rows=used,
             rel_sse=sum(abs2, (predicted .- b) ./ b))
 end
 
@@ -321,21 +321,39 @@ function fit_linear_memory(pairs::Vector{Tuple{Float64,Float64}})
     return (x[1], x[2], length(pairs))
 end
 
-"Two-parameter fit `t = a * W + b` for one matvec kind."
+"""
+    fit_matvec(rows, kind) -> NamedTuple or nothing
+
+Two-parameter fit `t = a * W + b` for one matvec kind, refusing to fit fewer than
+`MIN_MATVEC_POINTS` distinct sizes.
+
+The guard is not defensive padding. With one point the slope and intercept are
+perfectly degenerate, and NNLS resolves it by putting everything on the slope --
+which then gets multiplied by an `M log M` two orders of magnitude larger at
+production sizes. On the partial fir data that single `matvec_self` point implied
+1.9 s per matvec at 96x32x32, i.e. a 27-hour RSVD estimate, versus 27 ms from
+narval's four-point fit. A silently absurd number in the requests is worse than a
+loudly missing one.
+"""
+const MIN_MATVEC_POINTS = 3
+
 function fit_matvec(rows::Vector{Row}, kind::AbstractString)
     A = Matrix{Float64}(undef, 0, 2)
     b = Float64[]
+    sizes = Set{Int}()
     for row in rows
         row["kind"] == kind || continue
         M = block_M(row)
         t = num(row, "time_s")
         (M === nothing || t === nothing || t <= 0) && continue
+        push!(sizes, M)
         A = vcat(A, [fft_work(M), 1.0]')
         push!(b, t)
     end
-    isempty(b) && return nothing
+    length(sizes) >= MIN_MATVEC_POINTS || return (insufficient=true, n=length(b))
     x = nnls_relative(A, b)
-    return (fft=x[1], fixed=x[2], n=length(b), predicted=A * x, measured=b)
+    return (insufficient=false, fft=x[1], fixed=x[2], n=length(b),
+            predicted=A * x, measured=b)
 end
 
 """
@@ -498,7 +516,23 @@ function fit_bounds(rows::Vector{Row}, gemm_rate::Union{Nothing,Float64})
     return result
 end
 
-"Median startup seconds for host and device points."
+"""
+    MAX_PLAUSIBLE_STARTUP_S
+
+Ceiling on a believable process startup. Julia's boot plus loading precompiled
+images and creating a CUDA context off a cold shared filesystem is minutes at
+worst; anything beyond this is not startup.
+
+The guard exists because it caught a real bug: `bench/plan.jl` was emitting an
+unescaped `date` command substitution into an unquoted heredoc, so the
+*submitting* shell expanded it and `startup_s` recorded queue wait. On fir that read as
+9.8 hours, and since startup is added directly to the predicted time, writing it
+into the coefficients would have put a 10-hour floor under every GPU request --
+on the cluster where queue priority was already the problem.
+"""
+const MAX_PLAUSIBLE_STARTUP_S = 1800.0
+
+"Median startup seconds for host and device points, refusing implausible values."
 function fit_startup(rows::Vector{Row})
     host, device = Float64[], Float64[]
     for row in rows
@@ -506,9 +540,17 @@ function fit_startup(rows::Vector{Row})
         (t === nothing || t <= 0) && continue
         push!(row["device"] == "gpu" ? device : host, t)
     end
-    return (host=isempty(host) ? nothing : median(host),
-            device=isempty(device) ? nothing : median(device),
-            n_host=length(host), n_device=length(device))
+    summarise(v) = begin
+        isempty(v) && return (value=nothing, n=0, rejected=false)
+        m = median(v)
+        m > MAX_PLAUSIBLE_STARTUP_S ? (value=nothing, n=length(v), rejected=true) :
+                                      (value=m, n=length(v), rejected=false)
+    end
+    h, d = summarise(host), summarise(device)
+    return (host=h.value, device=d.value, n_host=h.n, n_device=d.n,
+            host_rejected=h.rejected, device_rejected=d.rejected,
+            host_median=isempty(host) ? nothing : median(host),
+            device_median=isempty(device) ? nothing : median(device))
 end
 
 # --------------------------------------------------------------------------- #
@@ -547,15 +589,18 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         fields[:g0_self_cell] = greens.self_cell
         fields[:g0_ext_fft] = greens.ext_fft
         fields[:g0_ext_cell] = greens.ext_cell
+        fields[:g0_contact_fft] = greens.contact_fft
         fields[:g0_contact_cell] = greens.contact_cell
+        fields[:g0_contact_fixed] = greens.contact_fixed
         fields[:g0_self_fixed] = greens.self_fixed
         fields[:g0_ext_fixed] = greens.ext_fixed
-        push!(report, @sprintf("%-26s self %.3g s/(M log M), %.3g s/cell, %.3g s fixed",
-                               "g0 block time", greens.self_fft, greens.self_cell,
-                               greens.self_fixed))
-        push!(report, @sprintf("%-26s ext  %.3g s/(M log M), %.3g s/cell, %.3g s fixed (+%.3g s/cell contact)",
-                               "", greens.ext_fft, greens.ext_cell, greens.ext_fixed,
-                               greens.contact_cell))
+        for (label, fft, cell, fixed) in (
+            ("g0 block time  self", greens.self_fft, greens.self_cell, greens.self_fixed),
+            ("               ext", greens.ext_fft, greens.ext_cell, greens.ext_fixed),
+            ("               contact", greens.contact_fft, greens.contact_cell, greens.contact_fixed))
+            push!(report, @sprintf("%-26s %.3g s/(M log M), %.3g s/cell, %.3g s fixed",
+                                   label, fft, cell, fixed))
+        end
         push!(report, "  " * summarize("g0 block time", greens.predicted, greens.measured))
     end
 
@@ -587,8 +632,9 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
     for (kind, fftkey, fixedkey, label) in (("matvec_self", :mv_self_fft, :mv_self_fixed, "matvec self"),
                                             ("matvec_ext", :mv_ext_fft, :mv_ext_fixed, "matvec ext"))
         fit = fit_matvec(rows, kind)
-        if fit === nothing
-            push!(missing_fits, "$label (no $kind points)")
+        if fit.insufficient
+            push!(missing_fits, fit.n == 0 ? "$label (no $kind points)" :
+                  "$label (only $(fit.n) point(s); need $MIN_MATVEC_POINTS distinct sizes)")
             continue
         end
         fields[fftkey] = fit.fft
@@ -643,7 +689,12 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
     for (kinds, analytic, factor_field, base_field, label) in (
         (("stage_rsvd",), pt -> Float64(rsvd_counts(pt).host_dense_bytes),
          :rsvd_host_mem_factor, :rsvd_host_mem_base, "rsvd host memory"),
-        (("stage_bounds", "bounds_core"), pt -> Float64(bounds_counts(pt).host_bytes),
+        # `bounds_core` is deliberately excluded: it synthesises its eigenvector
+        # block directly on the device with `CUDA.randn`, so it never makes the
+        # host-side copy that the real job's JLD2 read does. Pairing the analytic
+        # host model with that measurement produced a 0.02x factor, i.e. the fit
+        # concluding the host needs almost nothing.
+        (("stage_bounds",), pt -> Float64(bounds_counts(pt).host_bytes),
          :bounds_host_mem_factor, :bounds_host_mem_base, "bounds host memory"))
         pairs = Tuple{Float64,Float64}[]
         for row in rows
@@ -675,13 +726,22 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             row["kind"] in kinds || continue
             pt = row_to_srpoint(row)
             pt === nothing && continue
-            peak = num(row, "peak_vram_bytes")
+            # Live pool high-water only. It is the one device number that scales
+            # with the problem; the pool's reserved backing never shrinks, so a
+            # size model fitted to it attributes allocation churn to the size term
+            # (measured on the first run: slopes of 4-33x the analytic count,
+            # anti-correlated with size, which produced 280 GB bounds estimates).
+            # Rows from before that column existed are skipped rather than
+            # substituted, so a stale run leaves the coefficient uncalibrated
+            # instead of confidently wrong.
+            peak = num(row, "peak_vram_live_bytes")
             (peak === nothing || peak <= 0) && continue
             push!(pairs, (analytic(pt), peak))
         end
         f, bs, n = fit_linear_memory(pairs)
         if f === nothing
-            push!(missing_fits, n == 0 ? "$label (no points)" :
+            push!(missing_fits, n == 0 ?
+                  "$label (no points with a live-pool measurement; rerun with the current bench/point.jl)" :
                   "$label (only $n point(s); need $MIN_MEMORY_POINTS distinct sizes)")
         else
             fields[factor_field] = f
@@ -691,21 +751,57 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         end
     end
 
+    # ---- pool overhead ----------------------------------------------------
+    #=
+    How much more the CUDA.jl pool reserves than the job actually has live. The
+    VRAM model is fitted against live bytes, so this ratio is what turns a demand
+    estimate into a number the device must actually have free.
+    =#
+    overheads = Float64[]
+    for row in rows
+        live = num(row, "peak_vram_live_bytes")
+        reserved = num(row, "peak_vram_reserved_bytes")
+        (live === nothing || reserved === nothing || live <= 0) && continue
+        push!(overheads, reserved / live)
+    end
+    if isempty(overheads)
+        push!(missing_fits, "pool overhead (no peak_vram_live_bytes; rerun with the " *
+                            "current bench/point.jl)")
+    else
+        push!(report, @sprintf("%-26s median %.2fx, p95 %.2fx  (pool reserved / live, %d points)",
+                               "device pool overhead", median(overheads),
+                               quantile(overheads, 0.95), length(overheads)))
+    end
+
     # ---- startup ----------------------------------------------------------
     startup = fit_startup(rows)
-    if startup.host === nothing
-        push!(missing_fits, "g0_startup_s (no startup_s column; is PSC_T0 exported?)")
-    else
-        fields[:g0_startup_s] = startup.host
-        push!(report, @sprintf("%-26s %.1f s  (from %d points)", "host startup",
-                               startup.host, startup.n_host))
-    end
-    if startup.device === nothing
-        push!(missing_fits, "gpu_startup_s (no startup_s column on device points)")
-    else
-        fields[:gpu_startup_s] = startup.device
-        push!(report, @sprintf("%-26s %.1f s  (from %d points)", "device startup",
-                               startup.device, startup.n_device))
+    #=
+    The heredoc-expansion bug was per-launcher, not per-point: if one of the two
+    startup numbers is implausible then every startup row from that run recorded
+    queue wait, including the ones that happen to look believable. CPU-only points
+    queue quickly, so their contamination is small enough to pass a ceiling test
+    while still being wrong. Refuse both.
+    =#
+    contaminated = startup.host_rejected || startup.device_rejected
+    for (value, rejected, seen, n, field, label) in (
+        (startup.host, startup.host_rejected, startup.host_median, startup.n_host,
+         :g0_startup_s, "host startup"),
+        (startup.device, startup.device_rejected, startup.device_median, startup.n_device,
+         :gpu_startup_s, "device startup"))
+        if rejected
+            push!(missing_fits,
+                  @sprintf("%s (median %.0f s exceeds the %.0f s plausibility ceiling: almost certainly queue wait, not startup. Regenerate the launcher and rerun a few points.)",
+                           label, seen, MAX_PLAUSIBLE_STARTUP_S))
+        elseif contaminated && seen !== nothing
+            push!(missing_fits,
+                  @sprintf("%s (measured %.0f s, discarded: another startup number from this run was implausible, so all of them include queue wait)",
+                           label, seen))
+        elseif value === nothing
+            push!(missing_fits, "$label (no startup_s; is PSC_T0 exported?)")
+        else
+            fields[field] = value
+            push!(report, @sprintf("%-26s %.1f s  (from %d points)", label, value, n))
+        end
     end
 
     coeffs = Coefficients(; (k => v for (k, v) in fields)...)
@@ -870,7 +966,8 @@ function main(argv::Vector{String})
         push!(get!(by_cluster, get(row, "cluster", "unknown"), Row[]), row)
     end
 
-    for (cluster, rows) in sort(collect(by_cluster))
+    # for (cluster, rows) in sort(collect(by_cluster))
+    for (cluster, rows) in collect(by_cluster)
         println("\n" * "="^78)
         println("Cluster: $cluster  ($(length(rows)) rows)")
         kinds = Dict{String,Int}()

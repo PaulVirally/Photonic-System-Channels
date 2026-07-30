@@ -238,8 +238,7 @@ Measurement(; times=Dict{String,Float64}(), headline="total", time_median_s=noth
             time_mean_s=nothing, bytes_written=nothing, notes=String[]) =
     Measurement(times, headline, time_median_s, time_mean_s, bytes_written, notes)
 
-function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram,
-              peak_vram, peak_vram_delta)
+function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram, vram)
     extras = copy(m.notes)
     for (name, seconds) in sort(collect(m.times))
         name == m.headline && continue
@@ -267,9 +266,11 @@ function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram,
         time_mean_s=m.time_mean_s === nothing ? "" : m.time_mean_s,
         peak_rss_bytes=peak_rss_bytes(),
         baseline_rss_bytes=baseline_rss,
-        peak_vram_bytes=peak_vram,
-        peak_vram_delta_bytes=peak_vram_delta,
+        peak_vram_bytes=vram.peak,
+        peak_vram_delta_bytes=vram.delta,
         baseline_vram_bytes=baseline_vram,
+        peak_vram_live_bytes=vram.live,
+        peak_vram_reserved_bytes=vram.reserved,
         bytes_written=m.bytes_written === nothing ? "" : m.bytes_written,
         startup_s=startup_seconds() === nothing ? "" : startup_seconds(),
         extra=join(extras, ";"),
@@ -285,8 +286,12 @@ function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram,
     end
     println("    peak RSS               ", human_bytes(peak_rss_bytes()),
             "  (baseline ", human_bytes(baseline_rss), ")")
-    uses_gpu(spec) && println("    peak VRAM              ", human_bytes(peak_vram),
-                              "  (delta ", human_bytes(peak_vram_delta), ")")
+    if uses_gpu(spec)
+        println("    peak VRAM              ", human_bytes(vram.peak),
+                "  (delta ", human_bytes(vram.delta), ")")
+        println("    pool live / reserved   ", human_bytes(vram.live), " / ",
+                human_bytes(vram.reserved))
+    end
     println("  -> $(spec.out_csv)")
     println("="^78)
     return row
@@ -508,16 +513,21 @@ function point_bounds_core(spec::PointSpec)
     result = nothing
     _, dt = timed(() -> begin
         try
+            # `on_outer_error=:stop` so that a loop that cannot run on synthetic
+            # input still returns the setup-stage timings, which are measured
+            # before it and are the whole point of this measurement.
             result = bounds_from_spectrum(env, smr, Γ, V, Γrs;
-                                          G₀_uu=G₀_uu, outer_indices=outer_indices)
-            push!(notes, "outer_ok=1")
+                                          G₀_uu=G₀_uu, outer_indices=outer_indices,
+                                          on_outer_error=:stop)
         catch err
-            # A synthetic C_basis is not guaranteed positive definite, so the
-            # generalized eigendecomposition can legitimately refuse. The setup
-            # stages are still measured; `geigh` comes from the dense point.
-            @warn "bounds outer loop failed on synthetic data" exception = err
-            push!(notes, "outer_ok=0")
-            push!(notes, "outer_error=$(typeof(err))")
+            frames = stacktrace(catch_backtrace())
+            where_str = isempty(frames) ? "unknown" :
+                        join(["$(f.func)@$(basename(String(f.file))):$(f.line)"
+                              for f in Iterators.take(frames, 3)], "<-")
+            @warn "bounds setup failed on synthetic data" exception = err location = where_str
+            push!(notes, "setup_ok=0")
+            push!(notes, "setup_error=$(typeof(err))")
+            push!(notes, "setup_where=$(where_str)")
         end
     end; device_sync=true)
     times["total"] = dt
@@ -528,6 +538,12 @@ function point_bounds_core(spec::PointSpec)
         times["ss_basis"] = st.ss_basis
         times["c_projection"] = st.c_projection
         times["outer_total"] = st.outer_total
+        push!(notes, "outer_ok=$(result.outer_error === nothing ? 1 : 0)")
+        if result.outer_error !== nothing
+            push!(notes, "outer_fail_n=$(result.outer_error.n)")
+            push!(notes, "outer_error=$(replace(result.outer_error.exception, ';' => ',', '=' => ':'))")
+            push!(notes, "outer_where=$(result.outer_error.location)")
+        end
         for (n, seconds) in result.outer_times
             push!(notes, "outer[$n]=$(@sprintf("%.6g", seconds))")
         end
@@ -618,10 +634,10 @@ function run_point(spec::PointSpec)
         stop_vram_watcher!(watcher)
         rethrow(err)
     end
-    peak_vram, peak_vram_delta = stop_vram_watcher!(watcher)
+    vram = stop_vram_watcher!(watcher)
 
     return emit(spec, measurement; baseline_rss=baseline_rss, baseline_vram=baseline_vram,
-                peak_vram=peak_vram, peak_vram_delta=peak_vram_delta)
+                vram=vram)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

@@ -90,17 +90,39 @@ and `stop_vram_watcher!` returns the peak number of bytes in use on the device
 over the watched interval (relative to whatever was already in use when the
 watcher started, plus that baseline -- i.e. the absolute device footprint).
 """
+#=
+Three numbers, because they answer different questions and confusing them makes
+the memory model unfittable:
+
+  * `min_free`      -> device bytes unavailable at the worst moment, from the
+                       driver's point of view. Includes the CUDA context and any
+                       other tenant. This is what decides whether the job fits.
+  * `max_pool_used` -> bytes live in CUDA.jl's pool. This is *demand*, and the
+                       only one of the three that scales with the problem size.
+  * `max_pool_reserved` -> bytes the pool has claimed from the driver. The pool
+                       does not shrink, so transient allocation churn (the bounds
+                       job allocates a few vectors per basis column, thousands of
+                       times) inflates this far above demand.
+
+Fitting a size model against reserved bytes produced slopes 4-33x the analytic
+count, anti-correlated with size -- the signature of a size-independent overhead
+being attributed to a size-dependent term.
+=#
 mutable struct VramWatcher
     task::Union{Nothing,Task}
     running::Threads.Atomic{Bool}
     min_free::Threads.Atomic{Int}
+    max_pool_used::Threads.Atomic{Int}
+    max_pool_reserved::Threads.Atomic{Int}
     total::Int
     baseline_used::Int
     interval_s::Float64
 end
 
 const _NO_VRAM_WATCHER = VramWatcher(nothing, Threads.Atomic{Bool}(false),
-                                     Threads.Atomic{Int}(typemax(Int)), 0, 0, 0.0)
+                                     Threads.Atomic{Int}(typemax(Int)),
+                                     Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
+                                     0, 0, 0.0)
 
 """
     start_vram_watcher(; interval_s=0.05, enabled=true) -> VramWatcher
@@ -112,15 +134,21 @@ function start_vram_watcher(; interval_s::Real=0.05, enabled::Bool=true)
     enabled || return _NO_VRAM_WATCHER
     free, total = CUDA.memory_info()
     watcher = VramWatcher(nothing, Threads.Atomic{Bool}(true),
-                          Threads.Atomic{Int}(free), Int(total), Int(total - free),
+                          Threads.Atomic{Int}(free), Threads.Atomic{Int}(0),
+                          Threads.Atomic{Int}(0), Int(total), Int(total - free),
                           Float64(interval_s))
     watcher.task = Threads.@spawn begin
         while watcher.running[]
             try
                 f, _ = CUDA.memory_info()
-                if f < watcher.min_free[]
-                    watcher.min_free[] = Int(f)
-                end
+                f < watcher.min_free[] && (watcher.min_free[] = Int(f))
+                # Both return `missing` on devices without a stream-ordered pool.
+                used = CUDA.used_memory()
+                used isa Integer && used > watcher.max_pool_used[] &&
+                    (watcher.max_pool_used[] = Int(used))
+                reserved = CUDA.cached_memory()
+                reserved isa Integer && reserved > watcher.max_pool_reserved[] &&
+                    (watcher.max_pool_reserved[] = Int(reserved))
             catch
                 # A transient CUDA error must not take down the measurement.
             end
@@ -138,14 +166,15 @@ mark net of whatever was already resident when the watcher started (CUDA
 context, other tenants).
 """
 function stop_vram_watcher!(watcher::VramWatcher)
-    watcher.task === nothing && return (0, 0)
+    watcher.task === nothing && return (peak=0, delta=0, live=0, reserved=0)
     watcher.running[] = false
     try
         wait(watcher.task)
     catch
     end
     peak_used = watcher.total - watcher.min_free[]
-    return (peak_used, max(0, peak_used - watcher.baseline_used))
+    return (peak=peak_used, delta=max(0, peak_used - watcher.baseline_used),
+            live=watcher.max_pool_used[], reserved=watcher.max_pool_reserved[])
 end
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +260,8 @@ const CSV_COLUMNS = [
     "peak_vram_bytes",
     "peak_vram_delta_bytes",
     "baseline_vram_bytes",  # device bytes in use before any work
+    "peak_vram_live_bytes",     # high-water of live pool allocations (demand)
+    "peak_vram_reserved_bytes", # high-water of pool-reserved backing (never shrinks)
     "bytes_written",    # serialized output size where relevant
     "startup_s",        # process start to first measured work (package load, CUDA init)
     "extra",            # free-form key=value;key=value notes
