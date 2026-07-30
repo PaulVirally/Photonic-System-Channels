@@ -142,7 +142,10 @@ struct ClusterConfig
     code_dir::String
 end
 
-num_threads(config::ClusterConfig) = config.has_slurm ? "\\\$SLURM_CPUS_PER_TASK" : "auto"
+const MOLERING_THREADS = 16
+
+num_threads(config::ClusterConfig) =
+    config.has_slurm ? "\\\$SLURM_CPUS_PER_TASK" : string(MOLERING_THREADS)
 
 cc_project_dir(server) =
     server in CC_RRG_CLUSTERS ?
@@ -346,7 +349,10 @@ spends allocation without buying priority. For the GPU jobs: a fixed small count
 """
 function choose_cores(job::JobType, exp::Experiment, cluster::ClusterConfig,
                       coeffs::Coefficients)
-    cluster.has_slurm || return cluster.max_cores
+    # Without a scheduler there is nothing to ask for, but the prediction still
+    # has to match what the job will really run with, since the model divides the
+    # quadrature term by the thread efficiency.
+    cluster.has_slurm || return MOLERING_THREADS
     uses_gpu(job) && return min(GPU_JOB_CORES, cluster.max_cores)
     is_sr(exp) || return min(4, cluster.max_cores)
     candidates = filter(<=(cluster.max_cores), CORE_CANDIDATES)
