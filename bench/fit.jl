@@ -540,11 +540,16 @@ function fit_startup(rows::Vector{Row})
         (t === nothing || t <= 0) && continue
         push!(row["device"] == "gpu" ? device : host, t)
     end
+    # Drop individual implausible values first, then judge the remainder. A single
+    # garbage row (one molering run recorded 16777219 s, i.e. an unset PSC_T0)
+    # should not discard 37 good measurements alongside it; only a majority being
+    # implausible means the whole run is contaminated.
     summarise(v) = begin
         isempty(v) && return (value=nothing, n=0, rejected=false)
-        m = median(v)
-        m > MAX_PLAUSIBLE_STARTUP_S ? (value=nothing, n=length(v), rejected=true) :
-                                      (value=m, n=length(v), rejected=false)
+        ok = filter(<=(MAX_PLAUSIBLE_STARTUP_S), v)
+        length(ok) * 2 >= length(v) && !isempty(ok) ?
+            (value=median(ok), n=length(ok), rejected=false) :
+            (value=nothing, n=length(v), rejected=true)
     end
     h, d = summarise(host), summarise(device)
     return (host=h.value, device=d.value, n_host=h.n, n_device=d.n,
@@ -719,7 +724,13 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
     for (kinds, analytic, factor_field, base_field, label) in (
         (("stage_rsvd",), pt -> Float64(rsvd_counts(pt).vram_bytes),
          :rsvd_vram_factor, :rsvd_vram_base, "rsvd VRAM"),
-        (("stage_bounds", "bounds_core"), pt -> Float64(bounds_counts(pt).vram_bytes),
+        # `bounds_core` excluded for the same reason as the host fit, plus a worse
+        # one: its live-pool high-water saturates at device capacity regardless of
+        # problem size (measured on narval: 29 GB for a 1.2 GB problem and for a
+        # 9.5 GB one alike). Julia does not collect dead CuArrays until CUDA.jl
+        # hits allocation pressure, so the number measures accumulated garbage,
+        # not demand, and any slope fitted to it is meaningless.
+        (("stage_bounds",), pt -> Float64(bounds_counts(pt).vram_bytes),
          :bounds_vram_factor, :bounds_vram_base, "bounds VRAM"))
         pairs = Tuple{Float64,Float64}[]
         for row in rows
@@ -847,12 +858,58 @@ function row_to_srpoint(row::Row)
 end
 
 """
+    microbench_worst_ratio(coeffs, rows) -> Float64 or nothing
+
+Worst measured/predicted over the primitives the model was fitted to: the Green
+blocks and the matvecs. Used as a fallback padding source when there are no
+end-to-end runs.
+
+It is not as good as end-to-end validation -- it cannot see anything the model
+omits entirely -- but it is a real, measured bound on how far the fitted terms
+miss, and it is available immediately. Blocking the padding on the `validate`
+tier means shipping requests padded by a number chosen out of the air, which is
+strictly worse for the one thing padding is for: not getting killed.
+"""
+function microbench_worst_ratio(coeffs::Coefficients, rows::Vector{Row})
+    worst = nothing
+    greens = fit_greens_time(rows, coeffs.g0_thread_scaling)
+    if greens !== nothing
+        for (p, m) in zip(greens.predicted, greens.measured)
+            (p > 0 && m > 0) || continue
+            worst = worst === nothing ? m / p : max(worst, m / p)
+        end
+    end
+    for kind in ("matvec_self", "matvec_ext")
+        fit = fit_matvec(rows, kind)
+        fit.insufficient && continue
+        for (p, m) in zip(fit.predicted, fit.measured)
+            (p > 0 && m > 0) || continue
+            worst = worst === nothing ? m / p : max(worst, m / p)
+        end
+    end
+    return worst
+end
+
+"""
+    MIN_TIME_PAD, MIN_MEM_PAD
+
+Floors on the padding factors. Cluster timings are not reproducible to better than
+a few tens of percent -- the calibration saw the same 24-cubed external block take
+13.9 s and 17.6 s on fir in the same run, a 27% spread from node contention alone
+-- so no amount of model quality justifies padding below these.
+"""
+const MIN_TIME_PAD = 1.5
+const MIN_MEM_PAD = 1.3
+
+"""
     fit_padding(coeffs, rows) -> (coeffs, report)
 
-Set the safety factors from the observed spread of measured/predicted on the
-end-to-end points, at the 95th percentile and never below 1.05. A padding factor
-chosen from data is the difference between "we asked for 20% more than we think we
-need" and "we asked for 20% more than a model we have not checked thinks we need".
+Set the safety factors from measured spread: the 95th percentile of
+measured/predicted over the end-to-end runs when there are any, otherwise 1.25x
+the worst primitive-level miss, and never below the floors above.
+
+A padding factor taken from data is the difference between "we asked for 50% more
+than we measured" and "we asked for 50% more than a model nobody has checked".
 """
 function fit_padding(coeffs::Coefficients, rows::Vector{Row})
     report = String[]
@@ -874,20 +931,37 @@ function fit_padding(coeffs::Coefficients, rows::Vector{Row})
     end
 
     q95(v) = isempty(v) ? nothing : quantile(v, 0.95)
+    fallback = microbench_worst_ratio(coeffs, rows)
     fields = Dict{Symbol,Any}()
-    for (ratios, field, label) in ((time_ratios, :time_pad, "time"),
-                                   (host_ratios, :host_mem_pad, "host memory"),
-                                   (vram_ratios, :vram_pad, "VRAM"))
+    #=
+    Only the *time* padding falls back to timing scatter. Memory is not noisy the
+    way wall time is -- the same job allocates the same arrays every run -- so its
+    conservatism belongs in the `*_mem_factor` multiplier on the analytic count,
+    which is derived from reading the allocations. Stacking a timing-derived pad on
+    top of that factor on top of the analytic floor triple-counts the margin, which
+    is how a 26 GB rSVD turned into a 96 GB request.
+    =#
+    for (ratios, field, label, floor_pad, use_fallback) in (
+            (time_ratios, :time_pad, "time", MIN_TIME_PAD, true),
+            (host_ratios, :host_mem_pad, "host memory", MIN_MEM_PAD, false),
+            (vram_ratios, :vram_pad, "VRAM", MIN_MEM_PAD, false))
         q = q95(ratios)
-        if q === nothing
-            push!(report, "  $label padding: kept default (no end-to-end points; " *
-                          "run --tier validate)")
-            continue
+        if q !== nothing
+            pad = max(floor_pad, q)
+            fields[field] = pad
+            push!(report, @sprintf("  %-14s padding %.2f  (p95 over %d end-to-end runs, median %.2f)",
+                                   label, pad, length(ratios), median(ratios)))
+        elseif use_fallback && fallback !== nothing
+            # No end-to-end runs: pad by the worst primitive-level miss, with
+            # margin, so the number is at least anchored to a measurement.
+            pad = max(floor_pad, 1.25 * fallback)
+            fields[field] = pad
+            push!(report, @sprintf("  %-14s padding %.2f  (no end-to-end runs; 1.25x the worst primitive miss of %.2f)",
+                                   label, pad, fallback))
+        else
+            push!(report, @sprintf("  %-14s padding %.2f  (default; conservatism is in the analytic multiplier)",
+                                   label, getfield(coeffs, field)))
         end
-        pad = max(1.05, q)
-        fields[field] = pad
-        push!(report, @sprintf("  %-14s padding %.2f  (p95 over %d runs, median %.2f)",
-                               label, pad, length(ratios), median(ratios)))
     end
     isempty(fields) && return coeffs, report
     updated = Dict{Symbol,Any}()
@@ -962,9 +1036,20 @@ function main(argv::Vector{String})
     isempty(all_rows) && error("No rows to fit")
 
     by_cluster = Dict{String,Vector{Row}}()
+    dropped = 0
     for row in all_rows
-        push!(get!(by_cluster, get(row, "cluster", "unknown"), Row[]), row)
+        # Rows with no cluster and no kind are fragments from interleaved appends:
+        # on a slurm cluster every point is a separate job appending to one CSV on
+        # a shared filesystem, and concurrent appends can tear a line in half.
+        # Skip them rather than inventing an empty-named cluster to fit.
+        cluster = strip(get(row, "cluster", ""))
+        if isempty(cluster) || isempty(strip(get(row, "kind", "")))
+            dropped += 1
+            continue
+        end
+        push!(get!(by_cluster, cluster, Row[]), row)
     end
+    dropped > 0 && @warn "Skipped $dropped malformed row(s) (torn by concurrent appends). The current bench/plan.jl writes one file per point to avoid this."
 
     # for (cluster, rows) in sort(collect(by_cluster))
     for (cluster, rows) in collect(by_cluster)

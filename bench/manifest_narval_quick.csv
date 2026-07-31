@@ -19,7 +19,7 @@ g0ext_l1_sep0ss1,g0_ext,4,8,3600,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.
 g0ext_l1_sep1ss4,g0_ext,4,8,3600,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --rank 2750 --oversamples 50 --power-iters 14 --sep 1//4"
 g0ext_l1_sep1000ss1,g0_ext,4,8,3600,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --rank 2750 --oversamples 50 --power-iters 14 --sep 1000//1"
 g0uu_l1,g0_multiregion,4,8,3600,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --rank 2750 --oversamples 50 --power-iters 14 --sep 1//4"
-g0threads_l0p75_t1,g0_ext,1,8,3631,0,"--cells 24,24,24 --scale 1//32 --chi 13.6+0.05im --rank 1350 --oversamples 50 --power-iters 14 --sep 1//4"
+g0threads_l0p75_t1,g0_ext,1,8,3611,0,"--cells 24,24,24 --scale 1//32 --chi 13.6+0.05im --rank 1350 --oversamples 50 --power-iters 14 --sep 1//4"
 g0threads_l0p75_t2,g0_ext,2,8,3600,0,"--cells 24,24,24 --scale 1//32 --chi 13.6+0.05im --rank 1350 --oversamples 50 --power-iters 14 --sep 1//4"
 g0threads_l0p75_t4,g0_ext,4,8,3600,0,"--cells 24,24,24 --scale 1//32 --chi 13.6+0.05im --rank 1350 --oversamples 50 --power-iters 14 --sep 1//4"
 g0threads_l0p75_t8,g0_ext,8,8,3600,0,"--cells 24,24,24 --scale 1//32 --chi 13.6+0.05im --rank 1350 --oversamples 50 --power-iters 14 --sep 1//4"

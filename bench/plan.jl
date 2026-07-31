@@ -322,13 +322,40 @@ function point_command(cluster::ClusterSpec, point::PlannedPoint, tier::Symbol)
     # `--note` is quoted because its value contains a `;`, and `--scale` because
     # anisotropic scales are negative rationals that a bare shell word would be
     # happy to mangle.
+    # One CSV per point. Every point is a separate job appending to a shared
+    # filesystem, and concurrent appends tear lines in half -- two narval rows were
+    # lost that way. `merge_rows` at the end of the script stitches them together.
     return join(vcat(["julia", "--project=.", "-t", string(point.threads),
                       "bench/point.jl", "--kind", point.kind],
                      [startswith(a, "--") ? a : "'$a'" for a in point.args],
                      ["--gpu", point.gpu ? "0" : "-1",
-                      "--root", "\$CAL_ROOT", "--out", "\$OUT",
+                      "--root", "\$CAL_ROOT",
+                      "--out", "\$ROWS/$(point.label).csv",
                       "--cluster", cluster.name,
                       "--note", "'tier=$(tier);label=$(point.label)'"]), " ")
+end
+
+"""
+    merge_block(cluster)
+
+The `--merge` mode both generated scripts share: stitch the per-point row files
+into one CSV, keeping a single header. Needed because each point writes its own
+file -- concurrent appends to one shared-filesystem CSV tear lines in half.
+"""
+function merge_block(cluster::ClusterSpec)
+    return """
+    if [ "\${1:-}" = "--merge" ]; then
+        n=\$(ls -1 \$ROWS/*.csv 2>/dev/null | wc -l)
+        if [ "\$n" -eq 0 ]; then
+            echo "No row files in \$ROWS -- nothing to merge."
+            exit 1
+        fi
+        head -n 1 \$(ls -1 \$ROWS/*.csv | head -n 1) > \$OUT
+        for f in \$ROWS/*.csv; do tail -n +2 "\$f" >> \$OUT; done
+        echo "Merged \$n row file(s) into \$OUT (\$(( \$(wc -l < \$OUT) - 1 )) rows)."
+        exit 0
+    fi
+    """
 end
 
 function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::Symbol)
@@ -339,20 +366,25 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
     # Generated $(now()) by bench/plan.jl. Do not edit; regenerate instead.
     #
     # Every point is its own job: one point running out of memory or time must
-    # not take the rest of the calibration with it. Rows are appended to
-    # \$OUT as each job finishes, so partial results are still usable.
+    # not take the rest of the calibration with it. Each writes its own row file,
+    # so partial results are always usable.
+    #
+    # Submit:  bash <this script>
+    # Collect: bash <this script> --merge
 
     set -u
 
     CODE_DIR=$(cluster.code_dir)
     CAL_ROOT=$(cluster.cal_root)
+    ROWS=\$CAL_ROOT/rows
     OUT=\$CAL_ROOT/calibration_$(cluster.name).csv
 
-    mkdir -p \$CAL_ROOT/logs \$CAL_ROOT/preload \$CAL_ROOT/project \$CAL_ROOT/scratch
+    mkdir -p \$CAL_ROOT/logs \$CAL_ROOT/preload \$CAL_ROOT/project \$CAL_ROOT/scratch \$ROWS
     cd \$CODE_DIR
 
+    $(merge_block(cluster))
     echo "Submitting $(length(points)) calibration points for $(cluster.name) (tier=$(tier))"
-    echo "Results will accumulate in \$OUT"
+    echo "Each point writes its own row file under \$ROWS"
     """)
 
     for point in points
@@ -380,7 +412,9 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
     println(io, """
     echo
     echo "All points submitted. Watch them with: squeue -u \\\$USER"
-    echo "When they are done, copy the CSV back:"
+    echo
+    echo "When they have finished, merge the per-point rows and copy the result back:"
+    echo "  bash bench/$(basename("launch_calibration_$(cluster.name)_$(tier).sh")) --merge"
     echo "  scp $(CC_UNAME)@$(cluster.name).alliancecan.ca:\$OUT bench/data/"
     """)
     return String(take!(io))
@@ -404,13 +438,15 @@ function bash_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::S
 
     CODE_DIR=$(cluster.code_dir)
     CAL_ROOT=$(cluster.cal_root)
+    ROWS=\$CAL_ROOT/rows
     OUT=\$CAL_ROOT/calibration_$(cluster.name).csv
 
-    mkdir -p \$CAL_ROOT/logs \$CAL_ROOT/preload \$CAL_ROOT/project \$CAL_ROOT/scratch
+    mkdir -p \$CAL_ROOT/logs \$CAL_ROOT/preload \$CAL_ROOT/project \$CAL_ROOT/scratch \$ROWS
     cd \$CODE_DIR
 
     export PSC_CLUSTER=$(cluster.name)
 
+    $(merge_block(cluster))
     total=$(length(points))
     index=0
     """)
@@ -428,7 +464,8 @@ function bash_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::S
 
     println(io, """
     echo
-    echo "Done. Copy the CSV back to your laptop:"
+    echo "Done. Merge the per-point rows, then copy the result back:"
+    echo "  bash bench/$(basename("launch_calibration_$(cluster.name)_$(tier).sh")) --merge"
     echo "  scp $(MOLERING_UNAME)@molering:\$OUT bench/data/"
     """)
     return String(take!(io))

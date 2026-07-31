@@ -340,20 +340,35 @@ Base.@kwdef struct Coefficients
 
     gpu_startup_s::Float64 = 120.0
 
-    greens_mem_factor::Float64 = 1.0
-    greens_mem_base::Float64 = 2.0e9
-    rsvd_host_mem_factor::Float64 = 2.0
-    rsvd_host_mem_base::Float64 = 3.0e9
-    rsvd_vram_factor::Float64 = 1.0
-    rsvd_vram_base::Float64 = 1.5e9
-    bounds_host_mem_factor::Float64 = 2.5
-    bounds_host_mem_base::Float64 = 3.0e9
-    bounds_vram_factor::Float64 = 1.0
-    bounds_vram_base::Float64 = 1.5e9
+    #=
+    Memory defaults are deliberately generous, because they are what gets used
+    when a cluster has no end-to-end runs yet and because the failure modes are
+    wildly asymmetric: an over-request costs some queue time, an under-request
+    costs the entire job at the point where it has already done all the work.
+
+    The factors sit at 2x the analytic count (which comes from reading the
+    allocations in the code, so it is a floor, not a guess) plus a base that
+    covers the Julia process, the package images and the CUDA context. Measured
+    Green-job memory landed at 1.36-1.64x analytic + ~1.6 GiB across three
+    clusters, so 2x + 4 GB is comfortably above what the one calibrated case
+    actually needs.
+    =#
+    greens_mem_factor::Float64 = 2.0
+    greens_mem_base::Float64 = 4.0e9
+    rsvd_host_mem_factor::Float64 = 3.0
+    rsvd_host_mem_base::Float64 = 6.0e9
+    rsvd_vram_factor::Float64 = 2.0
+    rsvd_vram_base::Float64 = 3.0e9
+    bounds_host_mem_factor::Float64 = 3.0
+    bounds_host_mem_base::Float64 = 6.0e9
+    bounds_vram_factor::Float64 = 2.0
+    bounds_vram_base::Float64 = 3.0e9
 
     time_pad::Float64 = 1.5
-    host_mem_pad::Float64 = 1.25
-    vram_pad::Float64 = 1.2
+    # Small on purpose: the memory margin lives in `*_mem_factor`, which multiplies
+    # an analytic count read off the allocations. This is only for run-to-run slop.
+    host_mem_pad::Float64 = 1.15
+    vram_pad::Float64 = 1.15
 end
 
 thread_efficiency(coeffs::Coefficients, threads::Int) =
@@ -588,14 +603,15 @@ function rsvd_counts(pt::SRPoint)
             bytes_written=bytes_written)
 end
 
+"See `bounds_time_s` for why the device-bound part is reported separately."
 function rsvd_time_s(pt::SRPoint, c::Coefficients)
     n = rsvd_counts(pt)
-    t = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-    t += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
-    t += n.qr_flops / c.qr_rate + n.gemm_flops / c.gemm_rate
-    t += n.solve_flops / c.eigh_rate
-    t += n.bytes_written / c.disk_write_rate
-    return t + c.gpu_startup_s
+    device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
+    device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+    device += n.qr_flops / c.qr_rate + n.gemm_flops / c.gemm_rate
+    device += n.solve_flops / c.eigh_rate
+    host = n.bytes_written / c.disk_write_rate + c.gpu_startup_s
+    return (host + device, device)
 end
 
 rsvd_vram_bytes(pt::SRPoint, c::Coefficients) =
@@ -669,17 +685,29 @@ function bounds_counts(pt::SRPoint)
             bytes_read=bytes_read)
 end
 
+"""
+    bounds_time_s(pt, c) -> (total, device_bound)
+
+Total predicted seconds, and how many of them are actually device throughput.
+
+The split matters because a MIG slice gets a fraction of the streaming
+multiprocessors, so only the device-bound part stretches when you ask for one.
+The bounds job's dominant term at large rank is the *host-side* Brent root find
+in the `O(num_pos^2)` inner loop -- single-threaded scalar Julia with the GPU idle
+-- and scaling that by the slice fraction would over-request by up to 8x on
+exactly the small-body sweeps that are otherwise cheap enough to fit in a slice.
+"""
 function bounds_time_s(pt::SRPoint, c::Coefficients)
     n = bounds_counts(pt)
-    t = n.gs_bytes / c.bandwidth + n.gs_launches * c.launch_latency
-    t += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-    t += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
-    t += n.gemm_flops / c.gemm_rate
-    t += n.geigh_flops / c.geigh_rate + n.copy_bytes / c.bandwidth
-    t += n.inner_gemv_flops / c.gemm_rate + n.inner_syncs * c.sync_latency
-    t += n.root_work * c.host_root_find
-    t += n.bytes_read / c.disk_read_rate
-    return t + c.gpu_startup_s
+    device = n.gs_bytes / c.bandwidth + n.gs_launches * c.launch_latency
+    device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
+    device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+    device += n.gemm_flops / c.gemm_rate
+    device += n.geigh_flops / c.geigh_rate + n.copy_bytes / c.bandwidth
+    device += n.inner_gemv_flops / c.gemm_rate + n.inner_syncs * c.sync_latency
+    host = n.root_work * c.host_root_find + n.bytes_read / c.disk_read_rate +
+           c.gpu_startup_s
+    return (host + device, device)
 end
 
 bounds_vram_bytes(pt::SRPoint, c::Coefficients) =
@@ -702,20 +730,25 @@ coefficient set's safety factors are applied.
 function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_for("molering");
                  pad::Bool=true)
     if job == GenerateGreens
-        t, host, vram = greens_time_s(pt, coeffs), greens_host_bytes(pt, coeffs), 0.0
+        # CPU-only job: no device-bound share to stretch for a GPU slice.
+        t, device_t = greens_time_s(pt, coeffs), 0.0
+        host, vram = greens_host_bytes(pt, coeffs), 0.0
     elseif job == GenerateRSVD
-        t, host, vram = rsvd_time_s(pt, coeffs), rsvd_host_bytes(pt, coeffs), rsvd_vram_bytes(pt, coeffs)
+        t, device_t = rsvd_time_s(pt, coeffs)
+        host, vram = rsvd_host_bytes(pt, coeffs), rsvd_vram_bytes(pt, coeffs)
     elseif job == ComputeBounds
-        t, host, vram = bounds_time_s(pt, coeffs), bounds_host_bytes(pt, coeffs), bounds_vram_bytes(pt, coeffs)
+        t, device_t = bounds_time_s(pt, coeffs)
+        host, vram = bounds_host_bytes(pt, coeffs), bounds_vram_bytes(pt, coeffs)
     else
         error("Unknown job kind: $job")
     end
     if pad
         t *= coeffs.time_pad
+        device_t *= coeffs.time_pad
         host *= coeffs.host_mem_pad
         vram *= coeffs.vram_pad
     end
-    return (time_s=t, host_bytes=host, vram_bytes=vram)
+    return (time_s=t, device_time_s=device_t, host_bytes=host, vram_bytes=vram)
 end
 
 predict_time_s(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true) =

@@ -91,8 +91,21 @@ causes are a tier that skipped the relevant points, or `startup_s` being empty
 because `PSC_T0` was not exported (the generated scripts do it; a hand-run point
 will not).
 
-The padding factors are set from the 95th percentile of measured/predicted on the
-end-to-end runs, so without the `validate` tier they stay at their defaults.
+**Padding.** The time padding comes from the 95th percentile of
+measured/predicted on the end-to-end runs when there are any; without them it
+falls back to 1.25x the worst primitive-level miss, floored at 1.5. Memory padding
+is deliberately *not* derived from timing scatter — memory is not noisy the way
+wall time is, so its margin lives in the `*_mem_factor` multiplier on the analytic
+count instead. Stacking all three (analytic floor x factor x timing pad) is how a
+26 GB rSVD once turned into a 96 GB request.
+
+**Collecting rows.** Each point writes its own CSV under `$CAL_ROOT/rows`, because
+concurrent appends to one file on a shared filesystem tear lines in half (two
+narval rows were lost that way). Merge them before copying back:
+
+```bash
+bash bench/launch_calibration_narval_quick.sh --merge
+```
 
 ## Running a single point by hand
 
