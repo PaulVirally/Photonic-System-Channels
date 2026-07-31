@@ -329,14 +329,17 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     GC.gc()
     GC.gc()
 
-    @info "hello" size(Vur_asym) size(G₀_uu) size(s_projector) size(Γ) size(Γrs)
+    # @info "hello" size(Vur_asym) size(G₀_uu) size(s_projector) size(Γ) size(Γrs)
 
     χ = susceptibility(smr)
     ζ = abs(χ)^2/imag(χ)
     @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Susceptibility χ = $χ, material factor ζ = $ζ"
 
     num_pos = count(Γ .> zero(eltype(Γ)))
-    Γ_pos = cu(Γ[1:num_pos]) # These have been sorted in descending order; keep only the positive eigenvalues
+    Γ_pos = Γ[1:num_pos] # These have been sorted in descending order; keep only the positive eigenvalues
+    if use_gpu(compute_env)
+        Γ_pos = CuArray(Γ_pos)
+    end
     gs_pos = Vur_asym[:, 1:num_pos] # These have been sorted in descending order of the corresponding Γ values; keep only the eigenvectors with positive eigenvalues
 
     # Reverse Gram-Schmidt
