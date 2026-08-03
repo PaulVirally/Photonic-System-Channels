@@ -27,6 +27,9 @@ Kinds (see `run_point` at the bottom for the dispatch):
     matvec_uu       time the multi-region [S, R] <- [S, R] operator on a vector
     dense           time qr / gemm / eigh / geigh / svdvals at (m, c)
     bounds_core     time the bounds kernel on a synthetic spectrum
+    mem_rsvd        real RSVD memory, with power iterations reduced (memory is
+                    q-independent, time is not) -- the cheap way to measure the
+                    RSVD's RAM and VRAM without a full run
     stage_rsvd      run the real `_generate_rsvd_sr` end to end
     stage_bounds    run the real `_compute_bounds_sr` end to end
 
@@ -128,7 +131,7 @@ host point never touches CUDA, and so that the Green-function builds it measures
 stay on the host exactly as the production CPU job does.
 """
 const GPU_KINDS = Set(["matvec_self", "matvec_ext", "matvec_uu", "dense",
-                       "bounds_core", "stage_rsvd", "stage_bounds"])
+                       "bounds_core", "mem_rsvd", "stage_rsvd", "stage_bounds"])
 
 struct PointSpec
     kind::String
@@ -238,7 +241,8 @@ Measurement(; times=Dict{String,Float64}(), headline="total", time_median_s=noth
             time_mean_s=nothing, bytes_written=nothing, notes=String[]) =
     Measurement(times, headline, time_median_s, time_mean_s, bytes_written, notes)
 
-function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram, vram)
+function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram, vram,
+              device_total=0)
     extras = copy(m.notes)
     for (name, seconds) in sort(collect(m.times))
         name == m.headline && continue
@@ -271,6 +275,7 @@ function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram, vram
         baseline_vram_bytes=baseline_vram,
         peak_vram_live_bytes=vram.live,
         peak_vram_reserved_bytes=vram.reserved,
+        device_total_bytes=device_total,
         bytes_written=m.bytes_written === nothing ? "" : m.bytes_written,
         startup_s=startup_seconds() === nothing ? "" : startup_seconds(),
         extra=join(extras, ";"),
@@ -556,6 +561,47 @@ end
 # End-to-end stage points
 # --------------------------------------------------------------------------- #
 
+"""
+    point_mem_rsvd(spec)
+
+Real RSVD memory at a fraction of the real RSVD cost, by running the actual
+`_generate_rsvd_sr` with the power-iteration count knocked down.
+
+The trick is that **peak memory does not depend on `q`**. Looking at
+`randomized_hermitian_range_finder`, each power iteration allocates one fresh
+`N_u x c` block and drops the previous one, so the live set is the same on
+iteration 1 as on iteration 14 -- `Omega`, `Q`, and `operator * Q`. Only the matvec
+count, and so the time, scales with `q`. Two iterations rather than zero, because
+one full cycle is what lets the allocator reach its steady state; going to `q = 14`
+would buy nothing but wall time.
+
+Everything else is the production path: the same operators, the same
+`reigen_hermitian` and `rsvdvals` calls, the same host-side `Array(...)` copy and
+JLD2 write. So `peak_rss_bytes` and the device high-water are the numbers the real
+job would produce.
+
+Needs the Green functions in the preload directory. `bench/plan.jl`'s `memory`
+tier submits the `stage_greens` point first and makes this depend on it.
+"""
+function point_mem_rsvd(spec::PointSpec)
+    env = build_environment(spec)
+    smr = build_system(spec)
+    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters)
+    jld = joinpath(spec.scratch_dir, "$(file_prefix(smr)).jld")
+    # A stale JLD makes `_generate_rsvd_sr` skip the work it is here to measure.
+    isfile(jld) && rm(jld; force=true)
+    _, dt = timed(() -> PhotonicSystemChannels._generate_rsvd_sr(env, smr, params);
+                  device_sync=true)
+    written = isfile(jld) ? filesize(jld) : 0
+    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    c = spec.rank + spec.oversamples
+    return Measurement(times=Dict("stage" => dt), headline="stage",
+                       bytes_written=written,
+                       notes=["N_u=$N_u", "sketch_width=$c",
+                              "reduced_power_iters=$(spec.power_iters)",
+                              "analytic_live_bytes=$(3 * N_u * c * 16)"])
+end
+
 function point_stage_rsvd(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
@@ -603,6 +649,7 @@ const POINT_KINDS = Dict{String,Function}(
     "matvec_uu" => point_matvec_uu,
     "dense" => point_dense,
     "bounds_core" => point_bounds_core,
+    "mem_rsvd" => point_mem_rsvd,
     "stage_rsvd" => point_stage_rsvd,
     "stage_bounds" => point_stage_bounds,
 )
@@ -621,9 +668,11 @@ function run_point(spec::PointSpec)
 
     baseline_rss = peak_rss_bytes()
     baseline_vram = 0
+    device_total = 0
     if uses_gpu(spec)
         free, total = CUDA.memory_info()
         baseline_vram = Int(total - free)
+        device_total = Int(total)
     end
 
     watcher = start_vram_watcher(enabled=uses_gpu(spec))
@@ -637,7 +686,7 @@ function run_point(spec::PointSpec)
     vram = stop_vram_watcher!(watcher)
 
     return emit(spec, measurement; baseline_rss=baseline_rss, baseline_vram=baseline_vram,
-                vram=vram)
+                vram=vram, device_total=device_total)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

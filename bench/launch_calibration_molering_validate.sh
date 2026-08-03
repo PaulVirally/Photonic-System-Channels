@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cost-model calibration for molering, tier=validate.
-# Generated 2026-07-30T13:36:59.938 by bench/plan.jl. Do not edit; regenerate instead.
+# Generated 2026-08-03T09:51:38.911 by bench/plan.jl. Do not edit; regenerate instead.
 #
 # No scheduler here, so points run one at a time in the foreground. Each is
 # allowed to fail without stopping the run; check the logs afterwards for

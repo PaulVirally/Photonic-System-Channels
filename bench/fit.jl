@@ -428,6 +428,77 @@ function fit_dense_rates(rows::Vector{Row})
 end
 
 """
+    device_capacity_bytes(row) -> Float64 or nothing
+
+Device capacity, from the `device_total_bytes` column when present and otherwise
+from the GPU name, so that older rows can still be checked for censoring.
+"""
+function device_capacity_bytes(row::Row)
+    total = num(row, "device_total_bytes")
+    (total !== nothing && total > 0) && return total
+    name = get(row, "gpu_name", "")
+    m = match(r"(\d+)\s*GB", name)
+    m !== nothing && return parse(Float64, m.captures[1]) * 1024^3
+    occursin("A6000", name) && return 48.0 * 1024^3   # RTX A6000, 48 GB
+    return nothing
+end
+
+"""
+    fit_device_overhead(rows) -> (factor, base, n, dropped) or nothing
+
+Measured cost of holding dense complex arrays on the device, as
+`peak = factor * bytes_of_arrays + base`, fitted on the `dense` points.
+
+This is the grounded input to the RSVD and bounds VRAM estimates, and it is a
+proxy by design. The `dense` point allocates two `m x c` matrices plus three
+`c x c` ones and then runs the QR, the gemms and the Hermitian eigendecomposition
+on them -- the same shapes and the same cuSOLVER routines the RSVD's dense phase
+uses. What the fitted factor captures is everything the naive byte count misses:
+cuSOLVER workspaces (comparable in size to the matrix being factored), the pool's
+block rounding, and the intermediates of `A' * B`. Measured across three clusters
+it lands at 2.5-3.1x for the large shapes.
+
+Censored points are dropped. Once a measurement approaches device capacity it
+only says "at least this much", and including it flattens the slope. Detection
+needs the capacity, which is why `device_total_bytes` is recorded.
+
+**Reported, not used for the job estimates.** The `dense` point was built to
+measure *time*: it runs five factorizations back to back, each in a repetition
+loop that allocates a fresh result per rep (`copy(H)`, `copy(X)`, `A * X`). Its
+peak is therefore dominated by timing-loop churn, making it an upper bound on what
+a single pass needs rather than a demand model. Applying its 3.0x to the RSVD
+implied 94 GB for the 2750-component run that demonstrably completed on an 80 GB
+H100. Use a `mem_rsvd` point for the real number.
+"""
+const CENSORED_FRACTION = 0.75
+
+function fit_device_overhead(rows::Vector{Row})
+    pairs = Tuple{Float64,Float64}[]
+    dropped = 0
+    for row in rows
+        row["kind"] == "dense" || continue
+        m, c = int(row, "dense_m"), int(row, "dense_c")
+        peak = num(row, "peak_vram_bytes")
+        (m === nothing || c === nothing || peak === nothing || peak <= 0) && continue
+        capacity = device_capacity_bytes(row)
+        if capacity !== nothing && peak > CENSORED_FRACTION * capacity
+            dropped += 1
+            continue
+        end
+        # What point_dense actually allocates: A and B (m x c), X, H and P (c x c),
+        # u and w (length m).
+        arrays = 2 * m * c * 16 + 3 * c^2 * 16 + 2 * m * 16
+        push!(pairs, (Float64(arrays), peak))
+    end
+    length(unique(p -> round(p[1]; sigdigits=6), pairs)) >= MIN_MEMORY_POINTS ||
+        return nothing
+    A = hcat([p[1] for p in pairs], ones(length(pairs)))
+    b = [p[2] for p in pairs]
+    x = nnls_relative(A, b)
+    return (factor=x[1], base=x[2], n=length(pairs), dropped=dropped)
+end
+
+"""
     fit_bounds(rows, gemm_rate) -> NamedTuple
 
 Split the bounds measurements into the coefficients the model needs.
@@ -760,6 +831,51 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             push!(report, @sprintf("%-26s %.2f x analytic + %s  (from %d points)",
                                    label, f, human_bytes(bs), n))
         end
+    end
+
+    # ---- device memory overhead, from the dense points --------------------
+    #=
+    The VRAM estimates for the RSVD and bounds jobs rest on this rather than on
+    their own end-to-end runs, because those need a `validate` tier and this does
+    not. The dense points measure the same operations at the same shapes on the
+    same hardware, so applying their measured overhead to the analytic array count
+    is a proxy with a real number behind it instead of a chosen multiplier.
+    =#
+    overhead = fit_device_overhead(rows)
+    if overhead !== nothing
+        push!(report, @sprintf("%-26s %.2f x array bytes + %s  (%d uncensored dense points, %d dropped)",
+                               "dense-point VRAM", overhead.factor,
+                               human_bytes(overhead.base), overhead.n, overhead.dropped))
+        push!(report, "  NOT used for the job estimates: an upper bound, not a demand model (see below)")
+    end
+    push!(missing_fits, "rsvd/bounds VRAM (no stage_rsvd or mem_rsvd points; using the analytic floor x the default factor)")
+
+    # ---- host memory baseline for the device jobs -------------------------
+    #=
+    Measured process baseline for a GPU job: the smallest host RSS across the
+    matvec points, which load a Green operator and move it to the device but hold
+    nothing else. The RSVD adds one host-side `Array(vectors)` copy of the
+    eigenvector block plus JLD2's write buffer, which is what the factor covers.
+    =#
+    gpu_baselines = Float64[]
+    for row in rows
+        startswith(row["kind"], "matvec") || continue
+        rss = num(row, "peak_rss_bytes")
+        rss === nothing || push!(gpu_baselines, rss)
+    end
+    if isempty(gpu_baselines)
+        push!(missing_fits, "device-job host baseline (no matvec points)")
+    else
+        baseline = minimum(gpu_baselines)
+        for bf in (:rsvd_host_mem_base, :bounds_host_mem_base)
+            haskey(fields, bf) && continue
+            # 2x the measured baseline: it is a floor (the smallest point still
+            # holds an operator) and host RSS has no headroom once SLURM kills you.
+            fields[bf] = 2 * baseline
+        end
+        push!(report, @sprintf("%-26s %s measured, %s used as the base  (from %d GPU points)",
+                               "device-job host baseline", human_bytes(baseline),
+                               human_bytes(2 * baseline), length(gpu_baselines)))
     end
 
     # ---- pool overhead ----------------------------------------------------

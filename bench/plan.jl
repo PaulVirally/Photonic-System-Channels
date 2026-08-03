@@ -162,7 +162,11 @@ struct PlannedPoint
     host_GB::Int
     time_s::Int
     gpu::Bool
+    depends_on::Union{Nothing,String}   # label of a point that must finish first
 end
+
+PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu) =
+    PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu, nothing)
 
 cells_arg(cells::NTuple{3,Int}) = join(cells, ",")
 rat(r::Rational{Int}) = "$(numerator(r))//$(denominator(r))"
@@ -189,7 +193,7 @@ end
 
 function plan_points(cluster::ClusterSpec, tier::Symbol)
     quick = tier == :quick
-    micro = tier != :validate
+    micro = tier in (:quick, :full)
     bodies = quick ? filter(b -> b.tier == :quick, BODIES) : BODIES
     separations = quick ? QUICK_SEPARATIONS : SEPARATIONS
     points = PlannedPoint[]
@@ -274,6 +278,48 @@ function plan_points(cluster::ClusterSpec, tier::Symbol)
             push!(points, PlannedPoint("boundscore_$(body.label)_k$(rank)", "bounds_core",
                                        args, min(4, cluster.max_cores),
                                        max(16, ceil(Int, 3 * bytes / 2^30) + 8), 4 * 3600, true))
+        end
+    end
+
+    # ---- Memory tier: the real RSVD footprint, cheaply --------------------
+    #=
+    Green functions on the CPU (they have to exist before the RSVD can load them),
+    then the real RSVD with power iterations cut to 2. Memory does not depend on
+    `q` -- each power iteration recycles one N_u x c block -- so this measures
+    exactly the RAM and VRAM the production job uses, for roughly a sixth of the
+    matvecs. This is the only grounded source for RSVD memory; the dense points
+    over-state it because their timing loops churn allocations.
+    =#
+    if tier == :memory
+        for body in BODIES
+            tag = body.label
+            args = vcat(common(body), ["--sep", rat(8 // 32)])
+            hg, ts = block_resources(cluster, body, 8 // 32, min(4, cluster.max_cores))
+            greens_label = "memgreens_$(tag)"
+            push!(points, PlannedPoint(greens_label, "stage_greens", args,
+                                       min(4, cluster.max_cores), hg, ts, false))
+            # Ask for a whole GPU: we are measuring how much it needs, so capping
+            # the allocation in advance would just censor the answer.
+            pt = as_srpoint(body, 8 // 32, min(4, cluster.max_cores))
+            coeffs = coefficients_for(cluster.name)
+            p_rsvd = predict(GenerateRSVD, pt, coeffs; pad=false)
+            # `common(body)` already carries --power-iters, so drop it before
+            # appending the reduced value rather than passing the flag twice.
+            base_args = String[]
+            local skip_next = false
+            for a in common(body)
+                if skip_next; skip_next = false; continue; end
+                if a == "--power-iters"; skip_next = true; continue; end
+                push!(base_args, a)
+            end
+            push!(points, PlannedPoint("memrsvd_$(tag)", "mem_rsvd",
+                                       vcat(base_args,
+                                            ["--sep", rat(8 // 32), "--power-iters", "2"]),
+                                       min(4, cluster.max_cores),
+                                       min(cluster.max_host_GB,
+                                           max(32, ceil(Int, 4 * p_rsvd.host_bytes / 2^30))),
+                                       clamp(ceil(Int, 3 * p_rsvd.time_s), 1800, 12 * 3600),
+                                       true, greens_label))
         end
     end
 
@@ -389,9 +435,15 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
 
     for point in points
         gpu_line = point.gpu ? "    --gpus=$(cluster.full_gpu) \\\n" : ""
+        # Capture the job id so later points can depend on this one, and emit the
+        # dependency line when a point needs an earlier one's output (the memory
+        # tier's RSVD points need their Green functions on disk first).
+        var = "jid_$(replace(point.label, r"[^A-Za-z0-9_]" => "_"))"
+        dep_line = point.depends_on === nothing ? "" :
+            "    --dependency=afterok:\${jid_$(replace(point.depends_on, r"[^A-Za-z0-9_]" => "_"))} \\\n"
         println(io, """
-        sbatch \\
-            --job-name=psccal_$(point.label) \\
+        $var=\$(sbatch --parsable \\
+        $(dep_line)    --job-name=psccal_$(point.label) \\
             --output=\$CAL_ROOT/logs/$(point.label)_%j.out \\
             --account=$(cluster.account) \\
             --time=$(seconds2string(point.time_s)) \\
@@ -405,6 +457,7 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
         export PSC_T0=\\\$(date +%s)
         srun $(point_command(cluster, point, tier))
         EOF
+        )
         sleep 0.05
         """)
     end
@@ -505,7 +558,8 @@ function main(argv::Vector{String})
     cluster_name = get(opts, "cluster", "")
     isempty(cluster_name) && error("--cluster is required (fir, narval or molering)")
     tier = Symbol(get(opts, "tier", "quick"))
-    tier in (:quick, :full, :validate) || error("--tier must be quick, full or validate")
+    tier in (:quick, :full, :memory, :validate) ||
+        error("--tier must be quick, full, memory or validate")
 
     load_coefficients!(@__DIR__)
     cluster = ClusterSpec(cluster_name)

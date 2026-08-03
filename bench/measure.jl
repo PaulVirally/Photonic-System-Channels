@@ -262,6 +262,7 @@ const CSV_COLUMNS = [
     "baseline_vram_bytes",  # device bytes in use before any work
     "peak_vram_live_bytes",     # high-water of live pool allocations (demand)
     "peak_vram_reserved_bytes", # high-water of pool-reserved backing (never shrinks)
+    "device_total_bytes",       # device capacity, so censored measurements are detectable
     "bytes_written",    # serialized output size where relevant
     "startup_s",        # process start to first measured work (package load, CUDA init)
     "extra",            # free-form key=value;key=value notes
