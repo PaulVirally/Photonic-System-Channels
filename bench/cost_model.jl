@@ -355,10 +355,25 @@ Base.@kwdef struct Coefficients
     =#
     greens_mem_factor::Float64 = 2.0
     greens_mem_base::Float64 = 4.0e9
-    rsvd_host_mem_factor::Float64 = 3.0
-    rsvd_host_mem_base::Float64 = 6.0e9
+    rsvd_host_mem_factor::Float64 = 1.5
+    rsvd_host_mem_base::Float64 = 4.0e9
     rsvd_vram_factor::Float64 = 2.0
     rsvd_vram_base::Float64 = 3.0e9
+
+    #=
+    Smallest observed ratio of real device high-water to the analytic live-array
+    count, used for the *feasibility* test rather than for the request.
+
+    Device memory in this pipeline is churn-elastic: CUDA.jl's pool grows to hold
+    garbage Julia has not collected, so a job with a 5 GB working set was measured
+    taking 37 GB on an idle 80 GB card, while one with a 46 GB working set fitted
+    in 71 GB on the same card. The observed peak is "whatever the allocator felt
+    like taking", not demand. What it cannot go below is this floor, so this is the
+    number that decides whether a card is big enough -- and the request is capped
+    at the card, because asking for more than exists just gets the job rejected.
+    Measured minimum across fir's mem_rsvd points: 1.56.
+    =#
+    vram_floor_factor::Float64 = 1.6
     bounds_host_mem_factor::Float64 = 3.0
     bounds_host_mem_base::Float64 = 6.0e9
     bounds_vram_factor::Float64 = 2.0
@@ -617,6 +632,18 @@ end
 rsvd_vram_bytes(pt::SRPoint, c::Coefficients) =
     c.rsvd_vram_factor * rsvd_counts(pt).vram_bytes + c.rsvd_vram_base
 
+"""
+    rsvd_vram_floor_bytes(pt, c), bounds_vram_floor_bytes(pt, c)
+
+Least device memory the job can be squeezed into, as opposed to what it will use
+if given room. Compare *this* against a card's capacity to decide whether the job
+can run there; see `vram_floor_factor`.
+"""
+rsvd_vram_floor_bytes(pt::SRPoint, c::Coefficients) =
+    c.vram_floor_factor * rsvd_counts(pt).vram_bytes + c.rsvd_vram_base
+bounds_vram_floor_bytes(pt::SRPoint, c::Coefficients) =
+    c.vram_floor_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
+
 rsvd_host_bytes(pt::SRPoint, c::Coefficients) =
     c.rsvd_host_mem_factor * rsvd_counts(pt).host_dense_bytes + c.rsvd_host_mem_base
 
@@ -732,13 +759,15 @@ function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_fo
     if job == GenerateGreens
         # CPU-only job: no device-bound share to stretch for a GPU slice.
         t, device_t = greens_time_s(pt, coeffs), 0.0
-        host, vram = greens_host_bytes(pt, coeffs), 0.0
+        host, vram, floor = greens_host_bytes(pt, coeffs), 0.0, 0.0
     elseif job == GenerateRSVD
         t, device_t = rsvd_time_s(pt, coeffs)
         host, vram = rsvd_host_bytes(pt, coeffs), rsvd_vram_bytes(pt, coeffs)
+        floor = rsvd_vram_floor_bytes(pt, coeffs)
     elseif job == ComputeBounds
         t, device_t = bounds_time_s(pt, coeffs)
         host, vram = bounds_host_bytes(pt, coeffs), bounds_vram_bytes(pt, coeffs)
+        floor = bounds_vram_floor_bytes(pt, coeffs)
     else
         error("Unknown job kind: $job")
     end
@@ -747,8 +776,10 @@ function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_fo
         device_t *= coeffs.time_pad
         host *= coeffs.host_mem_pad
         vram *= coeffs.vram_pad
+        floor *= coeffs.vram_pad
     end
-    return (time_s=t, device_time_s=device_t, host_bytes=host, vram_bytes=vram)
+    return (time_s=t, device_time_s=device_t, host_bytes=host, vram_bytes=vram,
+            vram_floor_bytes=floor)
 end
 
 predict_time_s(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true) =

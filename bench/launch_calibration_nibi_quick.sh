@@ -1,6 +1,6 @@
 #!/bin/bash
-# Cost-model calibration for narval, tier=quick.
-# Generated 2026-08-05T12:30:09.680 by bench/plan.jl. Do not edit; regenerate instead.
+# Cost-model calibration for nibi, tier=quick.
+# Generated 2026-08-05T12:30:22.280 by bench/plan.jl. Do not edit; regenerate instead.
 #
 # Every point is its own job: one point running out of memory or time must
 # not take the rest of the calibration with it. Each writes its own row file,
@@ -14,7 +14,7 @@ set -u
 CODE_DIR=/home/pvirally/Photonic-System-Channels/
 CAL_ROOT=/home/pvirally/scratch/psc-calibration/
 ROWS=$CAL_ROOT/rows
-OUT=$CAL_ROOT/calibration_narval.csv
+OUT=$CAL_ROOT/calibration_nibi.csv
 
 mkdir -p $CAL_ROOT/logs $CAL_ROOT/preload $CAL_ROOT/project $CAL_ROOT/scratch $ROWS
 cd $CODE_DIR
@@ -31,14 +31,14 @@ if [ "${1:-}" = "--merge" ]; then
     exit 0
 fi
 
-echo "Submitting 62 calibration points for narval (tier=quick)"
+echo "Submitting 63 calibration points for nibi (tier=quick)"
 echo "Each point writes its own row file under $ROWS"
 
 jid_g0self_l0p25=$(sbatch --parsable \
     --job-name=psccal_g0self_l0p25 \
     --output=$CAL_ROOT/logs/g0self_l0p25_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -47,7 +47,7 @@ jid_g0self_l0p25=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l0p25.csv --cluster narval --note 'tier=quick;label=g0self_l0p25'
+srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l0p25.csv --cluster nibi --note 'tier=quick;label=g0self_l0p25'
 EOF
 )
 sleep 0.05
@@ -56,7 +56,7 @@ jid_g0ext_l0p25_sep0ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p25_sep0ss1 \
     --output=$CAL_ROOT/logs/g0ext_l0p25_sep0ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:23:58 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -65,7 +65,7 @@ jid_g0ext_l0p25_sep0ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p25_sep0ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l0p25_sep0ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p25_sep0ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p25_sep0ss1'
 EOF
 )
 sleep 0.05
@@ -74,7 +74,7 @@ jid_g0ext_l0p25_sep1ss4=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p25_sep1ss4 \
     --output=$CAL_ROOT/logs/g0ext_l0p25_sep1ss4_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -83,7 +83,7 @@ jid_g0ext_l0p25_sep1ss4=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p25_sep1ss4.csv --cluster narval --note 'tier=quick;label=g0ext_l0p25_sep1ss4'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p25_sep1ss4.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p25_sep1ss4'
 EOF
 )
 sleep 0.05
@@ -92,7 +92,7 @@ jid_g0ext_l0p25_sep1000ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p25_sep1000ss1 \
     --output=$CAL_ROOT/logs/g0ext_l0p25_sep1000ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -101,7 +101,7 @@ jid_g0ext_l0p25_sep1000ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p25_sep1000ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l0p25_sep1000ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p25_sep1000ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p25_sep1000ss1'
 EOF
 )
 sleep 0.05
@@ -110,7 +110,7 @@ jid_g0uu_l0p25=$(sbatch --parsable \
     --job-name=psccal_g0uu_l0p25 \
     --output=$CAL_ROOT/logs/g0uu_l0p25_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -119,7 +119,7 @@ jid_g0uu_l0p25=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l0p25.csv --cluster narval --note 'tier=quick;label=g0uu_l0p25'
+srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l0p25.csv --cluster nibi --note 'tier=quick;label=g0uu_l0p25'
 EOF
 )
 sleep 0.05
@@ -128,7 +128,7 @@ jid_g0self_l0p5=$(sbatch --parsable \
     --job-name=psccal_g0self_l0p5 \
     --output=$CAL_ROOT/logs/g0self_l0p5_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -137,7 +137,7 @@ jid_g0self_l0p5=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l0p5.csv --cluster narval --note 'tier=quick;label=g0self_l0p5'
+srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l0p5.csv --cluster nibi --note 'tier=quick;label=g0self_l0p5'
 EOF
 )
 sleep 0.05
@@ -146,7 +146,7 @@ jid_g0ext_l0p5_sep0ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p5_sep0ss1 \
     --output=$CAL_ROOT/logs/g0ext_l0p5_sep0ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:42 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -155,7 +155,7 @@ jid_g0ext_l0p5_sep0ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p5_sep0ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l0p5_sep0ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p5_sep0ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p5_sep0ss1'
 EOF
 )
 sleep 0.05
@@ -164,7 +164,7 @@ jid_g0ext_l0p5_sep1ss4=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p5_sep1ss4 \
     --output=$CAL_ROOT/logs/g0ext_l0p5_sep1ss4_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -173,7 +173,7 @@ jid_g0ext_l0p5_sep1ss4=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p5_sep1ss4.csv --cluster narval --note 'tier=quick;label=g0ext_l0p5_sep1ss4'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p5_sep1ss4.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p5_sep1ss4'
 EOF
 )
 sleep 0.05
@@ -182,7 +182,7 @@ jid_g0ext_l0p5_sep1000ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p5_sep1000ss1 \
     --output=$CAL_ROOT/logs/g0ext_l0p5_sep1000ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -191,7 +191,7 @@ jid_g0ext_l0p5_sep1000ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p5_sep1000ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l0p5_sep1000ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p5_sep1000ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p5_sep1000ss1'
 EOF
 )
 sleep 0.05
@@ -200,7 +200,7 @@ jid_g0uu_l0p5=$(sbatch --parsable \
     --job-name=psccal_g0uu_l0p5 \
     --output=$CAL_ROOT/logs/g0uu_l0p5_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -209,7 +209,7 @@ jid_g0uu_l0p5=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l0p5.csv --cluster narval --note 'tier=quick;label=g0uu_l0p5'
+srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l0p5.csv --cluster nibi --note 'tier=quick;label=g0uu_l0p5'
 EOF
 )
 sleep 0.05
@@ -218,7 +218,7 @@ jid_g0self_l0p75=$(sbatch --parsable \
     --job-name=psccal_g0self_l0p75 \
     --output=$CAL_ROOT/logs/g0self_l0p75_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -227,7 +227,7 @@ jid_g0self_l0p75=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l0p75.csv --cluster narval --note 'tier=quick;label=g0self_l0p75'
+srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l0p75.csv --cluster nibi --note 'tier=quick;label=g0self_l0p75'
 EOF
 )
 sleep 0.05
@@ -236,7 +236,7 @@ jid_g0ext_l0p75_sep0ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p75_sep0ss1 \
     --output=$CAL_ROOT/logs/g0ext_l0p75_sep0ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:26:40 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -245,7 +245,7 @@ jid_g0ext_l0p75_sep0ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p75_sep0ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l0p75_sep0ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p75_sep0ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p75_sep0ss1'
 EOF
 )
 sleep 0.05
@@ -254,7 +254,7 @@ jid_g0ext_l0p75_sep1ss4=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p75_sep1ss4 \
     --output=$CAL_ROOT/logs/g0ext_l0p75_sep1ss4_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -263,7 +263,7 @@ jid_g0ext_l0p75_sep1ss4=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p75_sep1ss4.csv --cluster narval --note 'tier=quick;label=g0ext_l0p75_sep1ss4'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p75_sep1ss4.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p75_sep1ss4'
 EOF
 )
 sleep 0.05
@@ -272,7 +272,7 @@ jid_g0ext_l0p75_sep1000ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l0p75_sep1000ss1 \
     --output=$CAL_ROOT/logs/g0ext_l0p75_sep1000ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -281,7 +281,7 @@ jid_g0ext_l0p75_sep1000ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p75_sep1000ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l0p75_sep1000ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l0p75_sep1000ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l0p75_sep1000ss1'
 EOF
 )
 sleep 0.05
@@ -290,7 +290,7 @@ jid_g0uu_l0p75=$(sbatch --parsable \
     --job-name=psccal_g0uu_l0p75 \
     --output=$CAL_ROOT/logs/g0uu_l0p75_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -299,7 +299,7 @@ jid_g0uu_l0p75=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l0p75.csv --cluster narval --note 'tier=quick;label=g0uu_l0p75'
+srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l0p75.csv --cluster nibi --note 'tier=quick;label=g0uu_l0p75'
 EOF
 )
 sleep 0.05
@@ -308,7 +308,7 @@ jid_g0self_l1=$(sbatch --parsable \
     --job-name=psccal_g0self_l1 \
     --output=$CAL_ROOT/logs/g0self_l1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -317,7 +317,7 @@ jid_g0self_l1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l1.csv --cluster narval --note 'tier=quick;label=g0self_l1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_self --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0self_l1.csv --cluster nibi --note 'tier=quick;label=g0self_l1'
 EOF
 )
 sleep 0.05
@@ -326,7 +326,7 @@ jid_g0ext_l1_sep0ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l1_sep0ss1 \
     --output=$CAL_ROOT/logs/g0ext_l1_sep0ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:30:31 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -335,7 +335,7 @@ jid_g0ext_l1_sep0ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l1_sep0ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l1_sep0ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '0//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l1_sep0ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l1_sep0ss1'
 EOF
 )
 sleep 0.05
@@ -344,7 +344,7 @@ jid_g0ext_l1_sep1ss4=$(sbatch --parsable \
     --job-name=psccal_g0ext_l1_sep1ss4 \
     --output=$CAL_ROOT/logs/g0ext_l1_sep1ss4_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -353,7 +353,7 @@ jid_g0ext_l1_sep1ss4=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l1_sep1ss4.csv --cluster narval --note 'tier=quick;label=g0ext_l1_sep1ss4'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l1_sep1ss4.csv --cluster nibi --note 'tier=quick;label=g0ext_l1_sep1ss4'
 EOF
 )
 sleep 0.05
@@ -362,7 +362,7 @@ jid_g0ext_l1_sep1000ss1=$(sbatch --parsable \
     --job-name=psccal_g0ext_l1_sep1000ss1 \
     --output=$CAL_ROOT/logs/g0ext_l1_sep1000ss1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -371,7 +371,7 @@ jid_g0ext_l1_sep1000ss1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l1_sep1000ss1.csv --cluster narval --note 'tier=quick;label=g0ext_l1_sep1000ss1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1000//1' --gpu -1 --root $CAL_ROOT --out $ROWS/g0ext_l1_sep1000ss1.csv --cluster nibi --note 'tier=quick;label=g0ext_l1_sep1000ss1'
 EOF
 )
 sleep 0.05
@@ -380,7 +380,7 @@ jid_g0uu_l1=$(sbatch --parsable \
     --job-name=psccal_g0uu_l1 \
     --output=$CAL_ROOT/logs/g0uu_l1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -389,7 +389,7 @@ jid_g0uu_l1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l1.csv --cluster narval --note 'tier=quick;label=g0uu_l1'
+srun julia --project=. -t 4 bench/point.jl --kind g0_multiregion --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0uu_l1.csv --cluster nibi --note 'tier=quick;label=g0uu_l1'
 EOF
 )
 sleep 0.05
@@ -398,7 +398,7 @@ jid_g0threads_l0p75_t1=$(sbatch --parsable \
     --job-name=psccal_g0threads_l0p75_t1 \
     --output=$CAL_ROOT/logs/g0threads_l0p75_t1_%j.out \
     --account=def-smolesky \
-    --time=01:00:38 \
+    --time=01:41:35 \
     --cpus-per-task=1 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -407,7 +407,7 @@ jid_g0threads_l0p75_t1=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 1 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t1.csv --cluster narval --note 'tier=quick;label=g0threads_l0p75_t1'
+srun julia --project=. -t 1 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t1.csv --cluster nibi --note 'tier=quick;label=g0threads_l0p75_t1'
 EOF
 )
 sleep 0.05
@@ -416,7 +416,7 @@ jid_g0threads_l0p75_t2=$(sbatch --parsable \
     --job-name=psccal_g0threads_l0p75_t2 \
     --output=$CAL_ROOT/logs/g0threads_l0p75_t2_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:29:57 \
     --cpus-per-task=2 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -425,7 +425,7 @@ jid_g0threads_l0p75_t2=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 2 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t2.csv --cluster narval --note 'tier=quick;label=g0threads_l0p75_t2'
+srun julia --project=. -t 2 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t2.csv --cluster nibi --note 'tier=quick;label=g0threads_l0p75_t2'
 EOF
 )
 sleep 0.05
@@ -434,7 +434,7 @@ jid_g0threads_l0p75_t4=$(sbatch --parsable \
     --job-name=psccal_g0threads_l0p75_t4 \
     --output=$CAL_ROOT/logs/g0threads_l0p75_t4_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -443,7 +443,7 @@ jid_g0threads_l0p75_t4=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t4.csv --cluster narval --note 'tier=quick;label=g0threads_l0p75_t4'
+srun julia --project=. -t 4 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t4.csv --cluster nibi --note 'tier=quick;label=g0threads_l0p75_t4'
 EOF
 )
 sleep 0.05
@@ -452,7 +452,7 @@ jid_g0threads_l0p75_t8=$(sbatch --parsable \
     --job-name=psccal_g0threads_l0p75_t8 \
     --output=$CAL_ROOT/logs/g0threads_l0p75_t8_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:21:14 \
     --cpus-per-task=8 \
     --mem=8G \
     --chdir=$CODE_DIR \
@@ -461,7 +461,7 @@ jid_g0threads_l0p75_t8=$(sbatch --parsable \
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 8 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t8.csv --cluster narval --note 'tier=quick;label=g0threads_l0p75_t8'
+srun julia --project=. -t 8 bench/point.jl --kind g0_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --gpu -1 --root $CAL_ROOT --out $ROWS/g0threads_l0p75_t8.csv --cluster nibi --note 'tier=quick;label=g0threads_l0p75_t8'
 EOF
 )
 sleep 0.05
@@ -470,17 +470,17 @@ jid_mvself_l0p25=$(sbatch --parsable \
     --job-name=psccal_mvself_l0p25 \
     --output=$CAL_ROOT/logs/mvself_l0p25_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l0p25.csv --cluster narval --note 'tier=quick;label=mvself_l0p25'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l0p25.csv --cluster nibi --note 'tier=quick;label=mvself_l0p25'
 EOF
 )
 sleep 0.05
@@ -489,17 +489,17 @@ jid_mvext_l0p25=$(sbatch --parsable \
     --job-name=psccal_mvext_l0p25 \
     --output=$CAL_ROOT/logs/mvext_l0p25_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l0p25.csv --cluster narval --note 'tier=quick;label=mvext_l0p25'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l0p25.csv --cluster nibi --note 'tier=quick;label=mvext_l0p25'
 EOF
 )
 sleep 0.05
@@ -508,17 +508,17 @@ jid_mvuu_l0p25=$(sbatch --parsable \
     --job-name=psccal_mvuu_l0p25 \
     --output=$CAL_ROOT/logs/mvuu_l0p25_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:15:45 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l0p25.csv --cluster narval --note 'tier=quick;label=mvuu_l0p25'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l0p25.csv --cluster nibi --note 'tier=quick;label=mvuu_l0p25'
 EOF
 )
 sleep 0.05
@@ -527,17 +527,17 @@ jid_mvself_l0p5=$(sbatch --parsable \
     --job-name=psccal_mvself_l0p5 \
     --output=$CAL_ROOT/logs/mvself_l0p5_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l0p5.csv --cluster narval --note 'tier=quick;label=mvself_l0p5'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l0p5.csv --cluster nibi --note 'tier=quick;label=mvself_l0p5'
 EOF
 )
 sleep 0.05
@@ -546,17 +546,17 @@ jid_mvext_l0p5=$(sbatch --parsable \
     --job-name=psccal_mvext_l0p5 \
     --output=$CAL_ROOT/logs/mvext_l0p5_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l0p5.csv --cluster narval --note 'tier=quick;label=mvext_l0p5'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l0p5.csv --cluster nibi --note 'tier=quick;label=mvext_l0p5'
 EOF
 )
 sleep 0.05
@@ -565,17 +565,17 @@ jid_mvuu_l0p5=$(sbatch --parsable \
     --job-name=psccal_mvuu_l0p5 \
     --output=$CAL_ROOT/logs/mvuu_l0p5_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:17:56 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l0p5.csv --cluster narval --note 'tier=quick;label=mvuu_l0p5'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l0p5.csv --cluster nibi --note 'tier=quick;label=mvuu_l0p5'
 EOF
 )
 sleep 0.05
@@ -584,17 +584,17 @@ jid_mvself_l0p75=$(sbatch --parsable \
     --job-name=psccal_mvself_l0p75 \
     --output=$CAL_ROOT/logs/mvself_l0p75_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l0p75.csv --cluster narval --note 'tier=quick;label=mvself_l0p75'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l0p75.csv --cluster nibi --note 'tier=quick;label=mvself_l0p75'
 EOF
 )
 sleep 0.05
@@ -603,17 +603,17 @@ jid_mvext_l0p75=$(sbatch --parsable \
     --job-name=psccal_mvext_l0p75 \
     --output=$CAL_ROOT/logs/mvext_l0p75_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l0p75.csv --cluster narval --note 'tier=quick;label=mvext_l0p75'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l0p75.csv --cluster nibi --note 'tier=quick;label=mvext_l0p75'
 EOF
 )
 sleep 0.05
@@ -622,17 +622,17 @@ jid_mvuu_l0p75=$(sbatch --parsable \
     --job-name=psccal_mvuu_l0p75 \
     --output=$CAL_ROOT/logs/mvuu_l0p75_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:24:08 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l0p75.csv --cluster narval --note 'tier=quick;label=mvuu_l0p75'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l0p75.csv --cluster nibi --note 'tier=quick;label=mvuu_l0p75'
 EOF
 )
 sleep 0.05
@@ -641,17 +641,17 @@ jid_mvself_l1=$(sbatch --parsable \
     --job-name=psccal_mvself_l1 \
     --output=$CAL_ROOT/logs/mvself_l1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l1.csv --cluster narval --note 'tier=quick;label=mvself_l1'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_self --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvself_l1.csv --cluster nibi --note 'tier=quick;label=mvself_l1'
 EOF
 )
 sleep 0.05
@@ -660,17 +660,17 @@ jid_mvext_l1=$(sbatch --parsable \
     --job-name=psccal_mvext_l1 \
     --output=$CAL_ROOT/logs/mvext_l1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l1.csv --cluster narval --note 'tier=quick;label=mvext_l1'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_ext --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvext_l1.csv --cluster nibi --note 'tier=quick;label=mvext_l1'
 EOF
 )
 sleep 0.05
@@ -679,17 +679,17 @@ jid_mvuu_l1=$(sbatch --parsable \
     --job-name=psccal_mvuu_l1 \
     --output=$CAL_ROOT/logs/mvuu_l1_%j.out \
     --account=def-smolesky \
-    --time=01:00:00 \
+    --time=01:36:33 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l1.csv --cluster narval --note 'tier=quick;label=mvuu_l1'
+srun julia --project=. -t 4 bench/point.jl --kind matvec_uu --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --reps '20' --gpu 0 --root $CAL_ROOT --out $ROWS/mvuu_l1.csv --cluster nibi --note 'tier=quick;label=mvuu_l1'
 EOF
 )
 sleep 0.05
@@ -701,14 +701,14 @@ jid_dense_l0p25_c128=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c128.csv --cluster narval --note 'tier=quick;label=dense_l0p25_c128'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c128.csv --cluster nibi --note 'tier=quick;label=dense_l0p25_c128'
 EOF
 )
 sleep 0.05
@@ -720,14 +720,14 @@ jid_dense_l0p25_c512=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c512.csv --cluster narval --note 'tier=quick;label=dense_l0p25_c512'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c512.csv --cluster nibi --note 'tier=quick;label=dense_l0p25_c512'
 EOF
 )
 sleep 0.05
@@ -739,14 +739,14 @@ jid_dense_l0p25_c1400=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c1400.csv --cluster narval --note 'tier=quick;label=dense_l0p25_c1400'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c1400.csv --cluster nibi --note 'tier=quick;label=dense_l0p25_c1400'
 EOF
 )
 sleep 0.05
@@ -758,14 +758,14 @@ jid_dense_l0p25_c2800=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c2800.csv --cluster narval --note 'tier=quick;label=dense_l0p25_c2800'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '3072' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p25_c2800.csv --cluster nibi --note 'tier=quick;label=dense_l0p25_c2800'
 EOF
 )
 sleep 0.05
@@ -777,14 +777,14 @@ jid_dense_l0p5_c128=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c128.csv --cluster narval --note 'tier=quick;label=dense_l0p5_c128'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c128.csv --cluster nibi --note 'tier=quick;label=dense_l0p5_c128'
 EOF
 )
 sleep 0.05
@@ -796,14 +796,14 @@ jid_dense_l0p5_c512=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c512.csv --cluster narval --note 'tier=quick;label=dense_l0p5_c512'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c512.csv --cluster nibi --note 'tier=quick;label=dense_l0p5_c512'
 EOF
 )
 sleep 0.05
@@ -815,14 +815,14 @@ jid_dense_l0p5_c1400=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c1400.csv --cluster narval --note 'tier=quick;label=dense_l0p5_c1400'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c1400.csv --cluster nibi --note 'tier=quick;label=dense_l0p5_c1400'
 EOF
 )
 sleep 0.05
@@ -834,14 +834,14 @@ jid_dense_l0p5_c2800=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=12G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c2800.csv --cluster narval --note 'tier=quick;label=dense_l0p5_c2800'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '24576' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p5_c2800.csv --cluster nibi --note 'tier=quick;label=dense_l0p5_c2800'
 EOF
 )
 sleep 0.05
@@ -853,14 +853,14 @@ jid_dense_l0p75_c128=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c128.csv --cluster narval --note 'tier=quick;label=dense_l0p75_c128'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c128.csv --cluster nibi --note 'tier=quick;label=dense_l0p75_c128'
 EOF
 )
 sleep 0.05
@@ -872,14 +872,14 @@ jid_dense_l0p75_c512=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c512.csv --cluster narval --note 'tier=quick;label=dense_l0p75_c512'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c512.csv --cluster nibi --note 'tier=quick;label=dense_l0p75_c512'
 EOF
 )
 sleep 0.05
@@ -891,14 +891,14 @@ jid_dense_l0p75_c1400=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=15G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c1400.csv --cluster narval --note 'tier=quick;label=dense_l0p75_c1400'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c1400.csv --cluster nibi --note 'tier=quick;label=dense_l0p75_c1400'
 EOF
 )
 sleep 0.05
@@ -910,14 +910,14 @@ jid_dense_l0p75_c2800=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=27G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c2800.csv --cluster narval --note 'tier=quick;label=dense_l0p75_c2800'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --rank '1350' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '82944' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l0p75_c2800.csv --cluster nibi --note 'tier=quick;label=dense_l0p75_c2800'
 EOF
 )
 sleep 0.05
@@ -929,14 +929,14 @@ jid_dense_l1_c128=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=8G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c128.csv --cluster narval --note 'tier=quick;label=dense_l1_c128'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '128' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c128.csv --cluster nibi --note 'tier=quick;label=dense_l1_c128'
 EOF
 )
 sleep 0.05
@@ -948,14 +948,14 @@ jid_dense_l1_c512=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=14G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c512.csv --cluster narval --note 'tier=quick;label=dense_l1_c512'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '512' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c512.csv --cluster nibi --note 'tier=quick;label=dense_l1_c512'
 EOF
 )
 sleep 0.05
@@ -967,14 +967,33 @@ jid_dense_l1_c1400=$(sbatch --parsable \
     --time=01:00:00 \
     --cpus-per-task=4 \
     --mem=29G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c1400.csv --cluster narval --note 'tier=quick;label=dense_l1_c1400'
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '1400' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c1400.csv --cluster nibi --note 'tier=quick;label=dense_l1_c1400'
+EOF
+)
+sleep 0.05
+
+jid_dense_l1_c2800=$(sbatch --parsable \
+    --job-name=psccal_dense_l1_c2800 \
+    --output=$CAL_ROOT/logs/dense_l1_c2800_%j.out \
+    --account=def-smolesky \
+    --time=01:00:00 \
+    --cpus-per-task=4 \
+    --mem=55G \
+    --gpus=h100:1 \
+    --chdir=$CODE_DIR \
+    --export=ALL \
+    <<EOF
+#!/bin/bash
+module load StdEnv/2023 julia/1.12.5 cuda/12.2
+export PSC_T0=\$(date +%s)
+srun julia --project=. -t 4 bench/point.jl --kind dense --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --rank '2750' --oversamples '50' --power-iters '14' --sep '1//4' --dense-m '196608' --dense-c '2800' --reps '12' --gpu 0 --root $CAL_ROOT --out $ROWS/dense_l1_c2800.csv --cluster nibi --note 'tier=quick;label=dense_l1_c2800'
 EOF
 )
 sleep 0.05
@@ -986,14 +1005,14 @@ jid_boundscore_l0p25_k256=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p25_k256.csv --cluster narval --note 'tier=quick;label=boundscore_l0p25_k256'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p25_k256.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p25_k256'
 EOF
 )
 sleep 0.05
@@ -1005,14 +1024,14 @@ jid_boundscore_l0p25_k800=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p25_k800.csv --cluster narval --note 'tier=quick;label=boundscore_l0p25_k800'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p25_k800.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p25_k800'
 EOF
 )
 sleep 0.05
@@ -1024,14 +1043,14 @@ jid_boundscore_l0p25_k1350=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '1350' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p25_k1350.csv --cluster narval --note 'tier=quick;label=boundscore_l0p25_k1350'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '8,8,8' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '1350' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p25_k1350.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p25_k1350'
 EOF
 )
 sleep 0.05
@@ -1043,14 +1062,14 @@ jid_boundscore_l0p5_k256=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p5_k256.csv --cluster narval --note 'tier=quick;label=boundscore_l0p5_k256'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p5_k256.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p5_k256'
 EOF
 )
 sleep 0.05
@@ -1062,14 +1081,14 @@ jid_boundscore_l0p5_k800=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p5_k800.csv --cluster narval --note 'tier=quick;label=boundscore_l0p5_k800'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p5_k800.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p5_k800'
 EOF
 )
 sleep 0.05
@@ -1081,14 +1100,14 @@ jid_boundscore_l0p5_k1350=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '1350' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p5_k1350.csv --cluster narval --note 'tier=quick;label=boundscore_l0p5_k1350'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '16,16,16' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '1350' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p5_k1350.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p5_k1350'
 EOF
 )
 sleep 0.05
@@ -1100,14 +1119,14 @@ jid_boundscore_l0p75_k256=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=16G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p75_k256.csv --cluster narval --note 'tier=quick;label=boundscore_l0p75_k256'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p75_k256.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p75_k256'
 EOF
 )
 sleep 0.05
@@ -1119,14 +1138,14 @@ jid_boundscore_l0p75_k800=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=23G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p75_k800.csv --cluster narval --note 'tier=quick;label=boundscore_l0p75_k800'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p75_k800.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p75_k800'
 EOF
 )
 sleep 0.05
@@ -1138,14 +1157,14 @@ jid_boundscore_l0p75_k1350=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=34G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '1350' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p75_k1350.csv --cluster narval --note 'tier=quick;label=boundscore_l0p75_k1350'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '24,24,24' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '1350' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l0p75_k1350.csv --cluster nibi --note 'tier=quick;label=boundscore_l0p75_k1350'
 EOF
 )
 sleep 0.05
@@ -1157,14 +1176,14 @@ jid_boundscore_l1_k256=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=20G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l1_k256.csv --cluster narval --note 'tier=quick;label=boundscore_l1_k256'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '256' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l1_k256.csv --cluster nibi --note 'tier=quick;label=boundscore_l1_k256'
 EOF
 )
 sleep 0.05
@@ -1176,14 +1195,14 @@ jid_boundscore_l1_k800=$(sbatch --parsable \
     --time=04:00:00 \
     --cpus-per-task=4 \
     --mem=44G \
-    --gpus=a100:1 \
+    --gpus=h100:1 \
     --chdir=$CODE_DIR \
     --export=ALL \
     <<EOF
 #!/bin/bash
 module load StdEnv/2023 julia/1.12.5 cuda/12.2
 export PSC_T0=\$(date +%s)
-srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l1_k800.csv --cluster narval --note 'tier=quick;label=boundscore_l1_k800'
+srun julia --project=. -t 4 bench/point.jl --kind bounds_core --cells '32,32,32' --scale '1//32' --chi '13.6+0.05im' --sep '1//4' --rank '800' --oversamples '50' --power-iters '14' --num-pos-frac '0.5' --outer-samples '4' --gpu 0 --root $CAL_ROOT --out $ROWS/boundscore_l1_k800.csv --cluster nibi --note 'tier=quick;label=boundscore_l1_k800'
 EOF
 )
 sleep 0.05
@@ -1192,6 +1211,6 @@ echo
 echo "All points submitted. Watch them with: squeue -u \$USER"
 echo
 echo "When they have finished, merge the per-point rows and copy the result back:"
-echo "  bash bench/launch_calibration_narval_quick.sh --merge"
-echo "  scp pvirally@narval.alliancecan.ca:$OUT bench/data/"
+echo "  bash bench/launch_calibration_nibi_quick.sh --merge"
+echo "  scp pvirally@nibi.alliancecan.ca:$OUT bench/data/"
 

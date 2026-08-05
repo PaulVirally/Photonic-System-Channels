@@ -81,21 +81,30 @@ struct ClusterSpec
     max_vram_GB::Int
 end
 
+#=
+`max_cores` and `max_host_GB` are the Alliance's published per-GPU bundle, so a
+calibration point that stays inside them is billed as exactly one GPU-equivalent.
+=#
 function ClusterSpec(name::AbstractString)
     name == "fir" && return ClusterSpec("fir", true, CC_CODE_DIR, CC_CAL_ROOT, CC_ACCOUNT,
                                         "module load StdEnv/2023 julia/1.12.5 cuda/12.2",
-                                        "h100:1", 12, 240, 80)
+                                        "h100:1", 12, 288, 80)
     name == "narval" && return ClusterSpec("narval", true, CC_CODE_DIR, CC_CAL_ROOT, CC_ACCOUNT,
                                            "module load StdEnv/2023 julia/1.12.5 cuda/12.2",
-                                           "a100:1", 12, 240, 40)
+                                           "a100:1", 12, 124, 40)
+    name == "nibi" && return ClusterSpec("nibi", true, CC_CODE_DIR, CC_CAL_ROOT, CC_ACCOUNT,
+                                         "module load StdEnv/2023 julia/1.12.5 cuda/12.2",
+                                         "h100:1", 14, 250, 80)
+    name == "rorqual" && return ClusterSpec("rorqual", true, CC_CODE_DIR, CC_CAL_ROOT, CC_ACCOUNT,
+                                            "module load StdEnv/2023 julia/1.12.5 cuda/12.2",
+                                            "h100:1", 16, 124, 80)
     # 128 logical threads (64 physical cores with SMT): molering is an AMD Ryzen
-    # Threadripper Pro 5995WX, and production jobs there get all of them via
-    # `-t auto`. The scan therefore has to reach 128, and note that the second
-    # hyperthread on each core adds little for FFT and quadrature work -- expect
-    # the measured scaling to flatten or reverse between 64 and 128.
+    # Threadripper Pro 5995WX, and production jobs there get all of them, so the
+    # thread scan has to reach 128. The second hyperthread on each core adds little
+    # for FFT and quadrature work; the measured optimum is 16.
     name == "molering" && return ClusterSpec("molering", false, MOLERING_CODE_DIR,
                                              MOLERING_CAL_ROOT, "", "", "a6000", 128, 480, 48)
-    error("Unknown cluster '$name'. Known: fir, narval, molering.")
+    error("Unknown cluster '$name'. Known: fir, narval, nibi, rorqual, molering.")
 end
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +269,9 @@ function plan_points(cluster::ClusterSpec, tier::Symbol)
                                             ["--sep", rat(8 // 32), "--dense-m", string(N_u),
                                              "--dense-c", string(c), "--reps", "12"]),
                                        min(4, cluster.max_cores),
-                                       max(8, ceil(Int, 2 * bytes / 2^30) + 4), 3600, true))
+                                       min(cluster.max_host_GB,
+                                           max(8, ceil(Int, 2 * bytes / 2^30) + 4)),
+                                       3600, true))
         end
     end
 
@@ -277,7 +288,9 @@ function plan_points(cluster::ClusterSpec, tier::Symbol)
                     "--num-pos-frac", "0.5", "--outer-samples", "4"]
             push!(points, PlannedPoint("boundscore_$(body.label)_k$(rank)", "bounds_core",
                                        args, min(4, cluster.max_cores),
-                                       max(16, ceil(Int, 3 * bytes / 2^30) + 8), 4 * 3600, true))
+                                       min(cluster.max_host_GB,
+                                           max(16, ceil(Int, 3 * bytes / 2^30) + 8)),
+                                       4 * 3600, true))
         end
     end
 
@@ -382,6 +395,21 @@ function point_command(cluster::ClusterSpec, point::PlannedPoint, tier::Symbol)
 end
 
 """
+    resource_lines(cluster, point) -> String
+
+The `sbatch` lines that say how much of the machine to take.
+
+Calibration always takes a whole GPU, never a MIG slice: the whole point is to
+measure the primitives on undivided hardware, and `create_jobs.jl` then derates
+for a slice by its SM fraction.
+"""
+function resource_lines(cluster::ClusterSpec, point::PlannedPoint)
+    lines = "    --cpus-per-task=$(point.threads) \\\n    --mem=$(point.host_GB)G \\\n"
+    point.gpu && (lines *= "    --gpus=$(cluster.full_gpu) \\\n")
+    return lines
+end
+
+"""
     merge_block(cluster)
 
 The `--merge` mode both generated scripts share: stitch the per-point row files
@@ -434,7 +462,6 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
     """)
 
     for point in points
-        gpu_line = point.gpu ? "    --gpus=$(cluster.full_gpu) \\\n" : ""
         # Capture the job id so later points can depend on this one, and emit the
         # dependency line when a point needs an earlier one's output (the memory
         # tier's RSVD points need their Green functions on disk first).
@@ -447,9 +474,7 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
             --output=\$CAL_ROOT/logs/$(point.label)_%j.out \\
             --account=$(cluster.account) \\
             --time=$(seconds2string(point.time_s)) \\
-            --cpus-per-task=$(point.threads) \\
-            --mem=$(point.host_GB)G \\
-        $(gpu_line)    --chdir=\$CODE_DIR \\
+        $(resource_lines(cluster, point))    --chdir=\$CODE_DIR \\
             --export=ALL \\
             <<EOF
         #!/bin/bash

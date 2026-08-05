@@ -5,13 +5,56 @@ the model, the harness that measures the numbers it needs, and the fit that turn
 those measurements into per-cluster coefficients.
 
 ```
-cost_model.jl   the model: analytic work counts + fitted primitive costs
-plan.jl         generates the run script for one cluster and tier
-point.jl        runs one measurement and appends one CSV row
-measure.jl      peak RSS / peak VRAM / timing / CSV plumbing
-fit.jl          CSVs -> bench/coeffs_<cluster>.jl
-data/           put the CSVs you bring back from the clusters here
+cost_model.jl     the model: analytic work counts + fitted primitive costs
+plan.jl           generates the run script for one cluster and tier
+point.jl          runs one measurement and appends one CSV row
+measure.jl        peak RSS / peak VRAM / timing / CSV plumbing
+fit.jl            CSVs -> bench/coeffs_<cluster>.jl
+derive_coeffs.jl  conservative stopgap coefficients for an uncalibrated cluster
+data/             put the CSVs you bring back from the clusters here
 ```
+
+## Clusters
+
+Per-GPU *bundle* below is the Alliance's published ratio: usage is billed as the
+largest of `gpus`, `cores / bundle_cores` and `host / bundle_RAM`, so a job that
+stays inside the bundle costs exactly one GPU-equivalent.
+
+| cluster | GPU | bundle/GPU | MIG slices | calibrated |
+|---------|-----|-----------|------------|------------|
+| fir | 4x H100 SXM5 80GB | 12 cores, 288 GB | `nvidia_h100_80gb_hbm3_{1g.10gb,2g.20gb,3g.40gb}` | yes, incl. memory |
+| narval | 4x A100 SXM4 40GB | 12 cores, 124 GB | `a100_{1g.5gb,2g.10gb,3g.20gb}` | yes, time only |
+| nibi | 8x H100 SXM 80GB | 14 cores, 250 GB | `h100_{1g.10gb,2g.20gb,3g.40gb}` | no — derived from fir |
+| rorqual | 4x H100 SXM5 80GB | 16 cores, 124 GB | `h100_{1g.10gb,2g.20gb,3g.40gb}` | no — derived from fir |
+| molering | RTX A6000 48GB | 16 useful threads of 128 | — | yes, time only |
+
+Note that fir spells the same three H100 partitions differently from nibi and
+rorqual. A slice name the cluster does not define is a hard `sbatch` rejection
+rather than a bad estimate, so if a submission is refused, check what the cluster
+actually offers — and confirm the `module load` line while you are there, since
+available Julia and CUDA versions differ between clusters:
+
+```bash
+sinfo -o "%G" | sort -u
+```
+
+`create_jobs.jl` picks the smallest slice that fits both the predicted VRAM *and*
+the predicted host RAM, since a slice comes with a proportionally smaller RAM
+bundle and exceeding it is billed as though several slices had been taken. Its
+plan summary lists every slice name the plan is about to request. Only about half
+of fir's GPU nodes carry MIG at all, which costs queue breadth but not
+correctness.
+
+Calibration itself always takes a whole GPU — the point is to measure the
+primitives on undivided hardware — and the model then derates for a slice by its
+SM fraction.
+
+A cluster with no calibration uses `bench/coeffs_<name>.jl` written by
+`derive_coeffs.jl`: fir's measurements derated to err towards over-estimating
+(CPU times x1.5, GPU times x1.25, rates /1.25, memory unchanged since it is the
+same code on the same 80 GB card). `create_jobs.jl` says so in its plan summary.
+Replace them by calibrating for real — `--tier quick` then `--tier memory` — after
+which `fit.jl` overwrites the derived file.
 
 ## What to run
 

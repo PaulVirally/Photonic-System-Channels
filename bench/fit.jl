@@ -761,6 +761,80 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
                                        bounds["gs_measured"]))
     end
 
+    # ---- RSVD memory, from the mem_rsvd points ----------------------------
+    #=
+    The real thing, at last: `mem_rsvd` runs the production RSVD path with the
+    power-iteration count reduced, and memory does not depend on it.
+
+    Host RSS is clean and fits tightly -- it is dominated by the single
+    `Array(vectors)` copy of the eigenvector block, and the measured ratio settles
+    at 1.15-1.32x that array plus a ~2.3 GB process baseline.
+
+    Device memory is not clean, and the model does not pretend otherwise. It is
+    churn-elastic: a job with a 5 GB working set was measured taking 37 GB on an
+    idle 80 GB card, while one with a 46 GB working set fitted into 71 GB on the
+    same card. So the slope is fitted on the uncensored points to size the request,
+    and the *smallest* observed ratio becomes `vram_floor_factor`, which is what
+    decides whether a given card is big enough.
+    =#
+    mem_rows = filter(r -> r["kind"] in ("mem_rsvd", "stage_rsvd"), rows)
+    if isempty(mem_rows)
+        push!(missing_fits, "rsvd memory (no mem_rsvd points; run --tier memory)")
+    else
+        host_pairs = Tuple{Float64,Float64}[]
+        vram_pairs = Tuple{Float64,Float64}[]
+        ratios = Float64[]
+        censored = 0
+        for row in mem_rows
+            pt = row_to_srpoint(row)
+            pt === nothing && continue
+            host = num(row, "peak_rss_bytes")
+            host === nothing || push!(host_pairs, (Float64(rsvd_counts(pt).host_dense_bytes), host))
+            vram = num(row, "peak_vram_bytes")
+            vram === nothing && continue
+            analytic = Float64(rsvd_counts(pt).vram_bytes)
+            analytic > 0 && push!(ratios, vram / analytic)
+            capacity = device_capacity_bytes(row)
+            if capacity !== nothing && vram > CENSORED_FRACTION * capacity
+                censored += 1
+                continue
+            end
+            push!(vram_pairs, (analytic, vram))
+        end
+
+        f, bs, n = fit_linear_memory(host_pairs)
+        if f === nothing
+            push!(missing_fits, "rsvd host memory (only $n mem_rsvd point(s))")
+        else
+            fields[:rsvd_host_mem_factor] = f
+            fields[:rsvd_host_mem_base] = bs
+            # The bounds job reads the same block back, so the same shape applies.
+            fields[:bounds_host_mem_factor] = f
+            fields[:bounds_host_mem_base] = bs
+            push!(report, @sprintf("%-26s %.2f x analytic + %s  (from %d mem_rsvd points)",
+                                   "rsvd host memory", f, human_bytes(bs), n))
+        end
+
+        fv, bv, nv = fit_linear_memory(vram_pairs)
+        if fv === nothing
+            push!(missing_fits, "rsvd VRAM slope (only $nv uncensored mem_rsvd point(s) of $(length(mem_rows)); the rest hit the card)")
+        else
+            fields[:rsvd_vram_factor] = fv
+            fields[:rsvd_vram_base] = bv
+            fields[:bounds_vram_factor] = fv
+            fields[:bounds_vram_base] = bv
+            push!(report, @sprintf("%-26s %.2f x analytic + %s  (from %d uncensored points, %d censored)",
+                                   "rsvd VRAM", fv, human_bytes(bv), nv, censored))
+        end
+        if !isempty(ratios)
+            fields[:vram_floor_factor] = max(1.1, minimum(ratios))
+            push!(report, @sprintf("%-26s %.2f  (smallest measured peak/analytic over %d points; range %.2f-%.2f)",
+                                   "vram floor factor", minimum(ratios), length(ratios),
+                                   minimum(ratios), maximum(ratios)))
+            push!(report, "  device memory is churn-elastic: the floor decides feasibility, the slope sizes the ask")
+        end
+    end
+
     # ---- memory for the device jobs ---------------------------------------
     for (kinds, analytic, factor_field, base_field, label) in (
         (("stage_rsvd",), pt -> Float64(rsvd_counts(pt).host_dense_bytes),
@@ -781,6 +855,7 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             peak === nothing && continue
             push!(pairs, (analytic(pt), peak))
         end
+        haskey(fields, factor_field) && continue  # already fitted from mem_rsvd
         f, bs, n = fit_linear_memory(pairs)
         if f === nothing
             push!(missing_fits, n == 0 ? "$label (no points)" :
@@ -820,6 +895,7 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             (peak === nothing || peak <= 0) && continue
             push!(pairs, (analytic(pt), peak))
         end
+        haskey(fields, factor_field) && continue  # already fitted from mem_rsvd
         f, bs, n = fit_linear_memory(pairs)
         if f === nothing
             push!(missing_fits, n == 0 ?
@@ -848,7 +924,8 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
                                human_bytes(overhead.base), overhead.n, overhead.dropped))
         push!(report, "  NOT used for the job estimates: an upper bound, not a demand model (see below)")
     end
-    push!(missing_fits, "rsvd/bounds VRAM (no stage_rsvd or mem_rsvd points; using the analytic floor x the default factor)")
+    haskey(fields, :rsvd_vram_factor) ||
+        push!(missing_fits, "rsvd/bounds VRAM (no usable mem_rsvd points; using the analytic floor x the default factor)")
 
     # ---- host memory baseline for the device jobs -------------------------
     #=
@@ -1131,6 +1208,12 @@ end
 # Entry point
 # --------------------------------------------------------------------------- #
 
+const TRANSFERABLE_MEMORY_FIELDS = (:rsvd_host_mem_factor, :rsvd_host_mem_base,
+                                    :bounds_host_mem_factor, :bounds_host_mem_base,
+                                    :rsvd_vram_factor, :rsvd_vram_base,
+                                    :bounds_vram_factor, :bounds_vram_base,
+                                    :vram_floor_factor)
+
 function main(argv::Vector{String})
     report_only = "--report-only" in argv
     paths = filter(a -> !startswith(a, "--"), argv)
@@ -1167,8 +1250,17 @@ function main(argv::Vector{String})
     end
     dropped > 0 && @warn "Skipped $dropped malformed row(s) (torn by concurrent appends). The current bench/plan.jl writes one file per point to avoid this."
 
-    # for (cluster, rows) in sort(collect(by_cluster))
-    for (cluster, rows) in collect(by_cluster)
+    #=
+    Memory coefficients transfer across clusters far better than time ones do. The
+    host term is close to pure arithmetic -- one `Array(vectors)` copy of the
+    eigenvector block plus a process baseline -- and the measured baselines agree
+    within 15% across the three machines (1.58, 1.62, 1.82 GiB). So a cluster with
+    no `mem_rsvd` points inherits them from one that has them: still a real
+    measurement rather than a chosen multiplier, and the coefficients file records
+    where it came from.
+    =#
+    fitted = Dict{String,Any}()
+    for (cluster, rows) in sort(collect(by_cluster); by=first)
         println("\n" * "="^78)
         println("Cluster: $cluster  ($(length(rows)) rows)")
         kinds = Dict{String,Int}()
@@ -1179,6 +1271,34 @@ function main(argv::Vector{String})
         println("-"^78)
 
         coeffs, report, missing_fits = fit_cluster(cluster, rows)
+        has_mem = any(r -> r["kind"] in ("mem_rsvd", "stage_rsvd"), rows)
+        fitted[cluster] = (coeffs=coeffs, report=report, missing_fits=missing_fits,
+                           has_mem=has_mem, nrows=length(rows))
+    end
+
+    donor = nothing
+    for (cluster, entry) in sort(collect(fitted); by=first)
+        entry.has_mem && (donor = cluster; break)
+    end
+
+    for (cluster, entry) in sort(collect(fitted); by=first)
+        coeffs = entry.coeffs
+        report = copy(entry.report)
+        missing_fits = copy(entry.missing_fits)
+        if !entry.has_mem && donor !== nothing
+            src = fitted[donor].coeffs
+            updated = Dict{Symbol,Any}(f => getfield(coeffs, f) for f in fieldnames(Coefficients))
+            for f in TRANSFERABLE_MEMORY_FIELDS
+                updated[f] = getfield(src, f)
+            end
+            coeffs = Coefficients(; (k => v for (k, v) in updated)...)
+            filter!(m -> !occursin("memory", m) && !occursin("VRAM", m), missing_fits)
+            push!(report, "memory coefficients inherited from $donor: measured there, no " *
+                          "mem_rsvd points here. Run --tier memory to replace them.")
+        end
+
+        println("\n" * "="^78)
+        println("Cluster: $cluster  ($(entry.nrows) rows)")
         for line in report
             println("  ", line)
         end
