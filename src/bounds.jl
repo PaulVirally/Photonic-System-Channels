@@ -102,8 +102,8 @@ end
 """
     psd_pencil_whitener(C; rtol=size(C, 1) * eps(real(eltype(C))))
 
-Eigendecompose the constraint matrix `C` of the generalized problem `Bv = λCv` on
-the host and return the pieces needed to solve it on `C`'s numerical range:
+Eigendecompose the constraint matrix `C` of the generalized problem `Bv = λCv`
+and return the pieces needed to solve it on `C`'s numerical range:
 
 - `whitener`: `W = U₊ diag(μ₊)^(-1/2)` over the eigenpairs above the rank
   tolerance, so that `W' C W = 1`. Solving `(W'BW)y = λy` and taking `v = Wy`
@@ -111,21 +111,29 @@ the host and return the pieces needed to solve it on `C`'s numerical range:
   the dual's `∑ⱼ |bⱼ|²/(α - λⱼ)` resolvent expansion assumes.
 - `nullspace`: an orthonormal basis `N` of the numerical null space, for the
   caller to verify that whatever it drops with it is genuinely absent.
-- `values`, `tol`, `rank`: the full ascending spectrum of `C` and where it was cut.
+- `values`, `tol`, `rank`: the full ascending spectrum of `C` (always a host
+  vector) and where it was cut.
 
 Every member of the constraint family `C(τ) = ζ⁻¹(Πₛ + (1−τ)Πᵣ) + τ(−G⁰ᵤᵣ)ᵃ₊ +
 (G⁰ᵤᵤ)ᵃ`, `τ ∈ [0, 1]`, is a sum of positive semi-definite terms, so it is never
 indefinite in exact arithmetic. An eigenvalue below `-tol` therefore indicates a
 wrong sign somewhere upstream, not roundoff, and is reported as an error.
 
-This runs on the host on purpose. The `m × m` dense problem is small next to the
-matrix-free work around it, and LAPACK raises on a failed factorization where
-CUSOLVER's `sygvd` silently returns `NaN`/`Inf` eigenvalues.
+The work stays in `C`'s array space: on the host `eigen!` goes through LAPACK,
+which raises on a failed factorization, and on the device it goes through
+CUSOLVER's `heevd`, which instead silently returns `NaN`/`Inf` eigenvalues —
+the explicit non-finite check below covers that case, and the `whitener` and
+`nullspace` come back on the same device as `C` so the per-index pencil solves
+never round-trip the `m × m` matrices through the host.
 """
 function psd_pencil_whitener(C::AbstractMatrix;
                              rtol::Real=size(C, 1) * eps(real(float(eltype(C)))))
-    F = eigen(Hermitian(Array(C))) # ascending and on the host so a failure throws
-    μ = F.values
+    F = eigen!(Hermitian(copy(C))) # ascending; LAPACK on the host, heevd on the device
+    μ = Array(F.values) # small, and the cut/tol logic is scalar host work
+    num_bad = count(!isfinite, μ)
+    num_bad == 0 || error("psd_pencil_whitener: eigendecomposition returned " *
+        "$num_bad/$(length(μ)) non-finite eigenvalues; CUSOLVER's heevd reports " *
+        "failure this way instead of throwing, so the factorization did not converge")
     μmax = maximum(μ)
     μmax > zero(μmax) || error("psd_pencil_whitener: C has no positive eigenvalue " *
         "(largest is $μmax), so the constraint bounds nothing")
@@ -135,10 +143,15 @@ function psd_pencil_whitener(C::AbstractMatrix;
         "roundoff floor of -$tol. C(τ) is a sum of positive semi-definite terms " *
         "(ζ⁻¹Πₛ, (1−τ)ζ⁻¹Πᵣ, τ(−G⁰ᵤᵣ)ᵃ₊, (G⁰ᵤᵤ)ᵃ), so a negative eigenvalue means " *
         "one of them has the wrong sign")
-    keep = μ .> tol
-    W = F.vectors[:, keep] ./ sqrt.(μ[keep])'
-    return (whitener=W, nullspace=F.vectors[:, .!keep], values=μ, tol=tol,
-            rank=count(keep))
+    # μ is ascending, so the kept eigenpairs are a contiguous tail — which also
+    # means device indexing below is a plain range, not a gather.
+    num_null = searchsortedlast(μ, tol)
+    kept = (num_null + 1):length(μ)
+    inv_sqrt = similar(F.values, length(kept)) # in C's array space
+    copyto!(inv_sqrt, 1 ./ sqrt.(μ[kept]))
+    W = F.vectors[:, kept] .* inv_sqrt'
+    return (whitener=W, nullspace=F.vectors[:, 1:num_null], values=μ, tol=tol,
+            rank=length(kept))
 end
 
 """
@@ -146,7 +159,9 @@ end
 
 Solve `diag(d) v = λ C v` for a diagonal, positive semi-definite `B = diag(d)`,
 given the `whitener` and `nullspace` of `psd_pencil_whitener(C)`. Returns
-`(values, vectors)` with `vectors' C vectors = 1`.
+`(values, vectors)` with `vectors' C vectors = 1`. `d` is a host vector; the
+dense work happens in `W`'s array space (CUSOLVER/CUBLAS when `W` lives on the
+device), `values` come back on the host and `vectors` stay with `W`.
 
 Errors unless `B` is negligible on the numerical null space of `C`, which is the
 condition under which discarding that null space is lossless. Both `B` and `C`
@@ -163,20 +178,27 @@ function diag_pencil_eigen(d::AbstractVector{<:Real}, W::AbstractMatrix,
         "diag_pencil_eigen: B = diag(d) must be positive semi-definite, got " *
         "minimum(d) = $(minimum(d)) (is ζ = |χ|²/ℑχ negative?)"))
     dmax = maximum(d)
+    sqrt_d = similar(W, real(eltype(W)), length(d)) # sqrt.(d) in W's array space
+    copyto!(sqrt_d, sqrt.(d))
     if size(N, 2) > 0 && dmax > zero(dmax)
         # Column j of this is N[:,j]' * B * N[:,j]; the compression of a positive
         # semi-definite B is positive semi-definite, so its largest diagonal entry
         # also bounds its largest off-diagonal one.
-        worst = maximum(sum(abs2, sqrt.(d) .* N; dims=1))
+        worst = maximum(sum(abs2, sqrt_d .* N; dims=1))
         worst <= btol * dmax || error("diag_pencil_eigen: B is not negligible on the " *
             "numerical null space of C: max_j N[:,j]'B N[:,j] = $worst vs " *
             "btol * max(d) = $(btol * dmax) over $(size(N, 2)) null direction(s). " *
             "The constraint does not bound those directions, so the true bound for " *
             "this index is +∞ rather than anything this program can report")
     end
-    Wd = sqrt.(d) .* W # Wd' * Wd == W' * diag(d) * W, positive semi-definite by construction
-    F = eigen(Hermitian(Wd' * Wd))
-    return F.values, W * F.vectors
+    Wd = sqrt_d .* W # Wd' * Wd == W' * diag(d) * W, positive semi-definite by construction
+    F = eigen!(Hermitian(Wd' * Wd)) # heevd on the device; see psd_pencil_whitener
+    Λ = Array(F.values)
+    num_bad = count(!isfinite, Λ)
+    num_bad == 0 || error("diag_pencil_eigen: eigendecomposition returned " *
+        "$num_bad/$(length(Λ)) non-finite eigenvalues; CUSOLVER's heevd reports " *
+        "failure this way instead of throwing, so the factorization did not converge")
+    return Λ, W * F.vectors
 end
 
 similar_fill(v::AbstractArray{T}, fill_val::T) where T = fill!(similar(v), fill_val)
@@ -407,7 +429,10 @@ be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
   probe evaluation is a valid bound on its own and the running minimum is kept.
   Each probe point costs one m × m whitening plus one GEVP (roughly twice a
   grid point, whose whitener is shared across all indices). The default grid
-  and tolerance add about five probe points per index.
+  and tolerance add about seven probe points per index; the tolerance costs
+  precision only in τ, and the bound is flat near its minimum (relative error
+  in σₙ² of roughly `4(Δτ)²` on the semi-analytic model), so `0.05` gives up
+  under about one percent of tightness relative to the exact minimiser.
 
 # Returns
 A named tuple with the bounds, the bookkeeping needed to save them, and
@@ -424,8 +449,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               G₀_uu=nothing,
                               outer_indices::Union{Nothing,AbstractVector{Int}}=nothing,
                               on_outer_error::Symbol=:throw,
-                              τs::AbstractVector{<:Real}=range(0.0, 1.0, length=9),
-                              τ_refine_tol::Union{Nothing,Real}=0.02)
+                              τs::AbstractVector{<:Real}=range(0.0, 1.0, length=5),
+                              τ_refine_tol::Union{Nothing,Real}=0.05)
     on_outer_error in (:throw, :stop) ||
         throw(ArgumentError("on_outer_error must be :throw or :stop, got :$on_outer_error"))
     isempty(τs) && throw(ArgumentError("τs must contain at least one grid point"))
@@ -544,16 +569,15 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         "$sender_size + $receiver_size), so Πᵣ ≠ 1 − Πₛ and the τ family " *
         "cannot be assembled from the sender projector alone")
     Bₛ = view(basis, 1:sender_size, :)
-    S_basis = Array(Bₛ' * Bₛ) # = basis' Πₛ basis, exact whether or not the basis is orthonormal
+    S_basis = Bₛ' * Bₛ # = basis' Πₛ basis, exact whether or not the basis is orthonormal
     D_basis = (1 / ζ) .* S_basis # −ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1 in the basis
-    D_basis[diagind(D_basis)] .+= Γ_pos_cpu[1:RSVD_BASIS_SIZE] .- (1 / ζ)
-    C_basis_cpu = Array(C_basis) # the pencil work lives on the host, like psd_pencil_whitener
+    D_basis[diagind(D_basis)] .+= view(Γ_pos, 1:RSVD_BASIS_SIZE) .- (1 / ζ)
 
     # None of the C(τ) depend on n, so the grid pencils are eigendecomposed once
     # here; the golden-section refinement builds throwaway pencils on demand
-    # (those whitenings land in outer_times rather than c_range).
+    # (those whitenings land in outer_times rather than c_range). 
     build_pencil(τ::Real) = begin
-        C_τ = isone(τ) ? C_basis_cpu : C_basis_cpu .- (1 - τ) .* D_basis
+        C_τ = isone(τ) ? C_basis : C_basis .- (1 - τ) .* D_basis
         try
             psd_pencil_whitener(C_τ)
         catch err
@@ -570,7 +594,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] C(τ) numerical ranks: " *
         join(("τ=$(τs[i]) → $(pencils[i].rank)/$(size(C_basis, 1))" for i in usable_τ), ", ")
 
-    ss_basis_cpu = Array(ss_basis) # probes follow the pencil onto the host
+    # The probes stay in the pencil's array space. Only the small projected
+    # b-vectors cross to the host, where the scalar root finds live.
     B_basis_diagonal = zeros(real(eltype(C_basis)), RSVD_BASIS_SIZE)
 
     bounds_dual_basis = zeros(Float64, num_pos)
@@ -601,19 +626,17 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         pencil_dual(pencil, τ) = begin
             Λ_basis, V_basis = diag_pencil_eigen(B_basis_diagonal, pencil.whitener,
                                                  pencil.nullspace)
-            num_bad = count(!isfinite, Λ_basis)
-            num_bad == 0 || error("GEVP at n=$n, τ=$τ returned " *
-                "$num_bad/$(length(Λ_basis)) non-finite eigenvalues despite " *
-                "C(τ) having numerical rank $(pencil.rank)")
 
             best_dual_τ = -Inf
             for k in n:num_pos
-                sₖ_basis = view(ss_basis_cpu, :, k)
-                sₖ_null = norm(pencil.nullspace' * sₖ_basis)
-                sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n, " *
-                    "τ=$τ has ‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) " *
-                    "in the numerical null space of C(τ), so the bound is +∞ ")
-                b_basis = V_basis' * sₖ_basis
+                sₖ_basis = view(ss_basis, :, k)
+                if size(pencil.nullspace, 2) > 0
+                    sₖ_null = norm(pencil.nullspace' * sₖ_basis)
+                    sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n, " *
+                        "τ=$τ has ‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) " *
+                        "in the numerical null space of C(τ), so the bound is +∞ ")
+                end
+                b_basis = Array(V_basis' * sₖ_basis) # to the host, for the scalar root find
 
                 fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
                 ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
