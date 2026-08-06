@@ -113,10 +113,10 @@ the host and return the pieces needed to solve it on `C`'s numerical range:
   caller to verify that whatever it drops with it is genuinely absent.
 - `values`, `tol`, `rank`: the full ascending spectrum of `C` and where it was cut.
 
-`C = ζ⁻¹Πₛ + (−G⁰ᵤᵣ)ᵃ₊ + (G⁰ᵤᵤ)ᵃ` is a sum of three positive semi-definite terms,
-so it is never indefinite in exact arithmetic. An eigenvalue below `-tol`
-therefore indicates a wrong sign somewhere upstream, not roundoff, and is
-reported as an error.
+Every member of the constraint family `C(τ) = ζ⁻¹(Πₛ + (1−τ)Πᵣ) + τ(−G⁰ᵤᵣ)ᵃ₊ +
+(G⁰ᵤᵤ)ᵃ`, `τ ∈ [0, 1]`, is a sum of positive semi-definite terms, so it is never
+indefinite in exact arithmetic. An eigenvalue below `-tol` therefore indicates a
+wrong sign somewhere upstream, not roundoff, and is reported as an error.
 
 This runs on the host on purpose. The `m × m` dense problem is small next to the
 matrix-free work around it, and LAPACK raises on a failed factorization where
@@ -132,9 +132,9 @@ function psd_pencil_whitener(C::AbstractMatrix;
     tol = rtol * μmax
     μmin = minimum(μ)
     μmin >= -tol || error("psd_pencil_whitener: C has eigenvalue $μmin, well below the " *
-        "roundoff floor of -$tol. C is a sum of three positive semi-definite terms " *
-        "(ζ⁻¹Πₛ, (−G⁰ᵤᵣ)ᵃ₊, (G⁰ᵤᵤ)ᵃ), so a negative eigenvalue means one of " *
-        "them has the wrong sign")
+        "roundoff floor of -$tol. C(τ) is a sum of positive semi-definite terms " *
+        "(ζ⁻¹Πₛ, (1−τ)ζ⁻¹Πᵣ, τ(−G⁰ᵤᵣ)ᵃ₊, (G⁰ᵤᵤ)ᵃ), so a negative eigenvalue means " *
+        "one of them has the wrong sign")
     keep = μ .> tol
     W = F.vectors[:, keep] ./ sqrt.(μ[keep])'
     return (whitener=W, nullspace=F.vectors[:, .!keep], values=μ, tol=tol,
@@ -379,10 +379,43 @@ be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
   passes `:stop` so that the setup-stage timings, which are measured before the
   loop and are useful on their own, survive a loop that cannot run on synthetic
   input.
+- `τs`: grid of `τ ∈ [0, 1]` over which the power-conservation constraint
+
+      C(τ) = ζ⁻¹(Πₛ + (1−τ)Πᵣ) + τ(−G⁰ᵤᵣ)ᵃ₊ + (G⁰ᵤᵤ)ᵃ
+
+  is scanned. `τ` toggles between the two sides of the receiver-power identity
+  `t'ζ⁻¹Πᵣt = t'(−G⁰ᵤᵣ)ᵃt` (Eq. (25) of the paper): at `τ = 0` the power
+  reaching the receiver is charged as material absorption inside it (global
+  asym power conservation), at `τ = 1` it is charged as radiative transfer
+  through `(−G⁰ᵤᵣ)ᵃ₊` (the historical behaviour of this code). Physical
+  currents satisfy the constraint at every `τ`, so each grid point yields a
+  valid bound. The grid plays two roles: the shared diagnostic table
+  `bounds_dual_by_tau`, and the bracketing stage for the per-index refinement
+  below. Must be sorted ascending.
+- `τ_refine_tol`: after the grid sweep, each index's minimiser is refined by a
+  golden-section search on the bracket formed by the best grid point and its
+  two neighbours, down to this width in `τ`; `nothing` reports the raw grid
+  minimum instead. The search is exact rather than heuristic because the dual
+  bound is quasi-convex in `τ`: `C(τ) = C₀ + τC₁` is affine in `τ`, so the
+  Lagrangian `h(α, β) = sup_t [t'Bₙt + αℑ(sₖ't) − t'(αC₀ + βC₁)t]` is a
+  supremum of functions affine in `(α, β)` (jointly convex) and the dual
+  value at `τ` is its infimum along the ray `β = ατ`. A sublevel set
+  `{τ : g(τ) ≤ c}` is then the set of slopes of rays meeting the convex set
+  `{h ≤ c}`, which is an interval, and the max over probes `k ≥ n` preserves
+  quasi-convexity. Each index's bound therefore descends to a single minimum
+  and rises again so golden-section converges to the global minimiser. Every
+  probe evaluation is a valid bound on its own and the running minimum is kept.
+  Each probe point costs one m × m whitening plus one GEVP (roughly twice a
+  grid point, whose whitener is shared across all indices). The default grid
+  and tolerance add about five probe points per index.
 
 # Returns
 A named tuple with the bounds, the bookkeeping needed to save them, and
-`stage_times` / `outer_times` for calibration.
+`stage_times` / `outer_times` for calibration. `bounds_dual_basis` holds the
+per-index minimum over all evaluated `τ`, `opt_taus` the `τ` that achieved it
+(off-grid when refinement improved on the grid), and `bounds_dual_by_tau` the
+grid-only `num_pos × length(τs)` table (`NaN` where an index/grid point was
+skipped or failed), with the grid echoed in `tau_grid`.
 """
 function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γ::AbstractVector, Vur_asym::AbstractMatrix,
@@ -390,9 +423,22 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               basis_size::Int=size(Vur_asym, 2),
                               G₀_uu=nothing,
                               outer_indices::Union{Nothing,AbstractVector{Int}}=nothing,
-                              on_outer_error::Symbol=:throw)
+                              on_outer_error::Symbol=:throw,
+                              τs::AbstractVector{<:Real}=range(0.0, 1.0, length=9),
+                              τ_refine_tol::Union{Nothing,Real}=0.02)
     on_outer_error in (:throw, :stop) ||
         throw(ArgumentError("on_outer_error must be :throw or :stop, got :$on_outer_error"))
+    isempty(τs) && throw(ArgumentError("τs must contain at least one grid point"))
+    all(τ -> zero(τ) <= τ <= one(τ), τs) || throw(ArgumentError(
+        "every τ must lie in [0, 1] — the constraint C(τ) is only a convex " *
+        "combination of valid power-conservation statements on that interval, " *
+        "got extrema(τs) = $(extrema(τs))"))
+    issorted(τs) || throw(ArgumentError(
+        "τs must be sorted ascending: the refinement step brackets the minimum " *
+        "between the best grid point's neighbours"))
+    isnothing(τ_refine_tol) || τ_refine_tol > 0 || throw(ArgumentError(
+        "τ_refine_tol must be positive, or `nothing` to disable refinement, " *
+        "got $τ_refine_tol"))
     # U_uu = read_array(jld_in, "UU/U", use_gpu(compute_env)) # TODO: could use this as basis too
     if isnothing(G₀_uu)
         G₀_uu = load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver]) # universe -> universe
@@ -478,19 +524,58 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     C_basis = basis' * opmat(C, basis)
     t_c_projection = (time_ns() - t_c_projection) / 1e9
 
-    # C does not depend on n, so its eigendecomposition is computed once here.
-    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Eigendecomposing C in the basis to find its numerical range"
+    # The C projected above is the τ = 1 endpoint of the constraint family
+    #
+    #     C(τ) = ζ⁻¹(Πₛ + (1−τ)Πᵣ) + τ(−G⁰ᵤᵣ)ᵃ₊ + (G⁰ᵤᵤ)ᵃ,
+    #
+    # which interpolates between the two sides of the receiver-power identity
+    # t'ζ⁻¹Πᵣt = t'(−G⁰ᵤᵣ)ᵃt: τ = 0 charges the power reaching the receiver as
+    # material absorption inside it (global asym power conservation), τ = 1 as
+    # radiative transfer. Physical currents satisfy every convex combination, so
+    # each τ bounds σₙ(Pᵣₛ) on its own and the per-index minimum over a grid is
+    # free tightening. Writing C(τ) = C(1) − (1−τ)D needs no further matrix-free
+    # projections: D = (−G⁰ᵤᵣ)ᵃ₊ − ζ⁻¹Πᵣ is exact in this basis, because
+    # basis'(−G⁰ᵤᵣ)ᵃ₊basis = diag(Γ₊) by the same orthonormality that makes Bₙ
+    # diagonal, and basis'Πₛbasis is the Gram matrix of the stored sender rows.
+    sender_size = prod(sender(smr).cel) * 3
+    receiver_size = prod(receiver(smr).cel) * 3
+    size(basis, 1) == sender_size + receiver_size || error(
+        "the universe is not [sender; receiver] ($(size(basis, 1)) ≠ " *
+        "$sender_size + $receiver_size), so Πᵣ ≠ 1 − Πₛ and the τ family " *
+        "cannot be assembled from the sender projector alone")
+    Bₛ = view(basis, 1:sender_size, :)
+    S_basis = Array(Bₛ' * Bₛ) # = basis' Πₛ basis, exact whether or not the basis is orthonormal
+    D_basis = (1 / ζ) .* S_basis # −ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1 in the basis
+    D_basis[diagind(D_basis)] .+= Γ_pos_cpu[1:RSVD_BASIS_SIZE] .- (1 / ζ)
+    C_basis_cpu = Array(C_basis) # the pencil work lives on the host, like psd_pencil_whitener
+
+    # None of the C(τ) depend on n, so the grid pencils are eigendecomposed once
+    # here; the golden-section refinement builds throwaway pencils on demand
+    # (those whitenings land in outer_times rather than c_range).
+    build_pencil(τ::Real) = begin
+        C_τ = isone(τ) ? C_basis_cpu : C_basis_cpu .- (1 - τ) .* D_basis
+        try
+            psd_pencil_whitener(C_τ)
+        catch err
+            @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] psd_pencil_whitener failed at τ=$τ; treating this point as unusable" exception = err
+            nothing
+        end
+    end
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Eigendecomposing C(τ) in the basis for τ ∈ $(collect(τs))"
     t_c_range = time_ns()
-    C_range = psd_pencil_whitener(C_basis)
+    pencils = [build_pencil(τ) for τ in τs]
+    usable_τ = findall(!isnothing, pencils)
+    isempty(usable_τ) && error("psd_pencil_whitener failed at every τ in $(collect(τs))")
     t_c_range = (time_ns() - t_c_range) / 1e9
-    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] C has numerical rank " *
-        "$(C_range.rank)/$(size(C_basis, 1)) (λ ∈ [$(minimum(C_range.values)), " *
-        "$(maximum(C_range.values))], cut at $(C_range.tol))"
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] C(τ) numerical ranks: " *
+        join(("τ=$(τs[i]) → $(pencils[i].rank)/$(size(C_basis, 1))" for i in usable_τ), ", ")
 
     ss_basis_cpu = Array(ss_basis) # probes follow the pencil onto the host
     B_basis_diagonal = zeros(real(eltype(C_basis)), RSVD_BASIS_SIZE)
 
     bounds_dual_basis = zeros(Float64, num_pos)
+    bounds_dual_by_tau = fill(NaN, num_pos, length(τs))
+    opt_taus = fill(NaN, num_pos)
     ns = isnothing(outer_indices) ? (1:RSVD_BASIS_SIZE) :
          filter(n -> 1 <= n <= RSVD_BASIS_SIZE, outer_indices)
     complete = length(ns) == num_pos
@@ -506,41 +591,105 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         fill!(B_basis_diagonal, zero(eltype(B_basis_diagonal)))
         B_basis_diagonal[n:RSVD_BASIS_SIZE] .= (4/ζ) .* Γ_pos_cpu[n:RSVD_BASIS_SIZE] # Bₙ is diagonal in the gs_pos basis, so no projection is needed
 
-        # Solve the GEVP on C's numerical range. Bₙ shrinks with n (Bₙ ⪯ Bₙ₋₁, as
-        # they differ by a positive semi-definite rank-one term), but the null
-        # directions it is allowed to ignore grow with n too, so the check inside
-        # diag_pencil_eigen has to happen per index rather than once up front.
-        @info string(now()) * " [$n/$(num_pos)] Solving λⱼ(Bₙ, C) in the basis"
-        Λ_basis, V_basis = diag_pencil_eigen(B_basis_diagonal, C_range.whitener,
-                                             C_range.nullspace)
-        num_bad = count(!isfinite, Λ_basis)
-        num_bad == 0 || error("GEVP at n=$n returned $num_bad/$(length(Λ_basis)) " *
-            "non-finite eigenvalues despite C having numerical rank $(C_range.rank)")
+        # Solve the GEVP on each C(τ)'s numerical range and keep the tightest τ.
+        # Bₙ shrinks with n (Bₙ ⪯ Bₙ₋₁, as they differ by a positive
+        # semi-definite rank-one term), but the null directions it is allowed to
+        # ignore grow with n too, so the check inside diag_pencil_eigen has to
+        # happen per index rather than once up front. Every τ bounds σₙ(Pᵣₛ) on
+        # its own, so an evaluation that fails numerically is dropped for this
+        # index with a warning; only the whole grid failing aborts the index.
+        pencil_dual(pencil, τ) = begin
+            Λ_basis, V_basis = diag_pencil_eigen(B_basis_diagonal, pencil.whitener,
+                                                 pencil.nullspace)
+            num_bad = count(!isfinite, Λ_basis)
+            num_bad == 0 || error("GEVP at n=$n, τ=$τ returned " *
+                "$num_bad/$(length(Λ_basis)) non-finite eigenvalues despite " *
+                "C(τ) having numerical rank $(pencil.rank)")
 
-        best_dual = -Inf
-        for k in n:num_pos
-            sₖ_basis = view(ss_basis_cpu, :, k)
-            sₖ_null = norm(C_range.nullspace' * sₖ_basis)
-            sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n has " *
-                "‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) in the numerical null " *
-                "space of C, so the bound is +∞ ")
-            b_basis = V_basis' * sₖ_basis
+            best_dual_τ = -Inf
+            for k in n:num_pos
+                sₖ_basis = view(ss_basis_cpu, :, k)
+                sₖ_null = norm(pencil.nullspace' * sₖ_basis)
+                sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n, " *
+                    "τ=$τ has ‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) " *
+                    "in the numerical null space of C(τ), so the bound is +∞ ")
+                b_basis = V_basis' * sₖ_basis
 
-            fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
-            ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
-            # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Refined bracketing interval for root finding: ($left, $right) ↦  ($f_left, $f_right)"
+                fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
+                ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
+                # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Refined bracketing interval for root finding: ($left, $right) ↦  ($f_left, $f_right)"
 
-            αₖ_opt_basis = find_zero(fₖ_basis, (left, right), Roots.Brent())
-            dual_basis(α) = α^2/4 * sum(abs2(bⱼ) / (α - λⱼ) for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
-            curr_dual = dual_basis(αₖ_opt_basis)
-            if curr_dual > best_dual
-                best_dual = curr_dual
+                αₖ_opt_basis = find_zero(fₖ_basis, (left, right), Roots.Brent())
+                dual_basis(α) = α^2/4 * sum(abs2(bⱼ) / (α - λⱼ) for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
+                curr_dual = dual_basis(αₖ_opt_basis)
+                if curr_dual > best_dual_τ
+                    best_dual_τ = curr_dual
+                end
+                # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Found root at α = $αₖ_opt_basis with dual value $(curr_dual) $(curr_dual > best_dual_τ ? ">" : "<") $(best_dual_τ) (best dual so far)"
             end
-            # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Found root at α = $αₖ_opt_basis with dual value $(curr_dual) $(curr_dual > best_dual ? ">" : "<") $(best_dual) (best dual so far)"
+            best_dual_τ
         end
-        dual = best_dual
-        @info string(now()) * " [$n/$(num_pos)] Dual is $dual, which gives a bound of $(sqrt(dual)) on σₙ(Pᵣₛ)"
-        bounds_dual_basis[n] = sqrt(dual)
+        best_dual = Inf
+        best_τ = NaN
+        best_grid_idx = 0
+        last_τ_error = nothing
+        eval_dual(pencil, τ) = begin
+            isnothing(pencil) && return Inf
+            try
+                pencil_dual(pencil, τ)
+            catch err
+                last_τ_error = err
+                @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] [$n/$(num_pos)] τ=$τ failed; dropping this evaluation" exception = err
+                Inf
+            end
+        end
+
+        @info string(now()) * " [$n/$(num_pos)] Solving λⱼ(Bₙ, C(τ)) over $(length(usable_τ)) τ grid point(s)"
+        for i in usable_τ
+            dual_τ = eval_dual(pencils[i], τs[i])
+            isfinite(dual_τ) || continue
+            bounds_dual_by_tau[n, i] = sqrt(dual_τ)
+            if dual_τ < best_dual
+                best_dual, best_τ, best_grid_idx = dual_τ, Float64(τs[i]), i
+            end
+        end
+        isfinite(best_dual) || error("every τ in the grid failed at n=$n" *
+            (last_τ_error === nothing ? "" : "; last error: $(sprint(showerror, last_τ_error))"))
+
+        # The dual bound is quasi-convex in τ (see the τ_refine_tol docstring),
+        # so the grid minimum brackets the true minimiser between its two
+        # neighbours, and golden-section inside that bracket converges to it.
+        # The running minimum keeps every evaluation, so noise denting
+        # unimodality can only cost tightness, never validity.
+        if !isnothing(τ_refine_tol) && length(τs) > 1
+            lo = Float64(τs[max(best_grid_idx - 1, firstindex(τs))])
+            hi = Float64(τs[min(best_grid_idx + 1, lastindex(τs))])
+            invφ = (sqrt(5.0) - 1) / 2
+            τ₁ = hi - invφ * (hi - lo)
+            τ₂ = lo + invφ * (hi - lo)
+            g₁ = eval_dual(build_pencil(τ₁), τ₁)
+            g₂ = eval_dual(build_pencil(τ₂), τ₂)
+            g₁ < best_dual && ((best_dual, best_τ) = (g₁, τ₁))
+            g₂ < best_dual && ((best_dual, best_τ) = (g₂, τ₂))
+            refine_iters = 0
+            while hi - lo > τ_refine_tol && refine_iters < 200
+                refine_iters += 1
+                if g₁ <= g₂
+                    hi, τ₂, g₂ = τ₂, τ₁, g₁
+                    τ₁ = hi - invφ * (hi - lo)
+                    g₁ = eval_dual(build_pencil(τ₁), τ₁)
+                    g₁ < best_dual && ((best_dual, best_τ) = (g₁, τ₁))
+                else
+                    lo, τ₁, g₁ = τ₁, τ₂, g₂
+                    τ₂ = lo + invφ * (hi - lo)
+                    g₂ = eval_dual(build_pencil(τ₂), τ₂)
+                    g₂ < best_dual && ((best_dual, best_τ) = (g₂, τ₂))
+                end
+            end
+        end
+        @info string(now()) * " [$n/$(num_pos)] Dual is $best_dual at τ = $best_τ, which gives a bound of $(sqrt(best_dual)) on σₙ(Pᵣₛ)"
+        bounds_dual_basis[n] = sqrt(best_dual)
+        opt_taus[n] = best_τ
         push!(outer_times, (n, (time_ns() - t_outer) / 1e9))
      catch err
         on_outer_error === :throw && rethrow(err)
@@ -595,6 +744,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
 
     return (num_pos=num_pos, complete=complete, outer_error=outer_error,
             bounds_dual_basis=bounds_dual_basis,
+            tau_grid=collect(Float64, τs), opt_taus=opt_taus,
+            bounds_dual_by_tau=bounds_dual_by_tau,
             old_analytical_bounds=old_analytical_bounds,
             new_analytical_bounds=new_analytical_bounds,
             true_bounds=true_bounds, which_bounds=which_bounds, ks=ks,
@@ -632,6 +783,15 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     end
     if !haskey(jld_out, "bounds_dual_basis")
         jld_out["bounds_dual_basis"] = result.bounds_dual_basis
+    end
+    if !haskey(jld_out, "tau_grid")
+        jld_out["tau_grid"] = result.tau_grid
+    end
+    if !haskey(jld_out, "opt_taus")
+        jld_out["opt_taus"] = result.opt_taus
+    end
+    if !haskey(jld_out, "bounds_dual_by_tau")
+        jld_out["bounds_dual_by_tau"] = result.bounds_dual_by_tau
     end
     if !haskey(jld_out, "old_analytical_bounds")
         jld_out["old_analytical_bounds"] = result.old_analytical_bounds
