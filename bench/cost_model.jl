@@ -27,11 +27,14 @@ reading the code and the primitive costs are the only fitted quantities:
     actually in use (c ~ 3000) and which the previous estimator ignored
     entirely.
 
-  * `ComputeBounds` is not constant-time. It runs one dense generalized
-    Hermitian eigendecomposition per positive eigenvalue, an
-    `O(num_pos^2)` loop of root-finds each with a device-to-host
-    synchronisation, an `O(num_pos^2)` reverse Gram-Schmidt over length-`N_u`
-    vectors, and `4k` self plus `4k` external Green matvecs.
+  * `ComputeBounds` is not constant-time. Each of the `m = num_pos` indices
+    runs `TAU_GRID_POINTS + TAU_REFINE_EVALS` pencil solves (the shared τ
+    grid plus a per-index golden-section refinement), every one an `m x m`
+    Hermitian eigendecomposition on the *device* (CUSOLVER heevd), on top of
+    an `O(m^2 * evals)` probe loop -- a device gemv, a device-to-host
+    transfer, and a host Brent root find per probe -- an `O(m^2)` reverse
+    Gram-Schmidt over length-`N_u` vectors, and `4m` self plus `4m` external
+    Green matvecs.
 
 Sizes are always driven by the cell count of **one body**. The separation
 between the bodies changes nothing about the cost except at contact. In
@@ -117,6 +120,33 @@ for the larger runs; 0.6 is a deliberately pessimistic default because the
 bounds cost grows superlinearly in `num_pos`.
 """
 const NUM_POS_FRACTION = 0.6
+
+"""
+    TAU_GRID_POINTS, TAU_REFINE_EVALS
+
+Shape of the τ optimization in `bounds_from_spectrum` (`src/bounds.jl`): the
+power-conservation constraint `C(τ)` is scanned over a `TAU_GRID_POINTS`-point
+grid whose whiteners are eigendecomposed once and shared across every index,
+then each index runs a golden-section refinement averaging `TAU_REFINE_EVALS`
+extra dual evaluations (measured at the default `τ_refine_tol = 0.05`), each of
+which builds its own throwaway whitener. Update these if the `τs` /
+`τ_refine_tol` defaults in `bounds_from_spectrum` change.
+"""
+const TAU_GRID_POINTS = 5
+const TAU_REFINE_EVALS = 6
+
+"""
+    RECOMPILE_OVERHEAD_S
+
+Flat per-job tax added to every padded time request. Some clusters invalidate
+Julia's compilation cache between jobs (heterogeneous CPU microarchitectures
+behind one queue, cleaned scratch caches), and a full recompile of this package
+stack costs about 700 s regardless of the job's size. Applied after `time_pad`
+so the request grows by exactly this amount, and only on the padded path so
+`bench/fit.jl`'s comparisons of raw predictions against measurements are
+unaffected.
+"""
+const RECOMPILE_OVERHEAD_S = 700.0
 
 n_cells(cells::NTuple{3,Int}) = prod(cells)
 sender_cells_count(pt::SRPoint) = n_cells(pt.sender_cells)
@@ -290,9 +320,9 @@ and nothing else.
 - `bandwidth`: device bytes/s for BLAS-1 traffic.
 - `launch_latency`: seconds per kernel launch, which dominates the
   `O(num_pos^2)` BLAS-1 loops.
-- `sync_latency`: seconds per device-to-host synchronisation, which dominates
-  the bounds inner loop.
-- `host_root_find`: seconds per unit of `num_pos * k` for the host-side Brent
+- `sync_latency`: seconds per device-to-host synchronisation, paid once per
+  probe when the projected b-vector crosses to the host for the root find.
+- `host_root_find`: seconds per unit of `probes * m` for the host-side Brent
   root find in the bounds inner loop.
 
 # Memory
@@ -654,47 +684,63 @@ rsvd_host_bytes(pt::SRPoint, c::Coefficients) =
 """
     bounds_counts(pt) -> NamedTuple
 
-Work done by `_compute_bounds_sr`, with `m = num_pos` and `k = rank`:
+Work done by `_compute_bounds_sr` after the τ-optimized pencil refactor, with
+`m = num_pos` (the projection basis is the `m` positive eigenvectors, so every
+dense pencil object is `m x m`) and `evals = TAU_GRID_POINTS + TAU_REFINE_EVALS`
+dual evaluations per index:
 
-  * Reverse Gram-Schmidt: `m(m-1)/2` (dot, axpy) pairs on length-`N_u` vectors.
-    Two kernel launches each, so launch latency matters as much as bandwidth.
-  * `ss_basis = basis' * ss`: one `(k x N_u)(N_u x m)` gemm.
-  * `C_basis = basis' * opmat(C, basis)`: `k` applications of `C`. Each applies
-    `asym(G0_uu)`, which is a difference of two multi-region operators, and each
-    multi-region application runs all four blocks -- so `4k` self plus `4k`
-    external Green matvecs in total, plus `2k` length-`N_u` by `m` gemvs.
-  * Main loop, once per `n in 1:m`: a dense `k x k` generalized Hermitian
-    eigendecomposition (this is the `O(m k^3)` term that makes bounds expensive
-    at large rank), plus `diagm` and two Hermitian copies.
-  * Inner loop, `m(m-1)/2` times: a `k x k` gemv, a device-to-host transfer
-    (a full synchronisation each time), and a host-side Brent root find over
-    length-`k` vectors.
+  * Reverse Gram-Schmidt: `m(m-1)/2` (dot, axpy) pairs on length-`N_u` vectors
+    on the device. Two kernel launches each, so launch latency matters as much
+    as bandwidth.
+  * `ss_basis = basis' * ss` and the `C`/`D` projections: `m` applications of
+    `C` -- each applies `asym(G0_uu)`, a difference of two multi-region
+    operators whose applications run all four blocks, so `4m` self plus `4m`
+    external Green matvecs -- plus the `(m x N_u)(N_u x m)` gemms.
+  * Pencil whitenings (device heevd, `psd_pencil_whitener`): `TAU_GRID_POINTS`
+    shared `m x m` Hermitian eigendecompositions up front, plus
+    `TAU_REFINE_EVALS` throwaway ones per index for the golden-section probes.
+  * Pencil solves (device, `diag_pencil_eigen`), once per (index, evaluation):
+    an `m x m` Hermitian eigendecomposition and two `m x m x m` gemms.
+  * Probe loop, `(m - n + 1)` probes per (index, evaluation) -- about
+    `evals * m^2/2` in total: an `m x m` device gemv, one device-to-host
+    transfer of the projected b-vector, and a host-side Brent root find over
+    length-`m` resolvent expansions.
 """
 function bounds_counts(pt::SRPoint)
     N_u = universe_length(pt)
     k = pt.rank
-    m = effective_num_pos(pt)
+    m = min(effective_num_pos(pt), N_u)
     pairs = m * (m - 1) / 2
+    evals_per_index = TAU_GRID_POINTS + TAU_REFINE_EVALS
+    probes = evals_per_index * m * (m + 1) / 2
 
     gs_bytes = pairs * 3 * N_u * BYTES_PER_COMPLEX   # read s_j, read/write w_i
     gs_launches = 2 * pairs
 
     M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
     M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
-    mv_ext = 4 * k
-    mv_self = 4 * k
+    mv_ext = 4 * m
+    mv_self = 4 * m
 
-    gemm_flops = flops_gemm(k, N_u, m) +            # ss_basis
-                 2 * k * flops_gemm(N_u, m, 1) +    # C: G' v and G w
-                 flops_gemm(k, N_u, k)              # basis' * (C basis)
-    geigh_flops = m * flops_geigh(k)
-    copy_bytes = m * 3 * k^2 * BYTES_PER_COMPLEX    # diagm + two Hermitian copies
-    inner_gemv_flops = pairs * flops_gemm(k, k, 1)
-    inner_syncs = pairs
-    root_work = pairs * k
+    # Device-side dense work: the m-wide basis projections, then the pencil
+    # stage -- whitenings (grid shared, refinement per index) and one
+    # diag_pencil_eigen (eigh + two gemms) per evaluation, all through
+    # CUSOLVER/CUBLAS. Only the root finds stay on the host.
+    gemm_flops = flops_gemm(m, N_u, m) +            # ss_basis
+                 2 * m * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
+                 flops_gemm(m, N_u, m) +            # basis' * (C basis)
+                 flops_gemm(m, N_u, m)              # D: Bs' Bs on the sender rows
+    whitenings = TAU_GRID_POINTS + m * TAU_REFINE_EVALS
+    pencil_eigh_flops = (whitenings + m * evals_per_index) * flops_eigh(m)
+    pencil_gemm_flops = 2 * m * evals_per_index * flops_gemm(m, m, m)
+    probe_gemv_flops = probes * flops_gemm(m, m, 1)
+    root_work = probes * m
 
+    # The pencil arena lives on the device with the whitenings: C_basis, D, S,
+    # ss_basis, the working whitener + eigenvectors, and the cached grid
+    # whiteners (whitener + nullspace ~ m^2 each).
     vram_bytes = (3 * k + 2 * m) * N_u * BYTES_PER_COMPLEX +
-                 3 * k^2 * BYTES_PER_COMPLEX +
+                 (2 * TAU_GRID_POINTS + 8) * m^2 * BYTES_PER_COMPLEX +
                  2 * self_fourier_bytes(pt.receiver_cells) +
                  2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
     # One host-side copy of the eigenvector block; JLD2's own buffering and the
@@ -706,8 +752,10 @@ function bounds_counts(pt::SRPoint)
             mv_ext=mv_ext, mv_self=mv_self,
             ext_fft_work=mv_ext * fft_work(M_ext),
             self_fft_work=mv_self * fft_work(M_self),
-            gemm_flops=gemm_flops, geigh_flops=geigh_flops, copy_bytes=copy_bytes,
-            inner_gemv_flops=inner_gemv_flops, inner_syncs=inner_syncs,
+            gemm_flops=gemm_flops,
+            pencil_eigh_flops=pencil_eigh_flops,
+            pencil_gemm_flops=pencil_gemm_flops,
+            probe_gemv_flops=probe_gemv_flops, probes=probes,
             root_work=root_work, vram_bytes=vram_bytes, host_bytes=host_bytes,
             bytes_read=bytes_read)
 end
@@ -719,10 +767,10 @@ Total predicted seconds, and how many of them are actually device throughput.
 
 The split matters because a MIG slice gets a fraction of the streaming
 multiprocessors, so only the device-bound part stretches when you ask for one.
-The bounds job's dominant term at large rank is the *host-side* Brent root find
-in the `O(num_pos^2)` inner loop -- single-threaded scalar Julia with the GPU idle
--- and scaling that by the slice fraction would over-request by up to 8x on
-exactly the small-body sweeps that are otherwise cheap enough to fit in a slice.
+The pencil eigendecompositions and gemms run on the device (heevd/CUBLAS) and
+stretch; the per-probe Brent root finds are single-threaded host Julia with the
+GPU idle, and scaling them by the slice fraction would over-request on exactly
+the small-body sweeps that are otherwise cheap enough to fit in a slice.
 """
 function bounds_time_s(pt::SRPoint, c::Coefficients)
     n = bounds_counts(pt)
@@ -730,10 +778,12 @@ function bounds_time_s(pt::SRPoint, c::Coefficients)
     device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
     device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
     device += n.gemm_flops / c.gemm_rate
-    device += n.geigh_flops / c.geigh_rate + n.copy_bytes / c.bandwidth
-    device += n.inner_gemv_flops / c.gemm_rate + n.inner_syncs * c.sync_latency
-    host = n.root_work * c.host_root_find + n.bytes_read / c.disk_read_rate +
-           c.gpu_startup_s
+    device += n.pencil_eigh_flops / c.eigh_rate
+    device += (n.pencil_gemm_flops + n.probe_gemv_flops) / c.gemm_rate
+    # Per-probe D2H syncs and root finds go in the host bucket: neither gets
+    # slower on a MIG slice, so neither should be stretched by its fraction.
+    host = n.probes * c.sync_latency + n.root_work * c.host_root_find
+    host += n.bytes_read / c.disk_read_rate + c.gpu_startup_s
     return (host + device, device)
 end
 
@@ -752,7 +802,9 @@ bounds_host_bytes(pt::SRPoint, c::Coefficients) =
 
 Predicted `(time_s, host_bytes, vram_bytes)` for one job on one point.
 `vram_bytes` is zero for the CPU-only Green-function job. With `pad=true` the
-coefficient set's safety factors are applied.
+coefficient set's safety factors are applied, plus the flat
+`RECOMPILE_OVERHEAD_S` on the time (added after `time_pad`, and left out of
+`device_time_s` so MIG-slice stretching never multiplies it).
 """
 function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_for("molering");
                  pad::Bool=true)
@@ -777,6 +829,7 @@ function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_fo
         host *= coeffs.host_mem_pad
         vram *= coeffs.vram_pad
         floor *= coeffs.vram_pad
+        t += RECOMPILE_OVERHEAD_S
     end
     return (time_s=t, device_time_s=device_t, host_bytes=host, vram_bytes=vram,
             vram_floor_bytes=floor)
