@@ -14,14 +14,16 @@ using Printf
 # over. Run that script on the cluster to submit everything.
 #
 # Time and memory requests come from `bench/cost_model.jl`, calibrated per cluster
-# by the harness in `bench/` (see bench/README.md). If a cluster has no
-# `bench/coeffs_<cluster>.jl` yet, the model falls back to uncalibrated analytic
-# guesses and says so loudly -- treat those requests as placeholders.
+# by the harness in `bench/` (see bench/README.md).
 
 include(joinpath(@__DIR__, "bench", "cost_model.jl"))
 using .CostModel
 
-const PROJECT_NAME = "metasurface_0p25x0p25x0p25_1350comps_50oversamples_32scale"
+const PROJECT_NAME = "narval_arxivV3_0p25x0p25x0p25_1350comps_50oversamples_32scale"
+# const PROJECT_NAME = "fir_arxivV3_0p5x0p5x0p5_1350comps_50oversamples_32scale"
+# const PROJECT_NAME = "nibi_arxivV3_1x1x1_1350comps_50oversamples_32scale"
+# const PROJECT_NAME = "rorqual_arxivV3_2x2x2_1350comps_50oversamples_aniso-32-n16-n16scale"
+# const PROJECT_NAME = "rorqual_arxivV3_4x4x4_800comps_50oversamples_aniso-32-n8-n8scale"
 
 # Previous project names:
 #   heat-transfer_sep_2x2x0p5_512comps
@@ -58,9 +60,10 @@ const CC_SCRATCH_DIR = "/home/$(CC_UNAME)/scratch/Photonic-System-Channels/"
     NUM_POS_FRACTION
 
 Assumed fraction of the computed rank that has a positive `Asym(G⁰ᵤᵣ)` eigenvalue.
-The bounds job runs one dense `k x k` generalized eigendecomposition per positive
-eigenvalue and an `O(num_pos²)` inner loop on top, so this number matters a lot
-and is only known after the RSVD has run.
+The bounds job runs ~11 dense `m x m` device pencil solves per positive
+eigenvalue (the τ grid plus golden-section refinement, `m = num_pos`) and an
+`O(num_pos² x evals)` probe loop on top, so this number matters a lot and is
+only known after the RSVD has run.
 
 Measured across `data analysis/data`: 0.22-0.52, clustering near 0.50 for the
 larger runs. 0.60 is deliberately on the high side so the bounds job does not run out of memory.
@@ -130,6 +133,15 @@ end
 "Does this job run on the GPU? The Green function job deliberately does not."
 uses_gpu(job::JobType) = job != GenerateGreensJob
 
+"""
+    ClusterConfig
+
+# Fields
+- `max_cores`, `max_host_GB`: the Alliance's published per-GPU bundle. Usage is
+  billed as the largest of `gpus`, `cores / max_cores` and `host / max_host_GB`,
+  so staying inside the bundle keeps a job costing exactly one GPU-equivalent;
+  exceeding it costs priority without making the job faster.
+"""
 struct ClusterConfig
     name::String
     has_slurm::Bool
@@ -142,8 +154,22 @@ struct ClusterConfig
     code_dir::String
 end
 
+"""
+    MOLERING_THREADS
+
+Julia threads for the unscheduled machine. The molering thread scan measured the
+Green-function job peaking at 16 of the 128 available and getting slower beyond:
+Gila's FFTs are single-threaded and only the quadrature loops are `@threads`, so
+the parallel fraction saturates early.
+"""
 const MOLERING_THREADS = 16
 
+"""
+    num_threads(cluster) -> String
+
+The `-t` argument for Julia. Under SLURM that is whatever the scheduler gave us,
+which is `choose_cores`' answer by construction.
+"""
 num_threads(config::ClusterConfig) =
     config.has_slurm ? "\\\$SLURM_CPUS_PER_TASK" : string(MOLERING_THREADS)
 
@@ -161,54 +187,98 @@ function ClusterConfig(server::AbstractString)
                              MOLERING_PRELOAD_DIR, MOLERING_PROJECT_DIR,
                              MOLERING_SCRATCH_DIR, MOLERING_CODE_DIR)
     elseif server == "narval"
+        # Calcul Quebec. 159 GPU nodes, 4x A100-SXM4-40GB, 48 Milan cores, 498 GB.
         return ClusterConfig(server, true,
-                             40,  # NVIDIA A100-SXM4-40GB
-                             240,
-                             12,
+                             40,   # NVIDIA A100-SXM4-40GB
+                             124,  # bundle: 124.5 GB per A100
+                             12,   # bundle: 12 cores per A100
                              CC_PRELOAD_DIR, cc_project_dir(server),
                              CC_SCRATCH_DIR, CC_CODE_DIR)
     elseif server == "fir"
+        # Simon Fraser, replaced Cedar. 160 GPU nodes, 4x H100 SXM5, 48 EPYC 9454
+        # cores, 1125 GB. MIG is enabled on roughly half the GPU nodes.
         return ClusterConfig(server, true,
-                             80,  # NVIDIA H100 80GB HBM3
-                             240,
-                             12,
+                             80,   # NVIDIA H100 80GB HBM3
+                             288,  # bundle: 288 GB per H100
+                             12,   # bundle: 12 cores per H100
+                             CC_PRELOAD_DIR, cc_project_dir(server),
+                             CC_SCRATCH_DIR, CC_CODE_DIR)
+    elseif server == "nibi"
+        # Waterloo, replaced Graham. 10 GPU nodes with 8x H100 SXM 80GB each,
+        # 112 Intel Xeon 6 "Granite Rapids" cores, 2000 GB.
+        return ClusterConfig(server, true,
+                             80,   # NVIDIA H100 80GB
+                             250,  # bundle: 250 GB per H100
+                             14,   # bundle: 14 cores per H100
+                             CC_PRELOAD_DIR, cc_project_dir(server),
+                             CC_SCRATCH_DIR, CC_CODE_DIR)
+    elseif server == "rorqual"
+        # Calcul Quebec, replaced Beluga. GPU nodes are 4x H100 SXM5 80GB,
+        # 64 AMD Genoa cores, 498 GB.
+        return ClusterConfig(server, true,
+                             80,   # NVIDIA H100 80GB
+                             124,  # bundle: 124.5 GB per H100
+                             16,   # bundle: 16 cores per H100
                              CC_PRELOAD_DIR, cc_project_dir(server),
                              CC_SCRATCH_DIR, CC_CODE_DIR)
     end
-    error("Unknown server: $server")
+    error("Unknown server: $server. Known: molering, narval, fir, nibi, rorqual.")
 end
 
 """
-    gpu_options(cluster) -> Vector{(name, vram_GB, compute_fraction)}
+    gpu_options(cluster) -> Vector{(name, vram_GB, compute_fraction, host_GB)}
 
-The GPU allocations available on a cluster, smallest first. MIG slices get a
-fraction of the streaming multiprocessors as well as a fraction of the memory.
+The GPU allocations available on a cluster, smallest first.
+
+A MIG slice gets a fraction of the streaming multiprocessors as well as a fraction
+of the memory, and it comes with a correspondingly smaller bundle of cores and
+system RAM: `host_GB` is that bundle, and asking for more RAM than a slice's share
+is billed as though several slices had been used, which defeats the point of
+taking one.
+
+The names are cluster-specific and a name the cluster does not define is a hard
+`sbatch` rejection rather than a bad estimate, so they are transcribed from each
+cluster's wiki page rather than guessed. Note that fir spells its H100 slices
+`nvidia_h100_80gb_hbm3_*` while nibi and rorqual spell the same partitions
+`h100_*`. Verify with `sinfo -o "%G" | sort -u` if a submission is refused.
+
+The core bundle is not tracked here: the Green-function job never touches a GPU,
+and the GPU jobs ask for `GPU_JOB_CORES`, which is inside every 2g/3g/whole-GPU
+bundle. It does slightly exceed the 1g slice's 1.7 cores on fir and narval, which
+costs about 18% more than one slice-equivalent on the smallest jobs in the sweep.
 """
 function gpu_options(cluster::ClusterConfig)
     if cluster.name == "narval"
-        return [("a100_1g.5gb", 5, 1 / 8), ("a100_2g.10gb", 10, 2 / 8),
-                ("a100_3g.20gb", 20, 3 / 8), ("a100", 40, 1.0)]
+        return [("a100_1g.5gb", 5, 1 / 8, 17), ("a100_2g.10gb", 10, 2 / 8, 35),
+                ("a100_3g.20gb", 20, 3 / 8, 62), ("a100", 40, 1.0, 124)]
     elseif cluster.name == "fir"
-        return [("nvidia_h100_80gb_hbm3_1g.10gb", 10, 1 / 8),
-                ("nvidia_h100_80gb_hbm3_2g.20gb", 20, 2 / 8),
-                ("nvidia_h100_80gb_hbm3_3g.40gb", 40, 3 / 8),
-                ("h100", 80, 1.0)]
+        return [("nvidia_h100_80gb_hbm3_1g.10gb", 10, 1 / 8, 41),
+                ("nvidia_h100_80gb_hbm3_2g.20gb", 20, 2 / 8, 82),
+                ("nvidia_h100_80gb_hbm3_3g.40gb", 40, 3 / 8, 144),
+                ("h100", 80, 1.0, 288)]
+    elseif cluster.name == "nibi"
+        return [("h100_1g.10gb", 10, 1 / 8, 35), ("h100_2g.20gb", 20, 2 / 8, 71),
+                ("h100_3g.40gb", 40, 3 / 8, 125), ("h100", 80, 1.0, 250)]
+    elseif cluster.name == "rorqual"
+        return [("h100_1g.10gb", 10, 1 / 8, 17), ("h100_2g.20gb", 20, 2 / 8, 35),
+                ("h100_3g.40gb", 40, 3 / 8, 62), ("h100", 80, 1.0, 124)]
     elseif cluster.name == "molering"
-        return [("a6000", 48, 1.0)]
+        return [("a6000", 48, 1.0, 480)]
     end
     error("GPU options not implemented for cluster: $(cluster.name)")
 end
 
 """
-    choose_gpu(cluster, vram_GB) -> (name, compute_fraction)
+    choose_gpu(cluster, vram_GB, host_GB) -> (name, compute_fraction)
 
-Smallest allocation whose memory fits. A slice is cheaper to schedule but slower,
-so `compute_fraction` is used to stretch the time request.
+Smallest allocation that fits both the device memory and the host memory the job
+needs. A slice is cheaper to schedule but slower, so `compute_fraction` is used to
+stretch the time request.
 """
-function choose_gpu(cluster::ClusterConfig, vram_GB::Real)
+function choose_gpu(cluster::ClusterConfig, vram_GB::Real, host_GB::Real)
     options = gpu_options(cluster)
-    for (name, capacity, fraction) in options
-        vram_GB <= capacity && return (name, fraction)
+    for (name, capacity, fraction, bundle_host_GB) in options
+        vram_GB <= capacity && host_GB <= bundle_host_GB && return (name, fraction)
     end
     return (options[end][1], options[end][3])
 end
@@ -292,16 +362,6 @@ end
 
 to_rsvd_params(exp::Experiment) = RSVDParams(exp.rank, exp.oversamples, exp.power_iters)
 
-"""
-    to_cost_point(exp, threads)
-
-The cost model's view of an experiment. Note what is *not* here: the union of the
-sender and receiver volumes. Nothing in the sender/receiver pipeline builds an
-operator on that bounding box -- the "universe" is the concatenated
-`[sender; receiver]` vector and a four-block multi-region operator -- so the gap
-between the bodies contributes nothing to cost. Using `prod(union.cel)` is what
-made a 10000-wavelength separation ask for terabytes.
-"""
 function to_cost_point(exp::Experiment, threads::Int)
     scale = exp.scale < 0 ? (1 // 32, abs(exp.scale), abs(exp.scale)) :
             (exp.scale, exp.scale, exp.scale)
@@ -333,9 +393,11 @@ end
 
 Cores for the GPU jobs. They are not CPU-bound, but they are not single-threaded
 either: the RSVD job pulls an `N_u x k` eigenvector block back to the host and
-writes it through JLD2, and the bounds job reads one back. A couple of cores keeps
-that and the garbage collector from serialising against the device work, and asking
-for more would burn allocation on idle cores.
+writes it through JLD2, the bounds job reads one back and runs its Brent root
+finds in single-threaded host Julia (its pencil eigendecompositions run on the
+device). A couple of cores keeps the host share and the garbage collector from
+serialising against the device work, and asking for more would burn allocation
+on idle cores.
 """
 const GPU_JOB_CORES = 2
 
@@ -384,33 +446,49 @@ function fallback_resources(job::JobType, exp::Experiment, cluster::ClusterConfi
         host_GB = ceil(Int, (2.0e9 + 320 * c * volume) * 1e-9 * 1.5)
         vram_GB = ceil(Int, (1.5e9 + 320 * c * volume) * 1e-9 * 1.5)
     end
-    return time_s, host_GB, vram_GB
+    # This path bypasses `predict`, so the recompile tax is added here instead.
+    return time_s + ceil(Int, CostModel.RECOMPILE_OVERHEAD_S), host_GB, vram_GB
 end
 
 function resources_for(job::JobType, exp::Experiment, cluster::ClusterConfig,
                        coeffs::Coefficients, cores::Int)
+    device_time_s = 0.0
     if is_sr(exp)
         p = predict(cost_job(job), to_cost_point(exp, cores), coeffs)
         time_s, host_bytes, vram_bytes = p.time_s, p.host_bytes, p.vram_bytes
+        device_time_s = p.device_time_s
         host_GB = ceil(Int, host_bytes / 1e9)
         vram_GB = ceil(Int, vram_bytes / 1e9)
     else
         time_s, host_GB, vram_GB = fallback_resources(job, exp, cluster)
+        device_time_s = time_s
     end
+
+    host_GB = max(MIN_MEMORY_GB, min(host_GB, cluster.max_host_GB))
 
     over_vram = false
     gpu_name, fraction = "", 1.0
     if uses_gpu(job)
-        if vram_GB > cluster.max_vram_GB
-            over_vram = true
-        end
-        gpu_name, fraction = choose_gpu(cluster, vram_GB)
-        # A MIG slice has a fraction of the compute as well as a fraction of the
-        # memory, and the calibration was taken on a whole GPU.
-        time_s /= fraction
+        #=
+        Two different numbers. The *floor* decides whether the card is big enough:
+        device memory here is churn-elastic, so a job whose comfortable footprint
+        is 137 GB was measured completing in 71 GB on an 80 GB card once memory
+        pressure forced the allocator to collect. Warning on the comfortable
+        number would refuse jobs that demonstrably run. The request itself is
+        capped at the card, since asking for more than exists is just a rejection.
+        =#
+        floor_GB = is_sr(exp) ? ceil(Int, p.vram_floor_bytes / 1e9) : vram_GB
+        over_vram = floor_GB > cluster.max_vram_GB
+        vram_GB = min(vram_GB, cluster.max_vram_GB)
+        gpu_name, fraction = choose_gpu(cluster, vram_GB, host_GB)
+        # A MIG slice has a fraction of the SMs as well as a fraction of the
+        # memory, and the calibration was taken on a whole GPU, but only the
+        # device-bound share of the work slows down. Stretching the whole
+        # prediction over-requested by up to 8x on the small-body sweeps, whose
+        # bounds job is dominated by a single-threaded host-side root find.
+        time_s = (time_s - device_time_s) + device_time_s / fraction
     end
 
-    host_GB = max(MIN_MEMORY_GB, min(host_GB, cluster.max_host_GB))
     return Resources(max(MIN_TIME_S, ceil(Int, time_s)), host_GB, vram_GB,
                      cores, gpu_name, fraction, over_vram)
 end
@@ -430,10 +508,6 @@ function seconds2string(seconds::Real)
     with_zeros(x) = lpad(string(x), 2, '0')
     return "$(with_zeros(hours)):$(with_zeros(mins)):$(with_zeros(secs))"
 end
-
-# --------------------------------------------------------------------------- #
-# Naming and command line arguments
-# --------------------------------------------------------------------------- #
 
 rational2string(r::Rational, separator="//") = "$(numerator(r))$separator$(denominator(r))"
 
@@ -487,10 +561,6 @@ end
 args(smr::SMRSystem, params::RSVDParams) =
     isnothing(mediator(smr)) ? heat_transfer_args(smr, params) : smr_args(smr, params)
 
-# --------------------------------------------------------------------------- #
-# Script generation
-# --------------------------------------------------------------------------- #
-
 function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSystem,
                              res::Resources, dependency::Union{Nothing,JobType}=nothing)
     var_name = job_var_name(job)
@@ -502,12 +572,12 @@ function slurm_header_footer(job::JobType, cluster::ClusterConfig, smr::SMRSyste
     --output=$(cluster.project_dir)/$(PROJECT_NAME)/logs/$(experiment_name(smr))_%j.out \\
     --account=$(cluster.name in CC_RRG_CLUSTERS ? CC_RRG_NAME : CC_DEFAULT_GROUP_NAME) \\
     --time=$(seconds2string(res.time_s)) \\
-    --cpus-per-task=$(res.cores) \\
-    --mem=$(res.host_GB)G \\
     --chdir=$(cluster.code_dir) \\
 """
+    header *= "    --cpus-per-task=$(res.cores) \\\n"
+    header *= "    --mem=$(res.host_GB)G \\\n"
     if uses_gpu(job)
-        header *= """    --gpus=$(res.gpu_name):1 \\\n"""
+        header *= "    --gpus=$(res.gpu_name):1 \\\n"
     end
     header *= """    --export=ALL \\
     <<EOF
@@ -574,7 +644,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
             job in jobs || continue
             res = resources[job]
             if res.over_vram
-                @warn "$(experiment_name(smr)) $(string(job)) needs about $(res.vram_GB) GB of VRAM, more than the $(cluster.max_vram_GB) GB on $(cluster.name). Submitting anyway on a whole GPU; expect an out-of-memory failure."
+                @warn "$(experiment_name(smr)) $(string(job)) cannot be squeezed below about $(res.vram_GB) GB of VRAM, more than the $(cluster.max_vram_GB) GB on $(cluster.name). Submitting anyway on a whole GPU, but expect an out-of-memory failure. Reduce the rank or move it to a bigger card."
             end
 
             header, footer = "", ""
@@ -635,6 +705,26 @@ function print_plan(plan, jobs::AbstractVector{JobType}, cluster::ClusterConfig)
     end
     @printf(stderr, "  total core-hours requested %13.1f\n", core_seconds / 3600)
     println(stderr, "  (requests, not predictions: they include the padding factors)")
+
+    coeffs = coefficients_for(cluster.name)
+    if !coeffs.calibrated
+        println(stderr)
+        println(stderr, "  NOTE: $(cluster.name) has no measured calibration. These requests come from")
+        println(stderr, "  bench/coeffs_$(cluster.name).jl, derived from another cluster and derated to")
+        println(stderr, "  over-estimate. Measure it with:")
+        println(stderr, "      julia bench/plan.jl --cluster $(cluster.name) --tier quick")
+    end
+
+    # A MIG slice name the cluster does not define is a hard sbatch rejection, and
+    # only about half of fir's GPU nodes carry slices at all, so say which names
+    # this plan is about to use.
+    slices = unique(res.gpu_name for (_, resources) in plan for (_, res) in resources
+                    if occursin("g.", res.gpu_name))
+    if !isempty(slices)
+        println(stderr)
+        println(stderr, "  This plan requests MIG slices: $(join(sort(slices), ", ")).")
+        println(stderr, "  If sbatch refuses them, check the names with:  sinfo -o \"%G\" | sort -u")
+    end
     return nothing
 end
 
@@ -643,17 +733,36 @@ load_coefficients!(joinpath(@__DIR__, "bench"))
 cluster = ClusterConfig("molering")
 # cluster = ClusterConfig("fir")
 # cluster = ClusterConfig("narval")
+# cluster = ClusterConfig("nibi")
+# cluster = ClusterConfig("rorqual")
+
+valid_clusters = ["molering", "fir", "narval", "nibi", "rorqual"]
+for cluster_name in valid_clusters
+    if occursin(cluster_name, PROJECT_NAME) && cluster_name != cluster.name
+        @warn "Project name contains '$(cluster_name)' but the cluster is set to '$(cluster.name)'. Did you mean to run on $(cluster_name)?"
+        println(stderr, "Press enter to continue anyway, or Ctrl-C to abort...")
+        readline()
+    end
+end
+
 
 ### Metasurface: lambda/4 cubes at lambda/32 cells, swept in separation
-experiments = sr_sweep(
-    cells=(8, 8, 8),
-    separations=[10, 12, 14, 16, 18, 20, 22] .// 1,
-    scale=1 // 32,
-    chi=13.6 + 0.05im,
-    rank=1350,
-    oversamples=50,
-    power_iters=14,
-)
+separations = unique(round.(Int, logrange(1, 10000 * 32, 415))) .// 32 # 415 points gives us 333 actual points (times 3 = 999 < 1000 which is the number of points we can submit to the queue at once (× 3 because 3 jobs per experiment))
+
+# 1/4
+experiments = sr_sweep(cells=(8, 8, 8), separations=separations, scale=1 // 32, chi=13.6 + 0.05im, rank=1350, oversamples=50, power_iters=14)
+
+# 1/2
+# experiments = sr_sweep(cells=(16, 16, 16), separations=separations, scale=1 // 32, chi=13.6 + 0.05im, rank=1350, oversamples=50, power_iters=14)
+
+# 1
+# experiments = sr_sweep(cells=(32, 32, 32), separations=separations, scale=1 // 32, chi=13.6 + 0.05im, rank=1350, oversamples=50, power_iters=14)
+
+# 2
+# experiments = sr_sweep(cells=(64, 32, 32), separations=separations, scale=-1 // 16, chi=13.6 + 0.05im, rank=1350, oversamples=50, power_iters=14)
+
+# 4
+# experiments = sr_sweep(cells=(128, 32, 32), separations=separations, scale=-1 // 8, chi=13.6 + 0.05im, rank=800, oversamples=50, power_iters=14)
 
 # Other sweeps that have been run, for reference:
 #
@@ -677,7 +786,7 @@ command, plan = job_launcher_script(
     experiments,
 )
 
-print(command)
+# print(command)
 print_plan(plan, [GenerateGreensJob, GenerateRSVDJob, ComputeBoundsJob], cluster)
 
 mkpath(joinpath(@__DIR__, "jobs"))
