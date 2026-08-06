@@ -119,16 +119,16 @@ Every member of the constraint family `C(τ) = ζ⁻¹(Πₛ + (1−τ)Πᵣ) + 
 indefinite in exact arithmetic. An eigenvalue below `-tol` therefore indicates a
 wrong sign somewhere upstream, not roundoff, and is reported as an error.
 
-The work stays in `C`'s array space: on the host `eigen!` goes through LAPACK,
+The work stays in `C`'s array space: on the host `eigen` goes through LAPACK,
 which raises on a failed factorization, and on the device it goes through
-CUSOLVER's `heevd`, which instead silently returns `NaN`/`Inf` eigenvalues —
-the explicit non-finite check below covers that case, and the `whitener` and
+CUSOLVER's `heevd`, which instead silently returns `NaN`/`Inf` eigenvalues.
+The explicit non-finite check below covers that case, and the `whitener` and
 `nullspace` come back on the same device as `C` so the per-index pencil solves
 never round-trip the `m × m` matrices through the host.
 """
 function psd_pencil_whitener(C::AbstractMatrix;
                              rtol::Real=size(C, 1) * eps(real(float(eltype(C)))))
-    F = eigen!(Hermitian(copy(C))) # ascending; LAPACK on the host, heevd on the device
+    F = eigen(Hermitian(C)) # ascending; LAPACK on the host, heevd on the device
     μ = Array(F.values) # small, and the cut/tol logic is scalar host work
     num_bad = count(!isfinite, μ)
     num_bad == 0 || error("psd_pencil_whitener: eigendecomposition returned " *
@@ -192,7 +192,7 @@ function diag_pencil_eigen(d::AbstractVector{<:Real}, W::AbstractMatrix,
             "this index is +∞ rather than anything this program can report")
     end
     Wd = sqrt_d .* W # Wd' * Wd == W' * diag(d) * W, positive semi-definite by construction
-    F = eigen!(Hermitian(Wd' * Wd)) # heevd on the device; see psd_pencil_whitener
+    F = eigen(Hermitian(Wd' * Wd))
     Λ = Array(F.values)
     num_bad = count(!isfinite, Λ)
     num_bad == 0 || error("diag_pencil_eigen: eigendecomposition returned " *
