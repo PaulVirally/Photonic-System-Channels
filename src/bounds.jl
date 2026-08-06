@@ -99,6 +99,86 @@ function qthin!(A::CuMatrix)
     return A
 end
 
+"""
+    psd_pencil_whitener(C; rtol=size(C, 1) * eps(real(eltype(C))))
+
+Eigendecompose the constraint matrix `C` of the generalized problem `Bv = λCv` on
+the host and return the pieces needed to solve it on `C`'s numerical range:
+
+- `whitener`: `W = U₊ diag(μ₊)^(-1/2)` over the eigenpairs above the rank
+  tolerance, so that `W' C W = 1`. Solving `(W'BW)y = λy` and taking `v = Wy`
+  yields the pencil's eigenpairs with `V' C V = 1` which is the normalization
+  the dual's `∑ⱼ |bⱼ|²/(α - λⱼ)` resolvent expansion assumes.
+- `nullspace`: an orthonormal basis `N` of the numerical null space, for the
+  caller to verify that whatever it drops with it is genuinely absent.
+- `values`, `tol`, `rank`: the full ascending spectrum of `C` and where it was cut.
+
+`C = ζ⁻¹Πₛ + (−G⁰ᵤᵣ)ᵃ₊ + (G⁰ᵤᵤ)ᵃ` is a sum of three positive semi-definite terms,
+so it is never indefinite in exact arithmetic. An eigenvalue below `-tol`
+therefore indicates a wrong sign somewhere upstream, not roundoff, and is
+reported as an error.
+
+This runs on the host on purpose. The `m × m` dense problem is small next to the
+matrix-free work around it, and LAPACK raises on a failed factorization where
+CUSOLVER's `sygvd` silently returns `NaN`/`Inf` eigenvalues.
+"""
+function psd_pencil_whitener(C::AbstractMatrix;
+                             rtol::Real=size(C, 1) * eps(real(float(eltype(C)))))
+    F = eigen(Hermitian(Array(C))) # ascending and on the host so a failure throws
+    μ = F.values
+    μmax = maximum(μ)
+    μmax > zero(μmax) || error("psd_pencil_whitener: C has no positive eigenvalue " *
+        "(largest is $μmax), so the constraint bounds nothing")
+    tol = rtol * μmax
+    μmin = minimum(μ)
+    μmin >= -tol || error("psd_pencil_whitener: C has eigenvalue $μmin, well below the " *
+        "roundoff floor of -$tol. C is a sum of three positive semi-definite terms " *
+        "(ζ⁻¹Πₛ, (−G⁰ᵤᵣ)ᵃ₊, (G⁰ᵤᵤ)ᵃ), so a negative eigenvalue means one of " *
+        "them has the wrong sign")
+    keep = μ .> tol
+    W = F.vectors[:, keep] ./ sqrt.(μ[keep])'
+    return (whitener=W, nullspace=F.vectors[:, .!keep], values=μ, tol=tol,
+            rank=count(keep))
+end
+
+"""
+    diag_pencil_eigen(d, W, N; btol=1e-8)
+
+Solve `diag(d) v = λ C v` for a diagonal, positive semi-definite `B = diag(d)`,
+given the `whitener` and `nullspace` of `psd_pencil_whitener(C)`. Returns
+`(values, vectors)` with `vectors' C vectors = 1`.
+
+Errors unless `B` is negligible on the numerical null space of `C`, which is the
+condition under which discarding that null space is lossless. Both `B` and `C`
+are positive semi-definite, so a null direction `v` of `C` splits two ways: if
+`v'Bv ≈ 0` then `Bv ≈ 0` as well (for positive semi-definite `B`, `v'Bv = 0`
+implies `Bv = 0`), the cross terms vanish too, and dropping `v` changes nothing;
+whereas if `v'Bv > 0` the constraint genuinely fails to bound that direction, the
+program is unbounded. Silently projecting the second case away would report a
+finite bound that the program does not support.
+"""
+function diag_pencil_eigen(d::AbstractVector{<:Real}, W::AbstractMatrix,
+                           N::AbstractMatrix; btol::Real=1e-8)
+    all(≥(zero(eltype(d))), d) || throw(ArgumentError(
+        "diag_pencil_eigen: B = diag(d) must be positive semi-definite, got " *
+        "minimum(d) = $(minimum(d)) (is ζ = |χ|²/ℑχ negative?)"))
+    dmax = maximum(d)
+    if size(N, 2) > 0 && dmax > zero(dmax)
+        # Column j of this is N[:,j]' * B * N[:,j]; the compression of a positive
+        # semi-definite B is positive semi-definite, so its largest diagonal entry
+        # also bounds its largest off-diagonal one.
+        worst = maximum(sum(abs2, sqrt.(d) .* N; dims=1))
+        worst <= btol * dmax || error("diag_pencil_eigen: B is not negligible on the " *
+            "numerical null space of C: max_j N[:,j]'B N[:,j] = $worst vs " *
+            "btol * max(d) = $(btol * dmax) over $(size(N, 2)) null direction(s). " *
+            "The constraint does not bound those directions, so the true bound for " *
+            "this index is +∞ rather than anything this program can report")
+    end
+    Wd = sqrt.(d) .* W # Wd' * Wd == W' * diag(d) * W, positive semi-definite by construction
+    F = eigen(Hermitian(Wd' * Wd))
+    return F.values, W * F.vectors
+end
+
 similar_fill(v::AbstractArray{T}, fill_val::T) where T = fill!(similar(v), fill_val)
 similar_fill(v::AbstractArray{T}, dims::NTuple{N, Int}, fill_val::T) where {N, T} = fill!(similar(v, dims), fill_val)
 Base.:\(::Nothing, x::AbstractArray) = (x, 0)
@@ -288,7 +368,8 @@ Compute the σₙ(Pᵣₛ) bounds from an already-loaded `Asym(G⁰ᵤᵣ)` spec
 be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
 
 # Keyword arguments
-- `basis_size`: how many leading eigenvectors to use as the projection basis.
+- `basis_size`: how many leading eigenvectors to use as the projection basis,
+  capped at `m = num_pos`, the number of positive `Γ`. 
 - `G₀_uu`: pre-loaded universe operator, loaded here if not supplied.
 - `outer_indices`: which `n` of the outer `σₙ` loop to actually evaluate.
   `nothing` (the default) means all of them.
@@ -313,13 +394,6 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     on_outer_error in (:throw, :stop) ||
         throw(ArgumentError("on_outer_error must be :throw or :stop, got :$on_outer_error"))
     # U_uu = read_array(jld_in, "UU/U", use_gpu(compute_env)) # TODO: could use this as basis too
-    RSVD_BASIS_SIZE = min(basis_size, size(Vur_asym, 2))
-    basis = copy(Vur_asym)
-    # basis = cat(U_uu, Vur_asym; dims=2)
-    # basis = qthin!(basis) # Orthonormalize the basis using QR factorization
-    basis = basis[:, 1:RSVD_BASIS_SIZE] # Restrict the basis to the top RSVD_BASIS_SIZE singular vectors
-    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Using RSVD_BASIS_SIZE = $RSVD_BASIS_SIZE"
-
     if isnothing(G₀_uu)
         G₀_uu = load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver]) # universe -> universe
     end
@@ -338,12 +412,20 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     ζ = abs(χ)^2/imag(χ)
     @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Susceptibility χ = $χ, material factor ζ = $ζ"
 
-    num_pos = count(Γ .> zero(eltype(Γ)))
+    num_pos = count(Γ .> zero(eltype(Γ))) # = m, the numerical rank of (−G⁰ᵤᵣ)ᵃ₊
     Γ_pos = Γ[1:num_pos] # These have been sorted in descending order; keep only the positive eigenvalues
+    Γ_pos_cpu = Array(Γ_pos) # the per-n diagonal of Bₙ is assembled on the host
     if use_gpu(compute_env)
         Γ_pos = CuArray(Γ_pos)
     end
     gs_pos = Vur_asym[:, 1:num_pos] # These have been sorted in descending order of the corresponding Γ values; keep only the eigenvectors with positive eigenvalues
+
+    # The projection basis is the m-dimensional span of the gₖ
+    RSVD_BASIS_SIZE = min(basis_size, num_pos)
+    basis = RSVD_BASIS_SIZE == num_pos ? gs_pos : gs_pos[:, 1:RSVD_BASIS_SIZE] # aliased when full, to avoid a second N × m copy
+    # basis = cat(U_uu, Vur_asym; dims=2)
+    # basis = qthin!(basis) # Orthonormalize the basis using QR factorization
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Using RSVD_BASIS_SIZE = $RSVD_BASIS_SIZE (num_pos = $num_pos of $(size(Vur_asym, 2)) RSVD directions)"
 
     # Reverse Gram-Schmidt
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Performing reverse Gram-Schmidt to construct the ss basis"
@@ -396,11 +478,21 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     C_basis = basis' * opmat(C, basis)
     t_c_projection = (time_ns() - t_c_projection) / 1e9
 
-    B_basis_diagonal = similar_fill(C_basis, (size(C_basis, 1),), zero(eltype(C_basis)))
+    # C does not depend on n, so its eigendecomposition is computed once here.
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Eigendecomposing C in the basis to find its numerical range"
+    t_c_range = time_ns()
+    C_range = psd_pencil_whitener(C_basis)
+    t_c_range = (time_ns() - t_c_range) / 1e9
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] C has numerical rank " *
+        "$(C_range.rank)/$(size(C_basis, 1)) (λ ∈ [$(minimum(C_range.values)), " *
+        "$(maximum(C_range.values))], cut at $(C_range.tol))"
+
+    ss_basis_cpu = Array(ss_basis) # probes follow the pencil onto the host
+    B_basis_diagonal = zeros(real(eltype(C_basis)), RSVD_BASIS_SIZE)
 
     bounds_dual_basis = zeros(Float64, num_pos)
-    B_basis_n = similar(C_basis)
-    ns = isnothing(outer_indices) ? (1:num_pos) : filter(n -> 1 <= n <= num_pos, outer_indices)
+    ns = isnothing(outer_indices) ? (1:RSVD_BASIS_SIZE) :
+         filter(n -> 1 <= n <= RSVD_BASIS_SIZE, outer_indices)
     complete = length(ns) == num_pos
     outer_times = Tuple{Int,Float64}[]
     outer_error = nothing
@@ -412,26 +504,27 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         @info string(now()) * " [$n/$(num_pos)] Projecting Bₙ into the basis of size $(size(basis, 2))"
         # B_basis_n = B_basis(n)
         fill!(B_basis_diagonal, zero(eltype(B_basis_diagonal)))
-        B_basis_diagonal[n:num_pos] .= (4/ζ) .* Γ_pos[n:num_pos]
-        B_basis_n .= diagm(B_basis_diagonal) # We can skip the projection step for Bₙ since Bₙ is diagonal in the gs_pos basis and the basis is just a change of basis from gs_pos
+        B_basis_diagonal[n:RSVD_BASIS_SIZE] .= (4/ζ) .* Γ_pos_cpu[n:RSVD_BASIS_SIZE] # Bₙ is diagonal in the gs_pos basis, so no projection is needed
 
-        # Solve GEVP
+        # Solve the GEVP on C's numerical range. Bₙ shrinks with n (Bₙ ⪯ Bₙ₋₁, as
+        # they differ by a positive semi-definite rank-one term), but the null
+        # directions it is allowed to ignore grow with n too, so the check inside
+        # diag_pencil_eigen has to happen per index rather than once up front.
         @info string(now()) * " [$n/$(num_pos)] Solving λⱼ(Bₙ, C) in the basis"
-        basis_fact = eigen!(Hermitian(copy(B_basis_n)), Hermitian(copy(C_basis))) # The copies are because CUDA can't do eigen, only eigen! for some reason
-        V_basis = basis_fact.vectors
-        Λ_basis = Array(basis_fact.values)
-        # eigen! on the GPU goes through CUSOLVER's sygvd, which does not throw
-        # when C_basis fails to be positive definite the way LAPACK does; it
-        # returns NaN/Inf eigenvalues instead. Fail here rather than let the
-        # non-finite λⱼ poison the root finding further down.
+        Λ_basis, V_basis = diag_pencil_eigen(B_basis_diagonal, C_range.whitener,
+                                             C_range.nullspace)
         num_bad = count(!isfinite, Λ_basis)
         num_bad == 0 || error("GEVP at n=$n returned $num_bad/$(length(Λ_basis)) " *
-            "non-finite eigenvalues; C_basis is likely not positive definite")
+            "non-finite eigenvalues despite C having numerical rank $(C_range.rank)")
 
         best_dual = -Inf
         for k in n:num_pos
-            sₖ_basis = view(ss_basis, :, k)
-            b_basis = Array(V_basis' * sₖ_basis)
+            sₖ_basis = view(ss_basis_cpu, :, k)
+            sₖ_null = norm(C_range.nullspace' * sₖ_basis)
+            sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n has " *
+                "‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) in the numerical null " *
+                "space of C, so the bound is +∞ ")
+            b_basis = V_basis' * sₖ_basis
 
             fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
             ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
@@ -496,7 +589,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     # readline()
 
     stage_times = (gram_schmidt=t_gram_schmidt, ss_basis=t_ss_basis,
-                   c_projection=t_c_projection,
+                   c_projection=t_c_projection, c_range=t_c_range,
                    outer_total=sum(last.(outer_times); init=0.0))
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Stage times [s]:" stage_times
 
