@@ -14,71 +14,74 @@ using Random
 # using .Projectors
 using MatrixFreeRandomizedLinearAlgebra
 
-function midpoint(left::T, right::T) where T <: Real
-    φ = (1 + sqrt(5))/2
-    if isfinite(left) && isfinite(right)
-        return (left + right) / 2
-    elseif isfinite(left) && !isfinite(right)
-        return left * φ
-    elseif !isfinite(left) && isfinite(right)
-        return right / φ
-    end
-    # Both left and right are infinite; return zero if one is negative and the other is positive
-    if left * right < zero(T)
-        return zero(T)
-    end
-    @warn "[midpoint] Both left == right == ∞ "
-    return left
-end
+"""
+    bracket_root(f, λs, b; btol=0.0, maxsteps=200)
 
-issign(x::T, s::Symbol) where T <: Real = (s == :positive && x > zero(T)) || (s == :negative && x < zero(T))
+Find a bracketing interval `((left, f(left)), (right, f(right)))` for
 
-function bisect_safe(f::Function, left::T, right::T, desired_sign::Symbol; f_left::Union{T, Nothing}=nothing, f_right::Union{T, Nothing}=nothing) where T <: Real
-    if isnothing(f_left)
-        f_left = f(left)
-    end
-    if isnothing(f_right)
-        f_right = f(right)
-    end
+    f(α) = ∑ⱼ |bⱼ|² (α - 2λⱼ) / (α - λⱼ)²
 
-    if isfinite(f_left) && issign(f_left, desired_sign)
-        return ((left, f_left), (left, f_left), (right, f_right))
-    end
-    if isfinite(f_left) && issign(f_right, desired_sign)
-        return ((right, f_right), (left, f_left), (right, f_right))
-    end
+with `f(left) < 0 < f(right)`, both endpoints finite. `f` has a pole at the
+largest `λⱼ` with `bⱼ ≠ 0`, where it tends to `-∞` (for a positive pole), and
+tends to `0⁺` as `α → ∞`, so such an interval exists whenever that pole is
+positive.
+"""
+function bracket_root(f::Function, λs::AbstractVector{<:Real}, b::AbstractVector;
+                      btol::Real=zero(real(eltype(b))), maxsteps::Int=200)
+    num_bad = count(!isfinite, λs)
+    num_bad == 0 || throw(ArgumentError(
+        "bracket_root: $num_bad/$(length(λs)) of the λⱼ are non-finite, which makes " *
+        "f(α) NaN at every α — the (α - 2λⱼ)/(α - λⱼ)² factor is Inf/Inf, so the " *
+        "term is 0 * NaN even where bⱼ = 0"))
+    pole_idxs = findall(j -> abs2(b[j]) > btol, eachindex(λs))
+    isempty(pole_idxs) && throw(ArgumentError(
+        "bracket_root: every |bⱼ|² is <= btol = $btol, so f ≡ 0"))
+    pole = maximum(@view λs[pole_idxs])
 
-    while true
-        mid = midpoint(left, right)
-        f_mid = f(mid)
-        if isfinite(f_mid) && issign(f_mid, desired_sign)
-            return ((mid, f_mid), (left, f_left), (right, f_right))
-        elseif isfinite(f_mid) && issign(f_left, desired_sign)
-            right, f_right = mid, f_mid
-        elseif isfinite(f_mid) && issign(f_right, desired_sign)
-            left, f_left = mid, f_mid
-        else
-            @error " [bisect_safe] Neither side has the desired sign; initial interval is not valid"
-            return ((mid, f_mid), (left, f_left), (right, f_right))
+    # Left endpoint: f → -∞ as α → pole⁺ (for pole > 0) and f → 0⁺ as α → ∞, so
+    # start an offset of order |pole| above the pole and halve until f is finite
+    # and negative. Halving rather than growing takes the larges* such offset,
+    # which keeps the endpoint away from the pole where f is stiffest. Starting
+    # relative to |pole| bounds the number of halvings needed by the ~52 bits of
+    # mantissa regardless of how large or small the pole is.
+    T = typeof(pole)
+    left = nothing
+    δ = iszero(pole) ? one(T) : abs(pole)
+    α = pole + δ # declared out here so the error below can report the last probe
+    for _ in 1:maxsteps
+        α = pole + δ
+        fα = f(α)
+        if isfinite(fα) && fα < zero(fα)
+            left = (α, fα)
+            break
         end
+        α == pole && break # δ has underflowed against pole; halving cannot help
+        δ /= 2
     end
-end
+    isnothing(left) && throw(ArgumentError(
+        "bracket_root: no representable α > λmax = $pole with f(α) < 0 " *
+        "(last probe f($α) = $(f(α))). Either λmax ≤ 0, in which case the dual " *
+        "has no interior stationary point on (λmax, ∞) and its infimum is 0 as " *
+        "α → 0, or the sign change next to λmax cannot be resolved in $T: the " *
+        "|bⱼ|² at λmax is negligible against the others, or (α - λmax)² " *
+        "under/overflows (eps(λmax) = $(eps(pole)))"))
 
-function refine_interval(f, interval)
-    left, right = interval
-    f_left, f_right = f(left), f(right)
-    T = promote_type(eltype(f_left), eltype(f_right))
-    φ = T((1 + sqrt(5))/2) 
-
-    # We want to refine (left, right) so that f(left) < 0 and f(right) > 0
-
-    if !isfinite(f_left) || f_left > zero(T)
-        (left, f_left), _, _ = bisect_safe(f, left, midpoint(left, right), :negative, f_left=f_left, f_right=f_right)
+    # Right endpoint: f → 0⁺ as α → ∞, so walk out until f is finite and positive.
+    right = nothing
+    step = max(abs(left[1]), one(T))
+    for _ in 1:maxsteps
+        α = left[1] + step
+        fα = f(α)
+        if isfinite(fα) && fα > zero(fα)
+            right = (α, fα)
+            break
+        end
+        step *= 2
     end
-    if !isfinite(f_right) || f_right < zero(T)
-        (right, f_right), _, _ = bisect_safe(f, midpoint(left, right), right, :positive, f_left=f_left, f_right=f_right)
-    end
-    return ((left, f_left), (right, f_right))
+    isnothing(right) && throw(ArgumentError(
+        "bracket_root: no α > $(left[1]) with f(α) > 0 after $maxsteps steps"))
+
+    return left, right
 end
 
 function qthin!(A::AbstractMatrix)
@@ -417,7 +420,13 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         basis_fact = eigen!(Hermitian(copy(B_basis_n)), Hermitian(copy(C_basis))) # The copies are because CUDA can't do eigen, only eigen! for some reason
         V_basis = basis_fact.vectors
         Λ_basis = Array(basis_fact.values)
-        interval_basis = (maximum(Λ_basis), Inf)
+        # eigen! on the GPU goes through CUSOLVER's sygvd, which does not throw
+        # when C_basis fails to be positive definite the way LAPACK does; it
+        # returns NaN/Inf eigenvalues instead. Fail here rather than let the
+        # non-finite λⱼ poison the root finding further down.
+        num_bad = count(!isfinite, Λ_basis)
+        num_bad == 0 || error("GEVP at n=$n returned $num_bad/$(length(Λ_basis)) " *
+            "non-finite eigenvalues; C_basis is likely not positive definite")
 
         best_dual = -Inf
         for k in n:num_pos
@@ -425,7 +434,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             b_basis = Array(V_basis' * sₖ_basis)
 
             fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
-            ((left, f_left), (right, f_right)) = refine_interval(fₖ_basis, interval_basis)
+            ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
             # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Refined bracketing interval for root finding: ($left, $right) ↦  ($f_left, $f_right)"
 
             αₖ_opt_basis = find_zero(fₖ_basis, (left, right), Roots.Brent())
