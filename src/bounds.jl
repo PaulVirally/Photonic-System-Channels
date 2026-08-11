@@ -201,6 +201,48 @@ function diag_pencil_eigen(d::AbstractVector{<:Real}, W::AbstractMatrix,
     return Λ, W * F.vectors
 end
 
+"""
+    pencil_probe_duals(pencil, B_diag, ss_basis, n, num_pos; τ=NaN)
+
+Solve the per-probe dual problems for index `n` on one eigendecomposed
+constraint pencil (the output of `psd_pencil_whitener`). For each probe
+`k ∈ n:num_pos` this finds the stationary dual multiplier `αₖ` by bracketed
+root finding and evaluates the dual value `αₖ²/4 ∑ⱼ |bⱼ|²/(αₖ - λⱼ)`, with
+`b = V'sₖ` in the pencil's `C`-orthonormal eigenbasis.
+
+Returns `(ks, alphas, duals)`. The bound contribution of this pencil is
+`maximum(duals)`. The per-probe records are kept so that `verify_bounds` can
+use the same probes in the full space, seeding each full-space
+evaluation with the multiplier found here.
+"""
+function pencil_probe_duals(pencil, B_diag::AbstractVector{<:Real},
+                            ss_basis::AbstractMatrix, n::Int, num_pos::Int;
+                            τ::Real=NaN)
+    Λ_basis, V_basis = diag_pencil_eigen(B_diag, pencil.whitener, pencil.nullspace)
+
+    ks = collect(n:num_pos)
+    alphas = zeros(Float64, length(ks))
+    duals = zeros(Float64, length(ks))
+    for (i, k) in enumerate(ks)
+        sₖ_basis = view(ss_basis, :, k)
+        if size(pencil.nullspace, 2) > 0
+            sₖ_null = norm(pencil.nullspace' * sₖ_basis)
+            sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n, " *
+                "τ=$τ has ‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) " *
+                "in the numerical null space of C(τ), so the bound is +∞ ")
+        end
+        b_basis = Array(V_basis' * sₖ_basis)
+
+        fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
+        ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
+
+        αₖ = find_zero(fₖ_basis, (left, right), Roots.Brent())
+        alphas[i] = αₖ
+        duals[i] = αₖ^2/4 * sum(abs2(bⱼ) / (αₖ - λⱼ) for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
+    end
+    return (ks=ks, alphas=alphas, duals=duals)
+end
+
 similar_fill(v::AbstractArray{T}, fill_val::T) where T = fill!(similar(v), fill_val)
 similar_fill(v::AbstractArray{T}, dims::NTuple{N, Int}, fill_val::T) where {N, T} = fill!(similar(v, dims), fill_val)
 Base.:\(::Nothing, x::AbstractArray) = (x, 0)
@@ -441,6 +483,11 @@ per-index minimum over all evaluated `τ`, `opt_taus` the `τ` that achieved it
 (off-grid when refinement improved on the grid), and `bounds_dual_by_tau` the
 grid-only `num_pos × length(τs)` table (`NaN` where an index/grid point was
 skipped or failed), with the grid echoed in `tau_grid`.
+
+The basis-side objects `ss` (full-space probe vectors, `N × num_pos`),
+`ss_basis`, `C_basis` (the `τ = 1` projected constraint) and `D_basis` are also
+returned, in their compute-device array space, so that `verify_bounds` can
+rebuild any `C(τ)` pencil and its probes without re-deriving them.
 """
 function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γ::AbstractVector, Vur_asym::AbstractMatrix,
@@ -622,36 +669,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         # ignore grow with n too, so the check inside diag_pencil_eigen has to
         # happen per index rather than once up front. Every τ bounds σₙ(Pᵣₛ) on
         # its own, so an evaluation that fails numerically is dropped for this
-        # index with a warning; only the whole grid failing aborts the index.
-        pencil_dual(pencil, τ) = begin
-            Λ_basis, V_basis = diag_pencil_eigen(B_basis_diagonal, pencil.whitener,
-                                                 pencil.nullspace)
-
-            best_dual_τ = -Inf
-            for k in n:num_pos
-                sₖ_basis = view(ss_basis, :, k)
-                if size(pencil.nullspace, 2) > 0
-                    sₖ_null = norm(pencil.nullspace' * sₖ_basis)
-                    sₖ_null <= 1e-8 * norm(sₖ_basis) || error("probe k=$k at n=$n, " *
-                        "τ=$τ has ‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ_basis)) " *
-                        "in the numerical null space of C(τ), so the bound is +∞ ")
-                end
-                b_basis = Array(V_basis' * sₖ_basis) # to the host, for the scalar root find
-
-                fₖ_basis(α) = sum(abs2(bⱼ) * (α - 2λⱼ)/(α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
-                ((left, f_left), (right, f_right)) = bracket_root(fₖ_basis, Λ_basis, b_basis)
-                # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Refined bracketing interval for root finding: ($left, $right) ↦  ($f_left, $f_right)"
-
-                αₖ_opt_basis = find_zero(fₖ_basis, (left, right), Roots.Brent())
-                dual_basis(α) = α^2/4 * sum(abs2(bⱼ) / (α - λⱼ) for (bⱼ, λⱼ) in zip(b_basis, Λ_basis))
-                curr_dual = dual_basis(αₖ_opt_basis)
-                if curr_dual > best_dual_τ
-                    best_dual_τ = curr_dual
-                end
-                # @info string(now()) * " [$n/$(num_pos)] [k=$k/$(num_pos)] Found root at α = $αₖ_opt_basis with dual value $(curr_dual) $(curr_dual > best_dual_τ ? ">" : "<") $(best_dual_τ) (best dual so far)"
-            end
-            best_dual_τ
-        end
+        # index with a warning.
+        pencil_dual(pencil, τ) = maximum(pencil_probe_duals(pencil, B_basis_diagonal, ss_basis, n, num_pos; τ=τ).duals)
         best_dual = Inf
         best_τ = NaN
         best_grid_idx = 0
@@ -769,6 +788,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             bounds_dual_basis=bounds_dual_basis,
             tau_grid=collect(Float64, τs), opt_taus=opt_taus,
             bounds_dual_by_tau=bounds_dual_by_tau,
+            ss=ss, ss_basis=ss_basis, C_basis=C_basis, D_basis=D_basis,
             old_analytical_bounds=old_analytical_bounds,
             new_analytical_bounds=new_analytical_bounds,
             true_bounds=true_bounds, which_bounds=which_bounds, ks=ks,

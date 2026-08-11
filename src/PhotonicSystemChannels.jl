@@ -25,4 +25,7 @@ export generate_rsvd
 include("bounds.jl")
 export compute_bounds, load_bounds_inputs, bounds_from_spectrum
 
+include("verify_bounds.jl")
+export verify_bounds
+
 end # module
