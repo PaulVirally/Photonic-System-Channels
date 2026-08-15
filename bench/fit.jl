@@ -36,9 +36,21 @@ points designed for it in `bench/plan.jl`.
   * `geigh_rate`, `sync_latency` and `host_root_find` from the sampled bounds
     outer-loop iterations, by separating the per-`n` constant from the
     per-inner-iteration slope.
+  * `pcie_rate` and `overlap_factor` from the `panel_bus` points (Funicular's own
+    `benchmark/pinned.jl` and `benchmark/overlap.jl`, trial E1). Without those,
+    both keep their defaults and the report says so; see `fit_panel_bus`.
   * Startup costs from the `startup_s` column.
   * The padding factors from the distribution of measured/predicted, so they
     reflect the model's actual spread instead of a guess.
+
+# Forward compatibility
+
+`Coefficients` is `Base.@kwdef`, and every coefficient added since a
+`coeffs_<cluster>.jl` was generated has a default there. That is what lets an old
+coefficients file keep loading: it names a subset of the fields, and the rest come
+from the struct. Nothing in this file may require a coefficient to be present in
+the input, and `write_coefficients` iterates `fieldnames(Coefficients)` so a newly
+added one appears in the next generated file whether or not anything fitted it.
 """
 
 include(joinpath(@__DIR__, "cost_model.jl"))
@@ -588,6 +600,58 @@ function fit_bounds(rows::Vector{Row}, gemm_rate::Union{Nothing,Float64})
 end
 
 """
+    fit_panel_bus(rows) -> Dict
+
+`pcie_rate` and `overlap_factor` from the `panel_bus` points, which is trial E1:
+Funicular's `benchmark/pinned.jl` for the achievable pinned host-to-device rate and
+`benchmark/overlap.jl` for how much of a transfer the pipeline hides behind compute.
+
+The row contract:
+
+  * `kind = "panel_bus"`.
+  * For the rate, `extra` carries `bytes=<moved>` and the row's `time_s` is the
+    seconds those bytes took. Several rows at several transfer sizes are pooled
+    through `rate_through_origin`, so a fixed per-transfer overhead does not get
+    amortised into the slope by a single point.
+  * For the factor, `extra` carries `overlap=<fraction>`, the fraction of transfer
+    time that is *not* hidden, that is, `(t_pipelined - t_compute) / t_transfer`
+    when compute dominates. Median over the rows, clamped to `(0, 1]`. A measured
+    0 would mean the bus is free, which no benchmark can establish and which would
+    delete the term from the model.
+
+No CSV that exists today carries these rows, so this returns an empty `Dict` and
+the two coefficients keep their `CostModel.Coefficients` defaults. Until E1 runs,
+the panel time model has one fitted rate and one guessed factor in it, which is
+what the report has to name.
+"""
+function fit_panel_bus(rows::Vector{Row})
+    out = Dict{String,Any}()
+    panel = filter(r -> r["kind"] == "panel_bus", rows)
+    isempty(panel) && return out
+
+    bytes, times = Float64[], Float64[]
+    for row in panel
+        b = get(extras(row), "bytes", nothing)
+        t = num(row, "time_s")
+        (b === nothing || t === nothing || b <= 0 || t <= 0) && continue
+        push!(bytes, b)
+        push!(times, t)
+    end
+    rate = rate_through_origin(bytes, times)
+    (rate === nothing || rate <= 0) || (out["pcie_rate"] = (rate=rate, n=length(bytes)))
+
+    overlaps = Float64[]
+    for row in panel
+        f = get(extras(row), "overlap", nothing)
+        (f === nothing || f <= 0 || f > 1) && continue
+        push!(overlaps, f)
+    end
+    isempty(overlaps) ||
+        (out["overlap_factor"] = (rate=median(overlaps), n=length(overlaps)))
+    return out
+end
+
+"""
     MAX_PLAUSIBLE_STARTUP_S
 
 Ceiling on a believable process startup. Julia's boot plus loading precompiled
@@ -760,6 +824,31 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         push!(report, "  " * summarize("bounds gram-schmidt", bounds["gs_predicted"],
                                        bounds["gs_measured"]))
     end
+
+    # ---- Funicular panel path ---------------------------------------------
+    #=
+    Four coefficients. Two have a measurement designed for them (E1), and two need
+    an end-to-end panel run's high-water (E2/E3). None of them affect a prediction
+    made with `vram_capacity_bytes === nothing`, so leaving them at their defaults
+    cannot disturb the calibrated in-memory model. It does mean the panel-path
+    numbers in `print_plan` are analytic counts times guesses until the trials
+    land, which is what these report lines are for.
+    =#
+    panel = fit_panel_bus(rows)
+    for (key, field, unit) in (("pcie_rate", :pcie_rate, "B/s"),
+                               ("overlap_factor", :overlap_factor, "of transfers exposed"))
+        if haskey(panel, key)
+            fields[field] = panel[key].rate
+            push!(report, @sprintf("%-26s %.3g %s  (from %d panel_bus points)",
+                                   key, panel[key].rate, unit, panel[key].n))
+        else
+            push!(missing_fits, "$key (no panel_bus points; run Funicular's " *
+                                "benchmark/pinned.jl and benchmark/overlap.jl, trial E1)")
+        end
+    end
+    push!(missing_fits, "panel_host_mem_factor, panel_workspace_bytes (no panel-path " *
+                        "end-to-end runs; trial E2 measures the Gila operator's device " *
+                        "workspace and E3b the pinned-host high-water)")
 
     # ---- RSVD memory, from the mem_rsvd points ----------------------------
     #=
@@ -1156,6 +1245,17 @@ function fit_padding(coeffs::Coefficients, rows::Vector{Row})
                                    label, getfield(coeffs, field)))
         end
     end
+    #=
+    `panel_host_mem_pad` is not fitted from these ratios. Every end-to-end row in
+    the calibration CSVs is an in-memory run, so the p95 they give describes a
+    GC'd Julia heap around an analytic floor, which is the wrong quantity for a
+    path whose host count is preallocated pinned slabs. Fitting it here would copy
+    `host_mem_pad` under a different name and undo the reason the two are
+    separate. It moves when trial E3b measures a panel run's real high-water.
+    =#
+    push!(report, @sprintf("  %-14s padding %.2f  (panel path; not fitted, no panel-path end-to-end runs)",
+                           "panel host", coeffs.panel_host_mem_pad))
+
     isempty(fields) && return coeffs, report
     updated = Dict{Symbol,Any}()
     for field in fieldnames(Coefficients)
@@ -1208,11 +1308,19 @@ end
 # Entry point
 # --------------------------------------------------------------------------- #
 
+#=
+`panel_host_mem_factor` and `panel_workspace_bytes` are in here for the same reason
+as the rest: they are close to pure arithmetic (pinned slabs the plan owns, and the
+Gila operator's own device footprint), so they should travel with a measurement
+rather than be re-guessed per cluster. Until a trial fits them, inheriting them
+copies one default over another, which is a no-op.
+=#
 const TRANSFERABLE_MEMORY_FIELDS = (:rsvd_host_mem_factor, :rsvd_host_mem_base,
                                     :bounds_host_mem_factor, :bounds_host_mem_base,
                                     :rsvd_vram_factor, :rsvd_vram_base,
                                     :bounds_vram_factor, :bounds_vram_base,
-                                    :vram_floor_factor)
+                                    :vram_floor_factor,
+                                    :panel_host_mem_factor, :panel_workspace_bytes)
 
 function main(argv::Vector{String})
     report_only = "--report-only" in argv

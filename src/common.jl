@@ -1,6 +1,9 @@
 using Dates
 using Serialization
 using ArgParse
+import CUDA
+import Funicular
+import HDF5 # Funicular's disk tier only exists once HDF5 is loaded
 
 function ArgParse.parse_item(::Type{GPUChoice}, x::AbstractString)
     s = lowercase(String(x))
@@ -168,6 +171,11 @@ function ArgParse.parse_args()
             help = "Number of power iterations to use in RSVD"
             arg_type = Int
             default = 14
+
+        "--seed"
+            help = "Seed for the panel path's regenerated test matrix (0 derives it from --name)"
+            arg_type = Int
+            default = 0
     end
     args = parse_args(settings)
 
@@ -229,11 +237,122 @@ function ArgParse.parse_args()
     rsvd_params = RSVDParams(
         args["components"],
         args["oversamples"],
-        args["power-iterations"]
+        args["power-iterations"],
+        resolve_seed(args["seed"], project_name)
     )
-    @info string(now()) * " [common::parse_args] Using RSVD parameters:" rank(rsvd_params) oversamples(rsvd_params) power_iter(rsvd_params)
+    @info string(now()) * " [common::parse_args] Using RSVD parameters:" rank(rsvd_params) oversamples(rsvd_params) power_iter(rsvd_params) seed(rsvd_params)
 
     return compute_env, smr, rsvd_params
+end
+
+"""
+    resolve_seed(requested::Int, project_name::AbstractString) -> Int
+
+The seed the panel path sketches with. `requested == 0` (the `--seed` default)
+derives one from the experiment name, so each separation of a sweep gets its own
+seed without us writing 333 of them down; anything else is taken as given. The
+result is always positive and depends on the name alone, so a rerun of the same
+experiment sketches the same way. Note, however, that this only holds within one
+Julia version, since `hash` and `Xoshiro` are implementation details.
+"""
+function resolve_seed(requested::Int, project_name::AbstractString)
+    requested == 0 || return requested
+    return Int(hash(project_name) >>> 1) # >>> 1 clears the sign bit, so this fits an Int
+end
+
+# Host memory the process needs for itself outside the panel tier: the Julia
+# runtime, the Gila operator's host side, the JLD writes, and the page-locking
+# slack. Trial E2 pins the real number down; 6 GB is the plan's working estimate.
+const HOST_OVERHEAD_RESERVE_BYTES = 6 * 2^30
+# Below this there is no point starting, since one row sweep has to hold a whole
+# matrix.
+const HOST_BUDGET_FLOOR_BYTES = 2^30
+# Fraction of the device we hand to Funicular. The rest absorbs the driver, the
+# memory pool's cached blocks, and CUDA's own allocations. We read it from
+# total_memory rather than free_memory, which under-reports once the pool holds
+# cached blocks. On a MIG slice, total_memory reports the slice, not the card.
+const DEVICE_BUDGET_FRACTION = 0.9
+
+device_budget_bytes() = floor(Int, DEVICE_BUDGET_FRACTION * CUDA.total_memory())
+
+# Slurm reports memory in MB, but writes the unit out when the request carried
+# one ("240G"), so we honour the suffix when there is one.
+const SLURM_MEM_UNITS = Dict('K' => 2^10, 'M' => 2^20, 'G' => 2^30, 'T' => 2^40)
+
+function _slurm_mem_bytes(name::String)
+    raw = strip(get(ENV, name, ""))
+    isempty(raw) && return nothing
+    unit = get(SLURM_MEM_UNITS, uppercase(last(raw)), nothing)
+    digits = unit === nothing ? raw : raw[1:end-1]
+    value = tryparse(Int, digits)
+    value === nothing && return nothing
+    return value * (unit === nothing ? 2^20 : unit) # bare numbers are MB
+end
+
+# What Slurm gave us, in bytes. `SLURM_MEM_PER_NODE` is the whole-node request; a
+# `--mem-per-cpu` job gets the same number from the per-CPU request times the
+# task's CPU count. Off a cluster neither exists, so we fall back to the
+# machine's total memory.
+function _slurm_host_bytes()
+    node = _slurm_mem_bytes("SLURM_MEM_PER_NODE")
+    node === nothing || return node
+    per_cpu = _slurm_mem_bytes("SLURM_MEM_PER_CPU")
+    cpus = tryparse(Int, get(ENV, "SLURM_CPUS_PER_TASK", ""))
+    (per_cpu === nothing || cpus === nothing) || return per_cpu * cpus
+    return Int(Sys.total_memory())
+end
+
+"""
+    residency_plan(compute_env; workspace_bytes=0) -> Funicular.ResidencyPlan or nothing
+
+The `ResidencyPlan` the panel path streams its sketches through, sized from the
+allocation this process is running inside. Returns `nothing` on a CPU run: with
+no device in the picture and the sketch already in host memory, the panel
+machinery only adds bookkeeping, so CPU runs keep the in-memory path
+(FUNICULAR_PLAN.md, workstream B1/B3).
+
+Both budgets come from what the job was granted, not from what is momentarily
+free:
+
+- `device_budget` is 90% of `CUDA.total_memory()`. The held-back tenth absorbs
+  the driver and the memory pool's cached blocks. Nothing else is subtracted
+  here. The operator's own device footprint goes in through `workspace_bytes`,
+  which the plan holds back from the buffer pool itself.
+- `host_budget` is the Slurm memory request minus a $(HOST_OVERHEAD_RESERVE_BYTES >> 30) GB overhead
+  reserve for the runtime and the operator's host side, floored at
+  $(HOST_BUDGET_FLOOR_BYTES >> 30) GB. Off a cluster it is the machine's total memory, same
+  reserve.
+- `scratch_dir` is node-local NVMe (`\$SLURM_TMPDIR`) when Slurm gave us one.
+  With a scratch dir the host tier no longer has to hold a whole sketch, only
+  what a sweep touches at once.
+
+`workspace_bytes` is a keyword rather than a trait because `G₀_ur_asym` is a
+LinearMaps composition, which has nowhere to carry one. See
+`gila_workspace_bytes` in `rsvd.jl` for the estimate.
+"""
+function residency_plan(compute_env::ComputeEnvironment; workspace_bytes::Int=0)
+    if !use_gpu(compute_env)
+        @info string(now()) * " [common::residency_plan] CPU run: no residency plan, the in-memory path is cheaper here"
+        return nothing
+    end
+
+    device_budget = device_budget_bytes()
+    host_budget = max(_slurm_host_bytes() - HOST_OVERHEAD_RESERVE_BYTES, HOST_BUDGET_FLOOR_BYTES)
+
+    scratch = nothing
+    if haskey(ENV, "SLURM_TMPDIR")
+        scratch = joinpath(ENV["SLURM_TMPDIR"], "funicular")
+        mkpath(scratch)
+    end
+
+    @info string(now()) * " [common::residency_plan] Building a residency plan" device_budget host_budget workspace_bytes scratch
+    return Funicular.ResidencyPlan(
+        backend=Funicular.cuda_backend(),
+        device_budget=device_budget,
+        host_budget=host_budget,
+        workspace_bytes=workspace_bytes,
+        scratch_dir=scratch
+    )
 end
 
 function run_gc()

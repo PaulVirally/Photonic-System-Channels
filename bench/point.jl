@@ -32,6 +32,10 @@ Kinds (see `run_point` at the bottom for the dispatch):
                     RSVD's RAM and VRAM without a full run
     stage_rsvd      run the real `_generate_rsvd_sr` end to end
     stage_bounds    run the real `_compute_bounds_sr` end to end
+    panel_bus       host-link rate and pipeline overlap for the Funicular panel
+                    path: a pinned host-to-device size sweep plus Funicular's own
+                    `benchmark/pinned.jl` and `benchmark/overlap.jl`. Writes
+                    several `kind="panel_bus"` rows (trial E1)
 
 Options (all have defaults; rationals are written `a//b`):
 
@@ -54,6 +58,33 @@ Options (all have defaults; rationals are written `a//b`):
   --out <csv>             output CSV (default <root>/calibration_<cluster>.csv)
   --cluster <name>        override the cluster label
   --note <text>           free-form text appended to the `extra` column
+
+Funicular-trial options (tier `funicular`; see bench/README.md):
+
+  --seed 0                RSVD seed. The panel path regenerates its Gaussian test
+                          matrix from this instead of holding one, so two panel
+                          runs at the same seed sketch identically. The in-memory
+                          path draws from the global RNG and ignores it, which is
+                          why trial E2's parity is to RSVD accuracy rather than
+                          bit-for-bit.
+  --fresh                 delete the point's `.jld` (and the positive-vector `.h5`
+                          it names) before running, so `stage_rsvd` measures the
+                          work instead of skipping it because an output exists
+  --force-path auto|panel `panel` builds a `Funicular.ResidencyPlan` here and hands
+                          it to `_save_ur_asym` / `_run_rsvdvals` as
+                          `plan_override`, which is the one hook that bypasses
+                          `use_panel_path`. That is how trial E2 runs the panel
+                          code on a whole A100 where the in-memory sketch fits, so
+                          that the two halves of the parity check differ in the
+                          storage path alone. `auto` (the default) leaves the
+                          runtime's own predicate alone.
+  --host-budget-GB 0      override the plan's `host_budget` (0 = take it from the
+                          Slurm request, as production does). A debugging hook:
+                          trial E3c forces the NVMe spill through `--mem` instead,
+                          so that `residency_plan`'s own reading of
+                          `SLURM_MEM_PER_NODE` is what gets exercised.
+  --funicular-benchmark   directory holding Funicular's benchmark scripts
+                          (default `joinpath(pkgdir(Funicular), "benchmark")`)
 """
 
 using PhotonicSystemChannels
@@ -64,6 +95,7 @@ using JLD2
 using Dates
 using Printf
 using Random
+import Funicular
 
 include(joinpath(@__DIR__, "measure.jl"))
 
@@ -131,7 +163,8 @@ host point never touches CUDA, and so that the Green-function builds it measures
 stay on the host exactly as the production CPU job does.
 """
 const GPU_KINDS = Set(["matvec_self", "matvec_ext", "matvec_uu", "dense",
-                       "bounds_core", "mem_rsvd", "stage_rsvd", "stage_bounds"])
+                       "bounds_core", "mem_rsvd", "stage_rsvd", "stage_bounds",
+                       "panel_bus"])
 
 struct PointSpec
     kind::String
@@ -155,6 +188,11 @@ struct PointSpec
     out_csv::String
     cluster::String
     note::String
+    seed::Int
+    fresh::Bool
+    force_path::String
+    host_budget_GB::Float64
+    funicular_bench_dir::String
 end
 
 function PointSpec(opts::Dict{String,String})
@@ -188,7 +226,25 @@ function PointSpec(opts::Dict{String,String})
                      getopt(opts, "scratch", joinpath(root, "scratch")),
                      getopt(opts, "out", joinpath(root, "calibration_$(cluster).csv")),
                      cluster,
-                     getopt(opts, "note", ""))
+                     getopt(opts, "note", ""),
+                     getopt_int(opts, "seed", 0),
+                     getopt(opts, "fresh", "false") in ("true", "1", "yes"),
+                     getopt(opts, "force-path", "auto"),
+                     getopt_float(opts, "host-budget-GB", 0.0),
+                     getopt(opts, "funicular-benchmark", _default_funicular_bench_dir()))
+end
+
+"""
+    _default_funicular_bench_dir() -> String
+
+Where Funicular keeps `overlap.jl` and `pinned.jl`. Resolved through
+`pkgdir(Funicular)` rather than hard-coded, because Funicular comes in by URL and
+its depot path carries a content hash that changes with every pin.
+"""
+function _default_funicular_bench_dir()
+    dir = pkgdir(Funicular)
+    dir === nothing && return ""
+    return joinpath(dir, "benchmark")
 end
 
 uses_gpu(spec::PointSpec) = spec.gpu >= 0
@@ -558,6 +614,294 @@ function point_bounds_core(spec::PointSpec)
 end
 
 # --------------------------------------------------------------------------- #
+# Device point: the host link, for the Funicular panel path (trial E1)
+# --------------------------------------------------------------------------- #
+
+#=
+Two coefficients come out of this point, and nothing else identifies them:
+`pcie_rate` (seconds per byte of pinned host-to-device traffic) and
+`overlap_factor` (the share of that traffic the double-buffered sweep fails to
+hide behind compute). On the panel path the sketch crosses the bus once per sweep,
+so between them they are the whole of the panel time model's bus term.
+
+Three sources, in decreasing order of how much the fit leans on them:
+
+  1. an in-process pinned size sweep, through Funicular's own `alloc_host_slab` /
+     `h2d!` / `sync_queue`. Four transfer sizes rather than one, because
+     `rate_through_origin` fits a slope through the origin and a single point
+     cannot tell a slope from a fixed per-transfer overhead.
+  2. Funicular's `benchmark/pinned.jl`, which is the same measurement at one size
+     plus the pageable comparison that says whether the host tier is page-locked
+     at all. The pageable number is recorded under `bytes_pageable=` so that it
+     stays in the CSV without being fitted, since a pageable copy is not the rate
+     the panel path pays.
+  3. Funicular's `benchmark/overlap.jl`, which is where `overlap_factor` comes
+     from: at each compute-to-copy ratio it reports the copies alone, the compute
+     alone, the sweep at one buffer and the sweep at two.
+
+The scripts run as their own processes. Each wants a clean device and its own CUDA
+context, and `benchmark/common.jl` defines `best`, `banner` and `record` at top
+level, which would collide with this file's namespace if they were `include`d.
+They also write their TSVs next to themselves, so the directory is copied
+somewhere writable first: the depot's copy is not ours to scribble in.
+=#
+
+# `pinned.jl`'s transfer: N = 1 << 22 rows of W = 8 ComplexF64 columns.
+const PINNED_SCRIPT_BYTES = (1 << 22) * 8 * 16
+# `overlap.jl`'s serialized pass: N = 1 << 20, K = 16 ComplexF64, up and back.
+const OVERLAP_SWEEP_BYTES = 2 * (1 << 20) * 16 * 16
+# Rows of the in-process sweep. Column counts, at the same N as `pinned.jl`, so
+# each slab is contiguous and the sizes span 64 MiB to 512 MiB.
+const PANEL_BUS_SWEEP_WIDTHS = [1, 2, 4, 8]
+const PANEL_BUS_SWEEP_ROWS = 1 << 22
+#=
+`fit_panel_bus` rejects an overlap of zero, since no benchmark can establish that
+the bus is free and a zero would delete the term from the model. A sweep whose
+copies vanish completely behind compute measures exactly that, so it is recorded
+at this floor with the raw value kept alongside under `overlap_raw=`. Five percent
+is the resolution `best`'s minimum-of-five sampling can defend at these durations.
+=#
+const OVERLAP_FLOOR = 0.05
+
+"Minimum of `samples` timings after one warm-up, matching Funicular's own `best`."
+function _best(f, samples::Int=5)
+    f()
+    CUDA.synchronize()
+    return minimum(begin
+                       _, dt = timed(f; device_sync=true)
+                       dt
+                   end for _ in 1:samples)
+end
+
+"""
+    _pinned_sweep_rows(spec, device_total) -> (rows, notes)
+
+Pinned host-to-device timings at several transfer sizes, using the same Funicular
+primitives `benchmark/pinned.jl` does. Each size becomes one `panel_bus` row
+carrying `bytes=`, which is what `pcie_rate` is fitted from.
+"""
+function _pinned_sweep_rows(spec::PointSpec, device_total::Int)
+    rows = Dict{String,Any}[]
+    notes = String[]
+    backend = Funicular.cuda_backend()
+    queue = Funicular.make_queue(backend)
+    name = gpu_name()
+    for width in PANEL_BUS_SWEEP_WIDTHS
+        dims = (PANEL_BUS_SWEEP_ROWS, width)
+        nbytes = prod(dims) * 16
+        free, _ = CUDA.memory_info()
+        if nbytes > 0.25 * free
+            push!(notes, "sweep_skipped_w$(width)=insufficient_free_vram")
+            continue
+        end
+        try
+            slab = Funicular.alloc_host_slab(backend, nbytes)
+            locked = Funicular.slab_matrix(slab, ComplexF64, dims, 0)
+            fill!(locked, one(ComplexF64))
+            device = Funicular.alloc_device(backend, ComplexF64, dims)
+            dt = _best(() -> begin
+                           Funicular.h2d!(device, locked, backend; queue=queue)
+                           Funicular.sync_queue(backend, queue)
+                       end)
+            push!(rows, panel_bus_row(cluster=spec.cluster, gpu_name=name,
+                                      device_total=device_total, time_s=dt,
+                                      extras=["bytes=$(nbytes)", "source=pinned_sweep",
+                                              "panel_cols=$(width)",
+                                              "gbps=$(@sprintf("%.4g", nbytes / dt / 2^30))"]))
+        catch err
+            push!(notes, "sweep_failed_w$(width)=$(typeof(err))")
+            @warn "pinned sweep failed" width exception = err
+        end
+        # The slabs and device blocks go out of scope here; reclaim so the next,
+        # larger size sees the room rather than the pool's cached copy of it.
+        GC.gc()
+        CUDA.reclaim()
+    end
+    return rows, notes
+end
+
+"""
+    _stage_funicular_benchmark(spec) -> String
+
+Copy Funicular's `benchmark/` somewhere writable and return the copy's path.
+
+`benchmark/common.jl` writes its TSVs to `joinpath(@__DIR__, "results")`, that is,
+inside the package directory. Julia hands out depot package trees read-only often
+enough that running in place is a coin flip, and a calibration point should not be
+writing into the depot even where it can.
+"""
+function _stage_funicular_benchmark(spec::PointSpec)
+    src = spec.funicular_bench_dir
+    isempty(src) && error("could not locate Funicular's benchmark directory; pass --funicular-benchmark")
+    isdir(src) || error("no Funicular benchmark directory at '$src'")
+    dst = joinpath(spec.scratch_dir, "funicular_benchmark")
+    rm(dst; recursive=true, force=true)
+    mkpath(dirname(dst))
+    cp(src, dst)
+    # `cp` preserves the source's modes, and a read-only depot copy would make
+    # `record`'s mkpath fail for exactly the reason we copied it out.
+    chmod(dst, 0o755; recursive=true)
+    return dst
+end
+
+"Run one of Funicular's benchmark scripts against the active project, and log it."
+function _run_funicular_script(dir::AbstractString, script::AbstractString,
+                               log_path::AbstractString)
+    path = joinpath(dir, script)
+    isfile(path) || return (ok=false, seconds=0.0, log="no such script: $path")
+    project = Base.active_project()
+    project_dir = project === nothing ? "@." : dirname(project)
+    #=
+    The main project, not `benchmark/Project.toml`. That file exists for `plot.jl`
+    only, and lists DelimitedFiles and Plots, neither of which `pinned.jl` or
+    `overlap.jl` touches. Both need CUDA, Funicular and Printf, which this project
+    already has, so nothing needs instantiating for them.
+    =#
+    cmd = `$(Base.julia_cmd()) --project=$(project_dir) --startup-file=no $(path)`
+    buf = IOBuffer()
+    proc = try
+        run(pipeline(ignorestatus(cmd); stdout=buf, stderr=buf); wait=true)
+    catch err
+        return (ok=false, seconds=0.0, log="failed to launch: $(err)")
+    end
+    text = String(take!(buf))
+    try
+        write(log_path, text)
+    catch
+    end
+    print(text)
+    return (ok=success(proc), seconds=0.0, log=text)
+end
+
+"Header-keyed rows of one of `benchmark/common.jl`'s tab-separated result files."
+function _read_tsv(path::AbstractString)
+    isfile(path) || return nothing
+    lines = filter(!isempty, strip.(readlines(path)))
+    length(lines) >= 2 || return nothing
+    header = String.(split(lines[1], '\t'))
+    out = Dict{String,String}[]
+    for line in lines[2:end]
+        fields = String.(split(line, '\t'))
+        length(fields) == length(header) || continue
+        push!(out, Dict(header[i] => fields[i] for i in eachindex(header)))
+    end
+    return isempty(out) ? nothing : out
+end
+
+_tsv_float(row, key) = haskey(row, key) ? tryparse(Float64, row[key]) : nothing
+
+function point_panel_bus(spec::PointSpec)
+    mkpath(spec.scratch_dir)
+    free, total = CUDA.memory_info()
+    device_total = Int(total)
+    name = gpu_name()
+    notes = String["N_bus_rows=0"]
+    rows = Dict{String,Any}[]
+    times = Dict{String,Float64}()
+
+    # Three independent sources, and one of them failing must not cost the other
+    # two. A point that comes back with the overlap factor and no rate is still
+    # half of what E1 was for.
+    try
+        sweep_rows, sweep_notes = _pinned_sweep_rows(spec, device_total)
+        append!(rows, sweep_rows)
+        append!(notes, sweep_notes)
+    catch err
+        push!(notes, "pinned_sweep_failed=$(typeof(err))")
+        @warn "the pinned size sweep failed; falling back to Funicular's own scripts" exception = err
+    end
+
+    bench_dir = ""
+    try
+        bench_dir = _stage_funicular_benchmark(spec)
+        push!(notes, "funicular_benchmark=$(bench_dir)")
+    catch err
+        push!(notes, "stage_benchmark_failed=$(typeof(err))")
+        @warn "could not stage Funicular's benchmark directory" exception = err
+    end
+
+    if !isempty(bench_dir)
+        results = joinpath(bench_dir, "results")
+
+        _, dt = timed(() -> _run_funicular_script(bench_dir, "pinned.jl",
+                                                  joinpath(spec.scratch_dir, "funicular_pinned.log")))
+        times["pinned_script"] = dt
+        pinned = _read_tsv(joinpath(results, "pinned.tsv"))
+        if pinned === nothing
+            push!(notes, "pinned_tsv=missing")
+        else
+            for row in pinned
+                source = get(row, "source", "")
+                gbps = _tsv_float(row, "bandwidth_gbps")
+                (gbps === nothing || gbps <= 0) && continue
+                seconds = PINNED_SCRIPT_BYTES / (gbps * 2^30)
+                # Only the page-locked copy is the rate the panel path pays, so
+                # only that row gets the `bytes=` key the fit reads.
+                key = source == "pinned" ? "bytes" : "bytes_pageable"
+                push!(rows, panel_bus_row(cluster=spec.cluster, gpu_name=name,
+                                          device_total=device_total, time_s=seconds,
+                                          extras=["$key=$(PINNED_SCRIPT_BYTES)",
+                                                  "source=script_$(source)",
+                                                  "gbps=$(@sprintf("%.4g", gbps))"]))
+                push!(notes, "script_$(source)_gbps=$(@sprintf("%.4g", gbps))")
+            end
+        end
+
+        _, dt = timed(() -> _run_funicular_script(bench_dir, "overlap.jl",
+                                                  joinpath(spec.scratch_dir, "funicular_overlap.log")))
+        times["overlap_script"] = dt
+        overlap = _read_tsv(joinpath(results, "overlap.tsv"))
+        if overlap === nothing
+            push!(notes, "overlap_tsv=missing")
+        else
+            for row in overlap
+                ratio = _tsv_float(row, "ratio")
+                copy_ms = _tsv_float(row, "copy_ms")
+                compute_ms = _tsv_float(row, "compute_ms")
+                serial_ms = _tsv_float(row, "serial_ms")
+                pipeline_ms = _tsv_float(row, "pipeline_ms")
+                any(isnothing, (ratio, copy_ms, compute_ms, pipeline_ms)) && continue
+                (copy_ms <= 0 || pipeline_ms <= 0) && continue
+                extras = ["source=script_overlap", "ratio=$(@sprintf("%.4g", ratio))",
+                          "bytes_sweep=$(OVERLAP_SWEEP_BYTES)",
+                          "copy_s=$(@sprintf("%.6g", copy_ms / 1e3))",
+                          "compute_s=$(@sprintf("%.6g", compute_ms / 1e3))",
+                          "pipeline_s=$(@sprintf("%.6g", pipeline_ms / 1e3))"]
+                serial_ms === nothing ||
+                    push!(extras, "serial_s=$(@sprintf("%.6g", serial_ms / 1e3))")
+                #=
+                `overlap_factor` is the share of the transfer the pipeline leaves
+                exposed, and it is only measurable where compute dominates: below
+                a ratio of one the sweep is bus-bound and `pipeline - compute` is
+                most of the copy no matter how well the schedule overlaps.
+                =#
+                if compute_ms >= copy_ms
+                    raw = (pipeline_ms - compute_ms) / copy_ms
+                    fraction = clamp(raw, OVERLAP_FLOOR, 1.0)
+                    push!(extras, "overlap=$(@sprintf("%.6g", fraction))")
+                    push!(extras, "overlap_raw=$(@sprintf("%.6g", raw))")
+                else
+                    push!(extras, "overlap_skipped=bus_bound")
+                end
+                push!(rows, panel_bus_row(cluster=spec.cluster, gpu_name=name,
+                                          device_total=device_total,
+                                          time_s=pipeline_ms / 1e3, extras=extras))
+            end
+        end
+    end
+
+    for row in rows
+        append_csv_row(spec.out_csv, row)
+    end
+    notes[1] = "N_bus_rows=$(length(rows))"
+    push!(notes, "free_vram_at_start=$(Int(free))")
+    times["total"] = sum(values(times); init=0.0)
+    length(rows) >= 2 ||
+        @warn "panel_bus produced fewer than two rows; pcie_rate will be a single point or absent"
+    return Measurement(times=times, headline="total", notes=notes)
+end
+
+# --------------------------------------------------------------------------- #
 # End-to-end stage points
 # --------------------------------------------------------------------------- #
 
@@ -586,7 +930,7 @@ tier submits the `stage_greens` point first and makes this depend on it.
 function point_mem_rsvd(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
-    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters)
+    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters, spec.seed)
     jld = joinpath(spec.scratch_dir, "$(file_prefix(smr)).jld")
     # A stale JLD makes `_generate_rsvd_sr` skip the work it is here to measure.
     isfile(jld) && rm(jld; force=true)
@@ -602,23 +946,133 @@ function point_mem_rsvd(spec::PointSpec)
                               "analytic_live_bytes=$(3 * N_u * c * 16)"])
 end
 
+"""
+    _plan_scratch_dir() -> Union{Nothing,String}
+
+Where `residency_plan` would put Funicular's spill files: node-local NVMe when
+Slurm gave us one. Duplicated here rather than reached into, so that the override
+path and the production path agree without `bench/` importing an internal.
+"""
+function _plan_scratch_dir()
+    haskey(ENV, "SLURM_TMPDIR") || return nothing
+    dir = joinpath(ENV["SLURM_TMPDIR"], "funicular")
+    mkpath(dir)
+    return dir
+end
+
+"""
+    _forced_plan(spec, env, N_u) -> Union{Nothing,Funicular.ResidencyPlan}
+
+The `plan_override` for `--force-path panel`, and `nothing` for `--force-path
+auto` (which leaves `src/rsvd.jl`'s `use_panel_path` predicate in charge).
+
+Forcing exists for trial E2. The parity check wants the in-memory and panel paths
+compared on the *same* card, and the predicate would never choose panel there:
+1 lambda at k = 1350 is a 12 GB sketch on a 40 GB A100. The alternative, running
+the panel half on a 3g.20gb slice where the predicate flips on its own, would
+confound the storage path with three eighths of the streaming multiprocessors, and
+the wall-clock ratio the trial is for would mean nothing.
+
+`--host-budget-GB` reconstructs the plan with a smaller host tier instead of
+taking it from Slurm, which forces the NVMe spill without a large `--mem`. Trial
+E3c does *not* use it: going through `--mem` exercises `residency_plan`'s own
+reading of `SLURM_MEM_PER_NODE`, which is the code the production sweep will run.
+"""
+function _forced_plan(spec::PointSpec, env, N_u::Int)
+    spec.force_path in ("auto", "panel") ||
+        error("--force-path must be auto or panel, got '$(spec.force_path)'")
+    spec.force_path == "panel" || return nothing
+    uses_gpu(spec) || error("--force-path panel needs a GPU")
+    workspace = gila_workspace_bytes(N_u)
+    spec.host_budget_GB > 0 || return residency_plan(env; workspace_bytes=workspace)
+    return Funicular.ResidencyPlan(
+        backend=Funicular.cuda_backend(),
+        device_budget=device_budget_bytes(),
+        host_budget=round(Int, spec.host_budget_GB * 2^30),
+        workspace_bytes=workspace,
+        scratch_dir=_plan_scratch_dir(),
+    )
+end
+
+"Whatever the run left in the JLD that describes the spectrum, for the row's notes."
+function _rsvd_output_notes(jld::AbstractString)
+    notes = String[]
+    isfile(jld) || return notes
+    try
+        jldopen(jld, "r") do io
+            for (key, label) in (("UR_asym/num_pos", "num_pos"),
+                                 ("UR_asym/seed", "out_seed"),
+                                 ("UR_asym/exact", "exact"),
+                                 ("UR_asym/vectors_file", "vectors_file"))
+                haskey(io, key) && push!(notes, "$label=$(io[key])")
+            end
+            if haskey(io, "UR_asym/D") && haskey(io, "UR_asym/num_pos")
+                total = length(io["UR_asym/D"])
+                total == 0 ||
+                    push!(notes,
+                          "positive_fraction=$(@sprintf("%.4g", io["UR_asym/num_pos"] / total))")
+            end
+        end
+    catch err
+        push!(notes, "output_read_failed=$(typeof(err))")
+    end
+    return notes
+end
+
 function point_stage_rsvd(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
-    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters)
+    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters, spec.seed)
     jld = joinpath(spec.scratch_dir, "$(file_prefix(smr)).jld")
+    vectors = ur_asym_vectors_path(env, smr)
+    if spec.fresh
+        # `_save_ur_asym` skips a complete output, and "complete" includes the h5
+        # the JLD names, so both have to go or the point measures a no-op.
+        rm(jld; force=true)
+        rm(vectors; force=true)
+    end
     before = isfile(jld) ? filesize(jld) : 0
-    _, dt = timed(() -> PhotonicSystemChannels._generate_rsvd_sr(env, smr, params);
-                  device_sync=true)
+
+    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    c = spec.rank + spec.oversamples
+    plan = _forced_plan(spec, env, N_u)
+    notes = ["N_u=$N_u", "sketch_width=$c", "seed=$(spec.seed)",
+             "force_path=$(spec.force_path)", "fresh=$(spec.fresh ? 1 : 0)",
+             "workspace_bytes=$(uses_gpu(spec) ? gila_workspace_bytes(N_u) : 0)",
+             "predicate_says_panel=$(uses_gpu(spec) && use_panel_path(N_u, spec.rank, env) ? 1 : 0)",
+             "slurm_mem_per_node_mb=$(get(ENV, "SLURM_MEM_PER_NODE", ""))",
+             "slurm_tmpdir=$(haskey(ENV, "SLURM_TMPDIR") ? 1 : 0)"]
+    uses_gpu(spec) && push!(notes, "device_budget=$(device_budget_bytes())")
+    plan === nothing || push!(notes, "plan_override=1")
+    spec.host_budget_GB > 0 &&
+        push!(notes, "host_budget_override_GB=$(@sprintf("%.6g", spec.host_budget_GB))")
+
+    _, dt = timed(() -> begin
+                      if plan === nothing
+                          PhotonicSystemChannels._generate_rsvd_sr(env, smr, params)
+                      else
+                          # `_generate_rsvd_sr` has no `plan_override` of its own,
+                          # so the two halves it calls are driven directly. Same
+                          # calls, same order, one extra keyword.
+                          PhotonicSystemChannels._save_ur_asym(env, smr, params;
+                                                               plan_override=plan)
+                          PhotonicSystemChannels._run_rsvdvals(env, smr, params, "RS/";
+                                                               plan_override=plan)
+                      end
+                  end; device_sync=true)
+
     written = (isfile(jld) ? filesize(jld) : 0) - before
+    isfile(vectors) && (written += filesize(vectors))
+    append!(notes, _rsvd_output_notes(jld))
+    push!(notes, "jld=$(jld)")
     return Measurement(times=Dict("stage" => dt), headline="stage",
-                       bytes_written=max(0, written))
+                       bytes_written=max(0, written), notes=notes)
 end
 
 function point_stage_bounds(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
-    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters)
+    params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters, spec.seed)
     result = nothing
     _, dt = timed(() -> (result = PhotonicSystemChannels._compute_bounds_sr(env, smr, params));
                   device_sync=true)
@@ -652,6 +1106,7 @@ const POINT_KINDS = Dict{String,Function}(
     "mem_rsvd" => point_mem_rsvd,
     "stage_rsvd" => point_stage_rsvd,
     "stage_bounds" => point_stage_bounds,
+    "panel_bus" => point_panel_bus,
 )
 
 function run_point(spec::PointSpec)

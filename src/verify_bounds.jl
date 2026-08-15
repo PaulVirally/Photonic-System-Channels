@@ -27,8 +27,8 @@ const VERIFY_MAX_PROBES = 512
 
 const VERIFY_CG_RTOL = 1e-8
 const VERIFY_CG_MAXITER = 1000
-const VERIFY_LANCZOS_KRYLOVDIM = 150
-const VERIFY_LANCZOS_MAXITER = 20
+const VERIFY_LANCZOS_KRYLOVDIM = 200
+const VERIFY_LANCZOS_MAXITER = 1000
 # Accept λ_min ≥ -VERIFY_FEAS_RTOL * λ_max as feasible
 const VERIFY_FEAS_RTOL = 1e-8
 # Number of times to double the multiplier floor if the basis α is infeasible.
@@ -100,9 +100,8 @@ function certify_index(n::Int, τ::Real, records, family, ss::AbstractMatrix,
     order = sortperm(basis_duals; rev=true)
     truncated = length(order) > VERIFY_MAX_PROBES
     if truncated
-        @warn string(now()) * " [verify_bounds::certify_index] n=$n has $(length(order)) probes; " *
-            "evaluating only the $(VERIFY_MAX_PROBES) with the largest basis duals. " *
-            "The certificate no longer covers every probe — treat it as evidence, not proof."
+        @warn string(now()) * " [verify_bounds::certify_index] n=$n has $(length(order)) probes. " *
+            "Evaluating only the $(VERIFY_MAX_PROBES) with the largest basis duals. "
         order = order[1:VERIFY_MAX_PROBES]
     end
 
@@ -124,7 +123,7 @@ function certify_index(n::Int, τ::Real, records, family, ss::AbstractMatrix,
         α_infeasible = α_floor
         α_floor *= 2
         @warn string(now()) * " [verify_bounds::certify_index] n=$n: basis multiplier is " *
-            "infeasible in the full space (λ_min = $(λ_min.value) < -$feas_tol) — the sketch " *
+            "infeasible in the full space (λ_min = $(λ_min.value) < -$feas_tol). The sketch " *
             "under-reported the feasibility threshold. Raising the multiplier floor to $α_floor"
         λ_min = lanczos_extreme(Mop(α_floor), x₀, :SR; tol=lanczos_tol)
     end
@@ -144,7 +143,7 @@ function certify_index(n::Int, τ::Real, records, family, ss::AbstractMatrix,
     end
     feasible || @warn string(now()) * " [verify_bounds::certify_index] n=$n: could not certify " *
         "dual feasibility (λ_min estimate $(λ_min.value), converged=$(λ_min.converged), " *
-        "residual $(λ_min.normres)); the full-space values below are not certificates"
+        "residual $(λ_min.normres)). The full-space values below are not certificates"
 
     # λ_min(M(α)) is non-decreasing in α (C ⪰ 0), so the value certified at
     # α_floor lower-bounds it for every evaluated probe; it converts each CG
@@ -282,9 +281,15 @@ function _verify_summary(smr::SMRSystem, result, per_index, rsvd_check, λC0, λ
 end
 
 function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
-    Random.seed!(0x0B0DD5) # reproducible Lanczos starts
+    Random.seed!(0xdeadbeef)
 
-    inputs = load_bounds_inputs(compute_env, smr)
+    # `panel_mode=false` because this job's full-space math wants one dense basis:
+    # it applies the operators column by column over the whole universe and it
+    # re-derives the probes `ss`, which the panel front end frees. The reader
+    # stages only the `N_u × num_pos` positive block; an h5 `vectors_file` is
+    # collected with `Matrix(Funicular.load(...))`, whose host-memory guard is
+    # what refuses a block too large to hold densely.
+    inputs = load_bounds_inputs(compute_env, smr; panel_mode=false)
     Γ, Vur_asym, Γrs = inputs.Γ, inputs.Vur_asym, inputs.Γrs
 
     χ = susceptibility(smr)
@@ -292,7 +297,7 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
 
     G₀_uu = load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver])
 
-    num_pos = count(Γ .> zero(eltype(Γ)))
+    num_pos = inputs.num_pos
     ns = verify_indices(num_pos)
     @info string(now()) * " [verify_bounds::_verify_bounds_sr] Verifying indices $ns of num_pos = $num_pos"
 
@@ -305,7 +310,10 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
         "$(result.basis_size) ≠ $num_pos")
 
     Γ_pos_cpu = Γ[1:num_pos]
-    gs_pos = Vur_asym[:, 1:num_pos]
+    # The reader already returns the positive block, so this aliases it instead of
+    # making a second N_u × num_pos copy. A caller that hands over a wider basis
+    # (the benchmark harness's synthetic spectra) still gets the slice.
+    gs_pos = size(Vur_asym, 2) == num_pos ? Vur_asym : Vur_asym[:, 1:num_pos]
     Γ_pos = similar(gs_pos, real(eltype(gs_pos)), num_pos) # in gs_pos's array space
     copyto!(Γ_pos, Γ_pos_cpu)
 

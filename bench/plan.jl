@@ -172,10 +172,51 @@ struct PlannedPoint
     time_s::Int
     gpu::Bool
     depends_on::Union{Nothing,String}   # label of a point that must finish first
+    #=
+    The three fields below exist for the `funicular` tier and are inert elsewhere.
+    Calibration proper always takes a whole GPU, since the point there is to
+    measure primitives on undivided hardware. The Funicular trials ask the
+    opposite kind of question, whether a *particular* allocation holds a
+    particular job, so the slice is part of the trial and cannot be defaulted.
+    =#
+    gpu_request::Union{Nothing,String}  # `--gpus` value; nothing means the whole GPU
+    predicted_s::Float64                # cost model's unpadded wall time, 0 if unknown
+    bill_fraction::Float64              # GPU-equivalents this allocation is billed as
 end
 
 PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu) =
-    PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu, nothing)
+    PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu, nothing, nothing, 0.0, 0.0)
+PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu, depends_on) =
+    PlannedPoint(label, kind, args, threads, host_GB, time_s, gpu, depends_on, nothing, 0.0, 0.0)
+
+"""
+    GPU_ALLOCATIONS
+
+Per cluster, the GPU allocations a planned point may name, as
+`name => (vram_GB, fraction, bundle_host_GB)`. `fraction` is the share of the
+card's streaming multiprocessors, which is both what stretches a slice's
+device-bound time and what the allocation is billed at. `bundle_host_GB` is the
+system RAM that comes with it, and asking for more is billed as though several
+slices had been taken.
+
+The same numbers as `choose_gpu`'s table in `create_jobs.jl`, and kept in step
+with it, but not shared: `create_jobs.jl` is not includable from here without
+dragging the whole package in.
+"""
+const GPU_ALLOCATIONS = Dict(
+    "narval" => Dict("a100_1g.5gb" => (vram_GB=5, fraction=1 / 8, bundle_host_GB=17),
+                     "a100_2g.10gb" => (vram_GB=10, fraction=2 / 8, bundle_host_GB=35),
+                     "a100_3g.20gb" => (vram_GB=20, fraction=3 / 8, bundle_host_GB=62),
+                     "a100" => (vram_GB=40, fraction=1.0, bundle_host_GB=124)),
+)
+
+function gpu_allocation(cluster::ClusterSpec, name::AbstractString)
+    table = get(GPU_ALLOCATIONS, cluster.name, nothing)
+    table === nothing && error("no GPU allocation table for cluster '$(cluster.name)'")
+    haskey(table, name) ||
+        error("'$name' is not a $(cluster.name) GPU allocation. Known: $(join(sort(collect(keys(table))), ", "))")
+    return table[name]
+end
 
 cells_arg(cells::NTuple{3,Int}) = join(cells, ",")
 rat(r::Rational{Int}) = "$(numerator(r))//$(denominator(r))"
@@ -200,7 +241,274 @@ function block_resources(cluster::ClusterSpec, body, separation::Rational{Int}, 
     return host_GB, time_s
 end
 
+# --------------------------------------------------------------------------- #
+# The `funicular` tier: trials E1-E4 of FUNICULAR_PLAN.md, workstream E
+# --------------------------------------------------------------------------- #
+
+#=
+This tier is not calibration in the sense the other four are. Those measure
+primitives on undivided hardware and let `create_jobs.jl` derate for a slice.
+These ask whether particular allocations hold particular jobs, so the allocation
+is part of the trial and every point names its own.
+
+Every trial is one separation. Separation does not affect cost except at contact
+(see the model's claims in bench/README.md), so one mid-sweep gap is as
+informative as thirty-three.
+
+Two conventions the trials depend on:
+
+  * `--fresh` on every RSVD point. `_save_ur_asym` skips a complete output, and a
+    trial that skipped its own work would report a startup time as a wall time.
+  * a private `--scratch` per RSVD point, so that the parity pair's two JLDs
+    survive side by side and each E4 bounds point reads the E3 output it is meant
+    to read rather than whichever ran last.
+=#
+
+const FUNICULAR_SEPARATION = 16 // 32
+const FUNICULAR_SCALE = 1 // 32
+const FUNICULAR_OVERSAMPLES = 50
+const FUNICULAR_POWER_ITERS = 14
+const FUNICULAR_K_PARITY = 1350     # the historical rank, for E2 and E4's back-comparison
+const FUNICULAR_K_PRODUCTION = 4000 # the rank the sweep is going to
+#=
+One seed for every trial. The panel path regenerates its Gaussian test matrix from
+it, so the E3 runs are reproducible and re-runnable. The in-memory path draws from
+the global RNG and ignores the seed, which is why E2's parity is to RSVD accuracy
+rather than bit-for-bit.
+=#
+const FUNICULAR_SEED = 20260814
+#=
+`--mem` for trial E3c, chosen so that the spill happens through production code
+rather than through a testing hook. `residency_plan` takes `SLURM_MEM_PER_NODE`
+and subtracts `HOST_OVERHEAD_RESERVE_BYTES` (6 GiB), so 66 GiB requested is a
+60 GiB host budget exactly. The 4 lambda panel peak is ~95 GiB, so the tier below
+has to take the difference and the NVMe path gets exercised end to end.
+=#
+const FUNICULAR_SPILL_MEM_GB = 66
+
+const FUNICULAR_BODIES = (
+    l1=(label="l1", cells=(32, 32, 32)),    # 1 lambda, N_u = 196,608
+    l2=(label="l2", cells=(64, 32, 32)),    # 2 lambda, N_u = 393,216
+    l4=(label="l4", cells=(128, 32, 32)),   # 4 lambda, N_u = 786,432
+)
+
+funicular_srpoint(body, rank::Int; threads::Int=4, fresh_preload::Bool=true) =
+    SRPoint(body.cells, body.cells; scale=FUNICULAR_SCALE,
+            separation=FUNICULAR_SEPARATION, rank=rank,
+            oversamples=FUNICULAR_OVERSAMPLES, power_iters=FUNICULAR_POWER_ITERS,
+            threads=threads, fresh_preload=fresh_preload)
+
+funicular_common(body, rank::Int) =
+    ["--cells", cells_arg(body.cells), "--scale", rat(FUNICULAR_SCALE),
+     "--chi", DEFAULT_CHI, "--sep", rat(FUNICULAR_SEPARATION),
+     "--rank", string(rank), "--oversamples", string(FUNICULAR_OVERSAMPLES),
+     "--power-iters", string(FUNICULAR_POWER_ITERS),
+     "--seed", string(FUNICULAR_SEED)]
+
+"""
+    funicular_billing(cluster, alloc, host_GB, threads) -> Float64
+
+GPU-equivalents this allocation is billed at: the largest of its share of the
+card, its share of the per-GPU RAM bundle, and its share of the core bundle. A
+slice's `bundle_host_GB` is by construction its share of the card, so it stands in
+for the GPU term.
+"""
+funicular_billing(cluster::ClusterSpec, alloc, host_GB::Real, threads::Int) =
+    max(alloc.bundle_host_GB / cluster.max_host_GB,
+        host_GB / cluster.max_host_GB,
+        threads / cluster.max_cores)
+
+"""
+    funicular_gpu_point(...) -> PlannedPoint
+
+One GPU trial, sized from the cost model on the allocation it names.
+
+`force_panel` passes `vram_capacity_bytes = 0` to `predict`, which makes
+`rsvd_mode` return `:panel` whatever the card is. That is the sizing counterpart
+of `bench/point.jl`'s `--force-path panel`. The trial is going to run the panel
+code on that allocation, so it has to be *sized* for the panel code; asking the
+model what the predicate would have chosen would give the in-memory answer for
+the very runs where the predicate is being overridden.
+
+Wall time stretches only the device-bound share, by the slice's SM fraction. The
+bus term and the writes do not get slower on a slice, and stretching them would
+invent time in the wrong direction, since a slower slice hides *more* of a
+transfer behind compute, not less.
+"""
+function funicular_gpu_point(cluster::ClusterSpec, label::AbstractString,
+                             kind::AbstractString, pt::SRPoint, args::Vector{String},
+                             alloc_name::AbstractString; job::JobKind,
+                             force_panel::Bool=false, depends_on=nothing,
+                             host_GB::Union{Nothing,Int}=nothing,
+                             time_factor::Real=2.5, threads::Int=4)
+    coeffs = coefficients_for(cluster.name)
+    alloc = gpu_allocation(cluster, alloc_name)
+    capacity = force_panel ? 0.0 : alloc.vram_GB * 2^30
+    p = predict(job, pt, coeffs; pad=false, vram_capacity_bytes=capacity)
+    wall = (p.time_s - p.device_time_s) + p.device_time_s / alloc.fraction
+    time_s = clamp(ceil(Int, time_factor * wall), 3600, 24 * 3600)
+    if time_s < time_factor * wall
+        # 24 h is a queue-behaviour ceiling, not a model output. Say when a point
+        # is sitting on it, because the margin over the prediction is then whatever
+        # the ceiling leaves rather than the factor asked for.
+        @info "$label is limit-bound at the 24 h ceiling" predicted_h=wall / 3600 margin=time_s / wall
+    end
+    threads = min(threads, cluster.max_cores)
+    hg = host_GB === nothing ?
+         clamp(ceil(Int, p.host_bytes / 2^30) + 8, 16, alloc.bundle_host_GB) :
+         host_GB
+    if hg > alloc.bundle_host_GB
+        @warn "$label asks for more RAM than $(alloc_name)'s bundle; it will be billed as more than one slice" host_GB=hg bundle=alloc.bundle_host_GB
+    end
+    if p.vram_floor_bytes > alloc.vram_GB * 2^30
+        @warn "$label's predicted device floor does not fit $(alloc_name)" floor_GB=p.vram_floor_bytes / 2^30 capacity_GB=alloc.vram_GB
+    end
+    return PlannedPoint(label, kind, args, threads, hg, time_s, true, depends_on,
+                        alloc_name, wall, funicular_billing(cluster, alloc, hg, threads))
+end
+
+function plan_funicular_points(cluster::ClusterSpec)
+    cluster.name == "narval" ||
+        error("the funicular tier is narval-only for now (workstream E); got '$(cluster.name)'")
+    coeffs = coefficients_for(cluster.name)
+    threads = min(4, cluster.max_cores)
+    points = PlannedPoint[]
+    scratch(name) = ["--scratch", "\$CAL_ROOT/funicular/$(name)"]
+
+    # ---- E1: the host link ------------------------------------------------
+    #=
+    A whole card, because the question is what the link does when nothing else is
+    on it, and because Funicular's own `overlap.jl` allocates a 2 GiB device
+    budget of its own on top of this process's pinned sweep.
+    =#
+    push!(points, PlannedPoint("e1_panelbus", "panel_bus",
+                               vcat(scratch("e1_panelbus"), ["--reps", "5"]),
+                               threads, 32, 3600, true, nothing, "a100", 0.0,
+                               funicular_billing(cluster, gpu_allocation(cluster, "a100"),
+                                                 32, threads)))
+
+    # ---- Green functions, one per geometry --------------------------------
+    #=
+    CPU jobs, and dependencies of everything below: no RSVD can start until the
+    (R, S) and (R, R) blocks for its geometry are in the shared preload directory.
+    They are separate jobs rather than a prologue inside each GPU job so that the
+    three geometries build concurrently and nothing burns GPU time on a host
+    quadrature loop.
+    =#
+    greens_label = Dict{Symbol,String}()
+    for (key, body) in pairs(FUNICULAR_BODIES)
+        pt = funicular_srpoint(body, FUNICULAR_K_PRODUCTION; threads=threads)
+        hg, ts = block_resources(cluster, (cells=body.cells, scale=FUNICULAR_SCALE,
+                                           rank=FUNICULAR_K_PRODUCTION),
+                                 FUNICULAR_SEPARATION, threads)
+        label = "fungreens_$(body.label)"
+        greens_label[key] = label
+        # No `--scratch`: `stage_greens` writes into the shared preload directory
+        # under `--root`, which is exactly what every RSVD point below then reads.
+        # `bill_fraction` is zero because a CPU job is billed against a CPU
+        # allocation; it costs core-hours, not GPU-equivalents.
+        push!(points, PlannedPoint(label, "stage_greens",
+                                   funicular_common(body, FUNICULAR_K_PRODUCTION),
+                                   threads, hg, ts, false, nothing, nothing,
+                                   predict(GenerateGreens, pt, coeffs; pad=false).time_s,
+                                   0.0))
+    end
+
+    # ---- E2: parity, in-memory against panel, on the same card ------------
+    l1 = FUNICULAR_BODIES.l1
+    parity_pt = funicular_srpoint(l1, FUNICULAR_K_PARITY; threads=threads)
+    for (tag, force) in (("inmem", false), ("panel", true))
+        args = vcat(funicular_common(l1, FUNICULAR_K_PARITY),
+                    scratch("e2_l1_$(tag)"), ["--fresh"],
+                    ["--force-path", force ? "panel" : "auto"])
+        push!(points, funicular_gpu_point(cluster, "e2_l1_$(tag)", "stage_rsvd",
+                                          parity_pt, args, "a100";
+                                          job=GenerateRSVD, force_panel=force,
+                                          depends_on=greens_label[:l1], threads=threads))
+    end
+
+    # ---- E3: the panel path at the production rank ------------------------
+    #=
+    E3d is not in the plan's table. E4 wants bounds at k = 4000 for 1 lambda and
+    the table's E3 rows only produce 2 and 4 lambda outputs, so the 1 lambda
+    k = 4000 RSVD has to exist somewhere; here is the cheapest place. At that rank
+    the predicate chooses the panel path on its own (the in-memory sketch is 38 GB
+    against a 3g.20gb slice's 20), so nothing is forced.
+    =#
+    l1_prod = funicular_srpoint(l1, FUNICULAR_K_PRODUCTION; threads=threads)
+    push!(points, funicular_gpu_point(cluster, "e3d_l1_k4000", "stage_rsvd", l1_prod,
+                                      vcat(funicular_common(l1, FUNICULAR_K_PRODUCTION),
+                                           scratch("e3d_l1_k4000"), ["--fresh"],
+                                           ["--force-path", "panel"]),
+                                      "a100_3g.20gb"; job=GenerateRSVD, force_panel=true,
+                                      depends_on=greens_label[:l1], threads=threads))
+
+    # E3a: the same 2 lambda job twice, once on the tight bundle and once on the
+    # whole card. Same `--mem` on both, so the only variable is the GPU.
+    l2 = FUNICULAR_BODIES.l2
+    l2_pt = funicular_srpoint(l2, FUNICULAR_K_PRODUCTION; threads=threads)
+    for (tag, alloc) in (("slice", "a100_3g.20gb"), ("full", "a100"))
+        push!(points, funicular_gpu_point(cluster, "e3a_l2_$(tag)", "stage_rsvd", l2_pt,
+                                          vcat(funicular_common(l2, FUNICULAR_K_PRODUCTION),
+                                               scratch("e3a_l2_$(tag)"), ["--fresh"],
+                                               ["--force-path", "panel"]),
+                                          alloc; job=GenerateRSVD, force_panel=true,
+                                          depends_on=greens_label[:l2],
+                                          host_GB=60, threads=threads))
+    end
+
+    # E3b: 4 lambda with room to spare, which is the run that measures the 102 GB
+    # peak against the 124.5 GB bundle. E3c: the same job on a 60 GiB host budget,
+    # which is under the ~95 GiB the two panel matrices want, so Funicular has to
+    # spill to node-local NVMe.
+    l4 = FUNICULAR_BODIES.l4
+    l4_pt = funicular_srpoint(l4, FUNICULAR_K_PRODUCTION; threads=threads)
+    push!(points, funicular_gpu_point(cluster, "e3b_l4_full", "stage_rsvd", l4_pt,
+                                      vcat(funicular_common(l4, FUNICULAR_K_PRODUCTION),
+                                           scratch("e3b_l4_full"), ["--fresh"],
+                                           ["--force-path", "panel"]),
+                                      "a100"; job=GenerateRSVD, force_panel=true,
+                                      depends_on=greens_label[:l4],
+                                      host_GB=118, threads=threads))
+    push!(points, funicular_gpu_point(cluster, "e3c_l4_spill", "stage_rsvd", l4_pt,
+                                      vcat(funicular_common(l4, FUNICULAR_K_PRODUCTION),
+                                           scratch("e3c_l4_spill"), ["--fresh"],
+                                           ["--force-path", "panel"]),
+                                      "a100"; job=GenerateRSVD, force_panel=true,
+                                      depends_on=greens_label[:l4],
+                                      host_GB=FUNICULAR_SPILL_MEM_GB,
+                                      # The model has no NVMe term, so its estimate
+                                      # for this run is the no-spill one. Give the
+                                      # limit room for the round trip through disk.
+                                      time_factor=4.0, threads=threads))
+
+    # ---- E4: bounds on the E3 outputs -------------------------------------
+    #=
+    Each bounds point reads the scratch directory its RSVD point wrote and depends
+    on it with `afterok`. The k = 1350 run reads the *panel* half of the parity
+    pair on purpose: it is the one that compares the panelized front-end against
+    the historical numbers in `data analysis/data`, so it has to be reading a
+    panel-path basis.
+    =#
+    for (label, body, rank, alloc, src, dep) in
+        (("e4_bounds_l1_k4000", l1, FUNICULAR_K_PRODUCTION, "a100_3g.20gb",
+          "e3d_l1_k4000", "e3d_l1_k4000"),
+         ("e4_bounds_l4_k4000", l4, FUNICULAR_K_PRODUCTION, "a100",
+          "e3b_l4_full", "e3b_l4_full"),
+         ("e4_bounds_l1_k1350", l1, FUNICULAR_K_PARITY, "a100_3g.20gb",
+          "e2_l1_panel", "e2_l1_panel"))
+        pt = funicular_srpoint(body, rank; threads=threads)
+        push!(points, funicular_gpu_point(cluster, label, "stage_bounds", pt,
+                                          vcat(funicular_common(body, rank), scratch(src)),
+                                          alloc; job=ComputeBounds, force_panel=true,
+                                          depends_on=dep, threads=threads))
+    end
+
+    return points
+end
+
 function plan_points(cluster::ClusterSpec, tier::Symbol)
+    tier == :funicular && return plan_funicular_points(cluster)
     quick = tier == :quick
     micro = tier in (:quick, :full)
     bodies = quick ? filter(b -> b.tier == :quick, BODIES) : BODIES
@@ -384,9 +692,15 @@ function point_command(cluster::ClusterSpec, point::PlannedPoint, tier::Symbol)
     # One CSV per point. Every point is a separate job appending to a shared
     # filesystem, and concurrent appends tear lines in half -- two narval rows were
     # lost that way. `merge_rows` at the end of the script stitches them together.
+    # Single quotes everywhere except where the value is meant to be expanded by
+    # the shell. The funicular tier's `--scratch` values are written against
+    # `$CAL_ROOT`, and a single-quoted `$CAL_ROOT` is a directory called
+    # `$CAL_ROOT`. Double quotes still keep the word together, which is what the
+    # quoting was for.
+    quote_arg(a) = startswith(a, "--") ? a : (occursin('$', a) ? "\"$a\"" : "'$a'")
     return join(vcat(["julia", "--project=.", "-t", string(point.threads),
                       "bench/point.jl", "--kind", point.kind],
-                     [startswith(a, "--") ? a : "'$a'" for a in point.args],
+                     [quote_arg(a) for a in point.args],
                      ["--gpu", point.gpu ? "0" : "-1",
                       "--root", "\$CAL_ROOT",
                       "--out", "\$ROWS/$(point.label).csv",
@@ -402,10 +716,19 @@ The `sbatch` lines that say how much of the machine to take.
 Calibration always takes a whole GPU, never a MIG slice: the whole point is to
 measure the primitives on undivided hardware, and `create_jobs.jl` then derates
 for a slice by its SM fraction.
+
+The `funicular` tier is the exception, and names its own allocation per point
+(`gpu_request`). Those trials do not measure primitives. They ask whether a given
+bundle holds a given job, so the bundle is the variable under test, and the answer
+for a whole card would not be an answer to that question.
 """
 function resource_lines(cluster::ClusterSpec, point::PlannedPoint)
     lines = "    --cpus-per-task=$(point.threads) \\\n    --mem=$(point.host_GB)G \\\n"
-    point.gpu && (lines *= "    --gpus=$(cluster.full_gpu) \\\n")
+    if point.gpu
+        request = point.gpu_request === nothing ? cluster.full_gpu :
+                  "$(point.gpu_request):1"
+        lines *= "    --gpus=$(request) \\\n"
+    end
     return lines
 end
 
@@ -432,6 +755,96 @@ function merge_block(cluster::ClusterSpec)
     """
 end
 
+"""
+    funicular_preamble(cluster)
+
+Everything the `funicular` tier needs said before the first `sbatch`, as comments
+in the generated script. Comments rather than commands: the login-node steps below
+need a human to read their output, since an `instantiate` that cannot reach github
+otherwise only surfaces three hours later on a compute node, and this script is
+submitted from the login node rather than run on it.
+"""
+function funicular_preamble(cluster::ClusterSpec)
+    return """
+    # ---------------------------------------------------------------------------
+    # Before submitting: three things, on the LOGIN node, in this order.
+    #
+    # 1. Instantiate. Compute nodes have no internet, and this tier is the first
+    #    thing here to need Funicular and HDF5, both of which come in by URL:
+    #
+    #      $(cluster.modules)
+    #      cd $(cluster.code_dir)
+    #      julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+    #      julia --project=. -e 'using PhotonicSystemChannels, Funicular, CUDA; println(pkgdir(Funicular))'
+    #
+    #    The last line is the one that matters for E1. It prints the depot path
+    #    whose `benchmark/` subdirectory holds `overlap.jl` and `pinned.jl`, which
+    #    is what `bench/point.jl` resolves through `pkgdir(Funicular)`.
+    #
+    # 2. Funicular's `benchmark/Project.toml` does NOT need instantiating. It
+    #    lists DelimitedFiles and Plots, and those are for `benchmark/plot.jl`
+    #    only. `overlap.jl` and `pinned.jl` need CUDA, Funicular and Printf, all of
+    #    which this project already has, so the E1 point runs them against the main
+    #    project environment. It copies the directory under the point's --scratch
+    #    first, because `benchmark/common.jl` writes its TSV results next to itself
+    #    and the depot is not ours to write into.
+    #
+    # 3. Check the slice names are still what this script asks for, since a name
+    #    the cluster does not define is a hard sbatch rejection:
+    #
+    #      sinfo -o "%G" | sort -u
+    #
+    # Trial E3c (`e3c_l4_spill`) spills to node-local NVMe through
+    # \$SLURM_TMPDIR. It asks for --mem=$(FUNICULAR_SPILL_MEM_GB)G specifically:
+    # `residency_plan` reads SLURM_MEM_PER_NODE and subtracts a 6 GiB overhead
+    # reserve, so that request is a 60 GiB host budget exactly, against a ~95 GiB
+    # panel peak. No --tmp is requested (narval GPU nodes carry NVMe and the flag
+    # is not universally accepted); if the job dies writing spill files, check that
+    # \$SLURM_TMPDIR has ~120 GB free on the node it landed on.
+    #
+    # The three E4 points need workstream C (the panelized bounds front-end in
+    # src/bounds.jl). They are written against the CLI that exists today, but at
+    # k = 4000 the old in-memory front-end would want an N_u x m basis as one
+    # CuArray, ~30 GB at 4 lambda, so submit them only once C has landed. The
+    # E1-E3 points do not depend on it; comment the E4 block out to run the rest.
+    # ---------------------------------------------------------------------------
+    """
+end
+
+"""
+    funicular_epilogue(cluster, points)
+
+What to run once the trials come back: the parity comparison E2 exists for, and
+the refit that turns E1's rows into `pcie_rate` and `overlap_factor`.
+"""
+function funicular_epilogue(cluster::ClusterSpec, points::Vector{PlannedPoint})
+    return """
+    echo
+    echo "When they have finished:"
+    echo
+    echo "  1. Trial E2's parity check (login node, no GPU needed). The two paths"
+    echo "     use different RNG mechanisms, so this reports the deviation of the"
+    echo "     top of the spectrum rather than asserting equality:"
+    echo
+    echo "     julia --project=. bench/compare_parity.jl \\\\"
+    echo "         --a \$CAL_ROOT/funicular/e2_l1_inmem/*.jld \\\\"
+    echo "         --b \$CAL_ROOT/funicular/e2_l1_panel/*.jld \\\\"
+    echo "         --label-a in-memory --label-b panel --rtol 1e-6"
+    echo
+    echo "  2. Merge the rows and copy them back:"
+    echo "     bash bench/launch_calibration_$(cluster.name)_funicular.sh --merge"
+    echo "     scp $(CC_UNAME)@$(cluster.name).alliancecan.ca:\$OUT bench/data/calibration_$(cluster.name)_funicular.csv"
+    echo
+    echo "  3. Refit. E1's panel_bus rows identify pcie_rate and overlap_factor;"
+    echo "     the E2/E3 stage_rsvd rows are what panel_host_mem_factor and"
+    echo "     panel_workspace_bytes have been waiting for:"
+    echo "     julia bench/fit.jl"
+    echo
+    echo "  4. Re-run create_jobs.jl and read its print_plan against the capacity"
+    echo "     table at the top of FUNICULAR_PLAN.md."
+    """
+end
+
 function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::Symbol)
     io = IOBuffer()
     println(io, """
@@ -445,13 +858,13 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
     #
     # Submit:  bash <this script>
     # Collect: bash <this script> --merge
-
+    $(tier == :funicular ? "\n" * funicular_preamble(cluster) : "")
     set -u
 
     CODE_DIR=$(cluster.code_dir)
     CAL_ROOT=$(cluster.cal_root)
-    ROWS=\$CAL_ROOT/rows
-    OUT=\$CAL_ROOT/calibration_$(cluster.name).csv
+    ROWS=\$CAL_ROOT/$(tier == :funicular ? "rows_funicular" : "rows")
+    OUT=\$CAL_ROOT/calibration_$(cluster.name)$(tier == :funicular ? "_funicular" : "").csv
 
     mkdir -p \$CAL_ROOT/logs \$CAL_ROOT/preload \$CAL_ROOT/project \$CAL_ROOT/scratch \$ROWS
     cd \$CODE_DIR
@@ -487,14 +900,22 @@ function slurm_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::
         """)
     end
 
-    println(io, """
+    # `print`, not `println`: the tier-specific tail below supplies the final
+    # newline, and splitting this block in two must not add one of its own.
+    print(io, """
     echo
     echo "All points submitted. Watch them with: squeue -u \\\$USER"
-    echo
-    echo "When they have finished, merge the per-point rows and copy the result back:"
-    echo "  bash bench/$(basename("launch_calibration_$(cluster.name)_$(tier).sh")) --merge"
-    echo "  scp $(CC_UNAME)@$(cluster.name).alliancecan.ca:\$OUT bench/data/"
     """)
+    if tier == :funicular
+        println(io, funicular_epilogue(cluster, points))
+    else
+        println(io, """
+        echo
+        echo "When they have finished, merge the per-point rows and copy the result back:"
+        echo "  bash bench/$(basename("launch_calibration_$(cluster.name)_$(tier).sh")) --merge"
+        echo "  scp $(CC_UNAME)@$(cluster.name).alliancecan.ca:\$OUT bench/data/"
+        """)
+    end
     return String(take!(io))
 end
 
@@ -549,16 +970,124 @@ function bash_script(cluster::ClusterSpec, points::Vector{PlannedPoint}, tier::S
     return String(take!(io))
 end
 
+"""
+    write_manifest(path, cluster, points, tier)
+
+The human-readable list of what is about to be submitted. Read it before
+submitting; it is the cheapest place to notice that a point is going to ask for
+something silly.
+
+Two schemas. The four calibration tiers keep the original columns
+
+    label,kind,threads,host_GB,time_limit_s,gpu,args
+
+where `gpu` is 0/1 (calibration always takes a whole GPU) and every geometry,
+rank and separation lives inside the quoted `args` string exactly as
+`bench/point.jl` will receive them. The `funicular` tier appends four columns
+
+    ...,gpu,gpu_request,depends_on,predicted_wall_s,predicted_gpu_h,args
+
+because three of its facts have nowhere else to go: which allocation the point
+names (the trials compare allocations, so 0/1 cannot say it), which point must
+finish first (the Green functions and the E4 chain), and what the cost model
+predicts, which is the number the trial is judged against. The extension is
+additive and only on this tier, so anything reading the older manifests keeps
+working.
+"""
 function write_manifest(path::AbstractString, cluster::ClusterSpec,
                        points::Vector{PlannedPoint}, tier::Symbol)
     open(path, "w") do io
-        println(io, "label,kind,threads,host_GB,time_limit_s,gpu,args")
-        for p in points
-            println(io, join([p.label, p.kind, p.threads, p.host_GB, p.time_s,
-                              p.gpu ? 1 : 0, "\"$(join(p.args, " "))\""], ","))
+        if tier == :funicular
+            println(io, "label,kind,threads,host_GB,time_limit_s,gpu,gpu_request," *
+                        "depends_on,predicted_wall_s,predicted_gpu_h,args")
+            for p in points
+                println(io, join([p.label, p.kind, p.threads, p.host_GB, p.time_s,
+                                  p.gpu ? 1 : 0,
+                                  p.gpu_request === nothing ? "" : p.gpu_request,
+                                  p.depends_on === nothing ? "" : p.depends_on,
+                                  @sprintf("%.0f", p.predicted_s),
+                                  @sprintf("%.3f", p.bill_fraction * p.predicted_s / 3600),
+                                  "\"$(join(p.args, " "))\""], ","))
+            end
+        else
+            println(io, "label,kind,threads,host_GB,time_limit_s,gpu,args")
+            for p in points
+                println(io, join([p.label, p.kind, p.threads, p.host_GB, p.time_s,
+                                  p.gpu ? 1 : 0, "\"$(join(p.args, " "))\""], ","))
+            end
         end
     end
     return path
+end
+
+"""
+    print_funicular_cost(cluster, points)
+
+The table the `funicular` tier is judged by before it is submitted: what each
+trial asks for, what the cost model thinks it will take, and what that costs in
+GPU-equivalent hours. The budget in FUNICULAR_PLAN.md is 30 GPU-hours, and this is
+printed so that a plan which has drifted past it gets noticed while the fix is
+still an edit rather than a cancelled job.
+
+Two totals, because they answer different questions. The predicted total is the
+model's unpadded estimate, that is, what the trials should actually cost. The
+total at the limits is what they would cost if every job ran to its wall clock,
+which is the number to compare against an allocation's remaining balance. The
+limits here are loose on purpose, since a trial killed mid-measurement wastes the
+whole trial.
+
+The E3c row's prediction is the known miss in this table. The cost model has no
+NVMe term, so it prices that run as though the host tier held everything. It will
+be slower, and by how much is the measurement.
+"""
+function print_funicular_cost(cluster::ClusterSpec, points::Vector{PlannedPoint})
+    println()
+    println("Predicted cost (cost model, unpadded; GPU-equivalents billed as the")
+    println("largest of the GPU, RAM and core shares of the per-GPU bundle):")
+    println()
+    @printf("  %-20s %-14s %5s %6s   %9s %9s %8s\n",
+            "point", "allocation", "cpus", "mem", "predicted", "limit", "GPU-h")
+    predicted_gpu_h = 0.0
+    limit_gpu_h = 0.0
+    for p in points
+        alloc = p.gpu ? (p.gpu_request === nothing ? cluster.full_gpu : p.gpu_request) : "cpu"
+        gpu_h = p.bill_fraction * p.predicted_s / 3600
+        predicted_gpu_h += gpu_h
+        limit_gpu_h += p.bill_fraction * p.time_s / 3600
+        @printf("  %-20s %-14s %5d %5dG   %8.2fh %8.2fh %8.2f\n",
+                p.label, alloc, p.threads, p.host_GB,
+                p.predicted_s / 3600, p.time_s / 3600, gpu_h)
+    end
+    println()
+    @printf("  predicted total   %6.1f GPU-hours over %d GPU jobs (+%d CPU jobs)\n",
+            predicted_gpu_h, count(p -> p.gpu, points), count(p -> !p.gpu, points))
+    @printf("  at the limits     %6.1f GPU-hours\n", limit_gpu_h)
+    #=
+    E1 has no cost-model prediction, since no SRPoint describes how fast the PCIe
+    link is, so its predicted hours read as zero and its limit is the real number.
+    Printed rather than fudged: an unexplained zero in a cost table is how a
+    budget gets believed.
+    =#
+    println("  (E1 has no cost-model prediction: no SRPoint describes a bus")
+    println("   benchmark, so it contributes 0 to the predicted total and its")
+    println("   1 h limit to the other. E3c's prediction omits the NVMe round")
+    println("   trip the trial exists to measure, so it will run over.)")
+    #=
+    The three E4 rows are most of this total, and they are sized at
+    NUM_POS_FRACTION = 0.6, which the cost model calls "deliberately pessimistic"
+    because bounds time grows as m^4. The existing outputs run 0.22-0.52. The
+    sensitivity is printed rather than left for the reader to work out, since it
+    decides whether this tier fits the budget.
+    =#
+    bounds_gpu_h = sum((p.bill_fraction * p.predicted_s / 3600
+                        for p in points if p.kind == "stage_bounds"); init=0.0)
+    @printf("  of which bounds   %6.1f GPU-hours, at NUM_POS_FRACTION = 0.6\n", bounds_gpu_h)
+    @printf("  tier total        %6.1f GPU-hours if num_pos comes back at 0.5k, the top\n",
+            predicted_gpu_h - bounds_gpu_h * (1 - (0.5 / 0.6)^4))
+    println("                    of the historically measured 0.22-0.52 range")
+    predicted_gpu_h <= 30 ||
+        @info "predicted past FUNICULAR_PLAN.md's 30 GPU-hour budget at the pessimistic num_pos; see the sensitivity line above" predicted_gpu_h
+    return nothing
 end
 
 # --------------------------------------------------------------------------- #
@@ -583,8 +1112,9 @@ function main(argv::Vector{String})
     cluster_name = get(opts, "cluster", "")
     isempty(cluster_name) && error("--cluster is required (fir, narval or molering)")
     tier = Symbol(get(opts, "tier", "quick"))
-    tier in (:quick, :full, :memory, :validate) ||
-        error("--tier must be quick, full, memory or validate")
+    tier in (:quick, :full, :memory, :validate, :funicular) ||
+        error("--tier must be quick, full, memory, validate or funicular")
+    dry_run = get(opts, "dry-run", "false") in ("true", "1", "yes")
 
     load_coefficients!(@__DIR__)
     cluster = ClusterSpec(cluster_name)
@@ -593,11 +1123,16 @@ function main(argv::Vector{String})
     script = cluster.has_slurm ? slurm_script(cluster, points, tier) :
              bash_script(cluster, points, tier)
     script_path = joinpath(@__DIR__, "launch_calibration_$(cluster_name)_$(tier).sh")
-    write(script_path, script)
-    chmod(script_path, 0o755)
-    manifest_path = write_manifest(joinpath(@__DIR__,
-                                            "manifest_$(cluster_name)_$(tier).csv"),
-                                   cluster, points, tier)
+    manifest_path = joinpath(@__DIR__, "manifest_$(cluster_name)_$(tier).csv")
+    if dry_run
+        # Plan and cost it, write nothing. Useful for reading the resource table
+        # before letting it overwrite a script that is already out on a cluster.
+        println("--dry-run: planned but wrote nothing\n")
+    else
+        write(script_path, script)
+        chmod(script_path, 0o755)
+        write_manifest(manifest_path, cluster, points, tier)
+    end
 
     gpu_points = count(p -> p.gpu, points)
     total_time = sum(p.time_s for p in points)
@@ -613,9 +1148,15 @@ function main(argv::Vector{String})
     for (kind, count) in sort(collect(by_kind))
         println("    ", rpad(kind, 16), count)
     end
+    tier == :funicular && print_funicular_cost(cluster, points)
     println()
-    println("Wrote $script_path")
-    println("Wrote $manifest_path")
+    if dry_run
+        println("Would write $script_path")
+        println("Would write $manifest_path")
+    else
+        println("Wrote $script_path")
+        println("Wrote $manifest_path")
+    end
     println()
     if cluster.has_slurm
         println("Copy and run:")

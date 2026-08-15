@@ -5,13 +5,14 @@ the model, the harness that measures the numbers it needs, and the fit that turn
 those measurements into per-cluster coefficients.
 
 ```
-cost_model.jl     the model: analytic work counts + fitted primitive costs
-plan.jl           generates the run script for one cluster and tier
-point.jl          runs one measurement and appends one CSV row
-measure.jl        peak RSS / peak VRAM / timing / CSV plumbing
-fit.jl            CSVs -> bench/coeffs_<cluster>.jl
-derive_coeffs.jl  conservative stopgap coefficients for an uncalibrated cluster
-data/             put the CSVs you bring back from the clusters here
+cost_model.jl      the model: analytic work counts + fitted primitive costs
+plan.jl            generates the run script for one cluster and tier
+point.jl           runs one measurement and appends one CSV row
+measure.jl         peak RSS / peak VRAM / timing / CSV plumbing
+fit.jl             CSVs -> bench/coeffs_<cluster>.jl
+derive_coeffs.jl   conservative stopgap coefficients for an uncalibrated cluster
+compare_parity.jl  compares two RSVD runs' spectra (trial E2)
+data/              put the CSVs you bring back from the clusters here
 ```
 
 ## Clusters
@@ -65,6 +66,7 @@ Three tiers, in this order:
 | `quick`    | primitives on the four smallest bodies                  | first; identifies every coefficient |
 | `full`     | the same primitives on every body, up to 128x32x32       | when you want the fit interpolating rather than extrapolating at your real sizes |
 | `validate` | end-to-end `greens -> rsvd -> bounds` chains             | after fitting, to check the model and set the padding factors |
+| `funicular` | the Funicular panel path on narval (workstream E)      | before the k=4000 sweep; see its own section below |
 
 `quick` is roughly 60 short jobs. `validate` is the expensive one: on molering,
 where there is no scheduler and points run one at a time, budget days.
@@ -150,6 +152,156 @@ narval rows were lost that way). Merge them before copying back:
 bash bench/launch_calibration_narval_quick.sh --merge
 ```
 
+## The `funicular` tier
+
+A fifth tier, narval-only, and not calibration in the sense the other four are.
+Those measure primitives on undivided hardware and let `create_jobs.jl` derate for
+a slice. These are workstream E of `FUNICULAR_PLAN.md`: eleven GPU trials asking
+whether particular allocations hold particular jobs on the Funicular panel path, so
+each point names its own allocation rather than taking a whole card.
+
+```bash
+julia bench/plan.jl --cluster narval --tier funicular            # write both files
+julia bench/plan.jl --cluster narval --tier funicular --dry-run  # cost it, write nothing
+```
+
+Every trial is one separation (`16//32`, which Julia normalises to `1//2`),
+`chi = 13.6+0.05im`, scale `1//32`, `p = 50`, `q = 14`, and one shared seed.
+
+| point | trial | allocation | what it pins down |
+|-------|-------|-----------|-------------------|
+| `e1_panelbus` | E1 | whole a100 | `pcie_rate`, `overlap_factor` |
+| `fungreens_l{1,2,4}` | (none) | cpu | the Green blocks everything else depends on |
+| `e2_l1_{inmem,panel}` | E2 | whole a100 | eigenvalue parity, wall-clock ratio, host/VRAM high-water, `panel_workspace_bytes`, the host overhead reserve |
+| `e3d_l1_k4000` | (added) | a100_3g.20gb | E4's 1 lambda input, and the 1 lambda production allocation |
+| `e3a_l2_{slice,full}` | E3a | a100_3g.20gb, a100 | whether the 62 GB bundle holds 51 GB + overhead |
+| `e3b_l4_full` | E3b | whole a100 | the 102 GB peak against the 124.5 GB bundle; measured positive fraction |
+| `e3c_l4_spill` | E3c | whole a100 + NVMe | the spill path end to end |
+| `e4_bounds_l{1,4}_k4000`, `e4_bounds_l1_k1350` | E4 | 3g.20gb / a100 / 3g.20gb | panelized front-end correctness and the `m^4` pencil constant |
+
+`e3d_l1_k4000` is not in the plan's table. E4 wants bounds at k = 4000 for 1 lambda
+and the table's E3 rows only produce 2 and 4 lambda outputs, so the 1 lambda
+k = 4000 RSVD has to exist somewhere.
+
+The tier does three things the other four do not.
+
+It forces the path. `bench/point.jl --force-path panel` builds a
+`Funicular.ResidencyPlan` and hands it to `_save_ur_asym` / `_run_rsvdvals` as
+`plan_override`, which is the one hook that bypasses `use_panel_path`. Trial E2
+needs it: the parity check compares the two storage paths, and at 1 lambda,
+k = 1350 the predicate would never choose panel on a 40 GB card. Running the panel
+half on a 3g.20gb slice instead, where the predicate does flip on its own, would
+confound the storage path with three eighths of the SMs, and the wall-clock ratio
+would mean nothing.
+
+It forces the host budget through Slurm rather than through a flag. Trial E3c asks
+for `--mem=66G` on purpose: `residency_plan` reads `SLURM_MEM_PER_NODE` and
+subtracts a 6 GiB overhead reserve, so that request is a 60 GiB host budget
+exactly, against a ~95 GiB panel peak at 4 lambda. There is no environment
+override in `src/`, and adding one would have meant E3c exercising a testing hook
+instead of the code the production sweep will run. `point.jl` does carry a
+`--host-budget-GB` override for debugging; the tier leaves it unset.
+
+Its manifest carries four extra columns. The four calibration tiers keep
+
+    label,kind,threads,host_GB,time_limit_s,gpu,args
+
+with every geometry, rank and separation inside the quoted `args`. `funicular`
+appends `gpu_request`, `depends_on`, `predicted_wall_s` and `predicted_gpu_h`
+before `args`, because three of its facts have nowhere else to go: which allocation
+the point names (0/1 cannot say it when the allocation is the variable under test),
+which point must finish first (the Green functions, and the E4 chain), and what the
+model predicts, which is the number the trial is judged against. The extension is
+additive and only on this tier.
+
+The tier also writes its rows to `$CAL_ROOT/rows_funicular` and merges them into
+`calibration_narval_funicular.csv` rather than sharing `rows/` with the other
+tiers. Otherwise `--merge` would sweep up an earlier quick run's rows and the fit
+would count them twice.
+
+### Trial E1 and the `panel_bus` rows
+
+`fit.jl`'s `fit_panel_bus` reads rows with `kind="panel_bus"`, taking `pcie_rate`
+from rows carrying `bytes=<moved>` in `extra` (paired with the row's `time_s`) and
+`overlap_factor` from rows carrying `overlap=<fraction>`. The point produces them
+from three sources:
+
+- an in-process pinned host-to-device sweep at four transfer sizes, through
+  Funicular's own `alloc_host_slab` / `h2d!` / `sync_queue`. Four sizes rather than
+  one, because `rate_through_origin` fits a slope through the origin and a single
+  point cannot tell a slope from a fixed per-transfer overhead;
+- Funicular's `benchmark/pinned.jl`. Its pageable comparison is recorded under
+  `bytes_pageable=` so it stays in the CSV without being fitted, since a pageable
+  copy is not the rate the panel path pays;
+- Funicular's `benchmark/overlap.jl`, one row per compute-to-copy ratio.
+  `overlap = (pipeline - compute) / copy`, recorded only where compute dominates:
+  below a ratio of one the sweep is bus-bound and that expression is most of the
+  copy however well the schedule overlaps. A ratio whose copies vanish entirely is
+  recorded at a floor of 0.05 with the raw value kept under `overlap_raw=`, because
+  `fit_panel_bus` rejects a zero and a zero would delete the term from the model.
+
+The scripts run as their own processes against the main project environment.
+Funicular's `benchmark/Project.toml` does not need instantiating: it lists
+DelimitedFiles and Plots, both for `benchmark/plot.jl` only, while `pinned.jl` and
+`overlap.jl` need CUDA, Funicular and Printf, which this project already has. The
+point copies the directory under its `--scratch` first, because
+`benchmark/common.jl` writes its TSV results next to itself and the depot is not
+ours to write into. It locates the source through `pkgdir(Funicular)`, so a
+re-pinned commit needs no edit here.
+
+### Trial E2 and the parity comparison
+
+```bash
+julia --project=. bench/compare_parity.jl \
+    --a $CAL_ROOT/funicular/e2_l1_inmem/<prefix>.jld \
+    --b $CAL_ROOT/funicular/e2_l1_panel/<prefix>.jld \
+    --label-a in-memory --label-b panel --rtol 1e-6
+```
+
+This is not an equality check, and it must not become one. The in-memory path takes
+its Gaussian sketch from Julia's global RNG, while the panel path has nowhere to
+keep one and regenerates blocks from an integer seed. Two panel runs at the same
+seed sketch identically; a panel run and an in-memory run never do, whatever seed
+either is given. It follows that the two spectra agree only to the accuracy of the
+randomized method, and the top of the spectrum is the only part where that accuracy
+is many digits. The tail is where the sketch's random subspace has not converged,
+and two different random subspaces have no reason to agree there.
+
+The verdict is therefore taken over the leading `--top-fraction` (default 10%) of
+the positive spectrum at `--rtol`, and everything below is reported rather than
+judged; `--strict` judges the whole positive block. Deviations come out two ways:
+per-element (`|a-b| / max(|a|,|b|)`, how many digits this eigenvalue agrees to) and
+scaled by the largest eigenvalue (whether the disagreement matters downstream). A
+`num_pos` difference between the two runs is called out separately, because it
+sizes every object the bounds job then builds. The script reads only JLD2, so it
+runs on a login node.
+
+### Budget
+
+`plan.jl` prints a per-point cost table for this tier. As planned it comes to 31.3
+GPU-equivalent hours predicted, 72 at the limits. The limits are loose on purpose,
+since a trial killed mid-measurement wastes the whole trial. Two caveats the table
+prints for itself: E1 has no cost-model prediction (no `SRPoint` describes a bus
+benchmark) so it contributes zero to the predicted total, and E3c's prediction
+omits the NVMe round trip the trial exists to measure.
+
+The three E4 points are 19.6 of those 31.3, because they are sized at
+`NUM_POS_FRACTION = 0.6` and bounds time grows as `m^4`. The existing outputs run
+0.22-0.52; at 0.5 the tier comes to 21.2 GPU-hours. The pessimistic figure is kept
+for the *limits*, since a bounds job killed at 24 h is a wasted day, and the
+sensitivity is printed so the budget is not read off the wrong number.
+
+The two k=4000 bounds points sit on the 24 h ceiling rather than the 2.5x margin
+the others get; `plan.jl` says so when it plans them.
+
+### Ordering
+
+E1 to E3 need only workstreams A and B. The three E4 points need workstream C, the
+panelized bounds front-end: they are written against the CLI that exists today, but
+at k = 4000 the old in-memory front-end would want the `N_u x m` basis as one
+`CuArray`, which is ~30 GB at 4 lambda. Submit them only once C has landed. The
+generated script says so, and commenting out the E4 block leaves the rest runnable.
+
 ## Running a single point by hand
 
 Useful when a point failed and you want to see why:
@@ -170,6 +322,7 @@ julia --project=. -t 4 bench/point.jl --kind g0_ext --cells 32,32,32 --scale 1//
 | `dense` | GPU | QR / gemm / eigh / geigh / svdvals / BLAS-1 at `(m, c)` |
 | `bounds_core` | GPU | the bounds kernel on a synthetic spectrum |
 | `stage_rsvd` / `stage_bounds` | GPU | the real jobs |
+| `panel_bus` | GPU | pinned host-link rate and pipeline overlap (trial E1) |
 
 The Green-block points build with `force_generate=true, save_to_disk=false`, so
 they measure construction rather than deserialisation and do not depend on what a

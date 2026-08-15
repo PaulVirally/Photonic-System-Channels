@@ -36,6 +36,29 @@ reading the code and the primitive costs are the only fitted quantities:
     Gram-Schmidt over length-`N_u` vectors, and `4m` self plus `4m` external
     Green matvecs.
 
+# Three storage paths
+
+The tall `N x c` matrices can live in three places, and which one they live in
+changes the model itself rather than only its constants:
+
+  * `:in_memory`, a device-resident `CuArray` sketch with a Householder QR and no
+    bus traffic. This is what the model above describes, and what every
+    prediction with `vram_capacity_bytes === nothing` returns.
+
+  * `:panel`, MatrixFreeRandomizedLinearAlgebra's Funicular path
+    (`ext/MFRLAFunicularExt.jl`). The sketch is a `PanelMatrix` cut into column
+    panels held in pinned host memory and streamed through staging buffers on
+    the device, the test matrix is a `GhostPanels` that costs nothing, and the
+    orthonormalization is CholeskyQR2 rather than a thin QR. Device memory stops
+    scaling with `c`, host memory starts to, and the bus becomes a cost term.
+
+  * `:dense_exact`, for `N_u <= DENSE_EXACT_MAX_N`: the operator is applied to
+    the identity and eigendecomposed exactly, with no sketch at all.
+
+`rsvd_mode` and `bounds_mode` pick between them from the card's capacity, using
+the same predicate the runtime uses (`uses_dense_path`, then `uses_panel_path`),
+so a prediction and the job it sizes agree on which code will run.
+
 Sizes are always driven by the cell count of **one body**. The separation
 between the bodies changes nothing about the cost except at contact. In
 particular, `union(sender, receiver)` -- the bounding box that includes the gap
@@ -55,6 +78,9 @@ export SRPoint, JobKind, GenerateGreens, GenerateRSVD, ComputeBounds
 export Coefficients, DEFAULT_COEFFICIENTS, coefficients_for, load_coefficients!
 export predict, predict_time_s, predict_host_bytes, predict_vram_bytes
 export greens_counts, rsvd_counts, bounds_counts
+export rsvd_panel_counts, rsvd_dense_counts, bounds_panel_counts
+export uses_panel_path, uses_dense_path, rsvd_mode, bounds_mode
+export panel_width, panel_staging_bytes
 export n_cells, vector_length, universe_length, sketch_width, is_contact
 export self_fourier_bytes, ext_fourier_bytes, block_build_peak_bytes
 export circulant_cells, fft_work
@@ -264,6 +290,24 @@ constant factor, so being off by 2x here is harmless as long as the *shape* in
 
 "Thin QR of a complex `m x c` matrix, including the explicit Q (geqrf + orgqr)."
 flops_qr(m::Real, c::Real) = 16 * (m * c^2 - c^3 / 3)
+
+"""
+    flops_cholqr2(m, c)
+
+CholeskyQR2 of a complex `m x c` matrix, which is how the panel path
+orthonormalizes instead of a thin QR (`Funicular.cholqr2!`, called from
+`panel_range_finder` in `ext/MFRLAFunicularExt.jl`).
+
+Two passes of `cholqr_pass!`, each a `gram` (`Y' Y`, `8 m c^2`) followed by an
+`rdiv_rows!` against the Cholesky factor (`8 m c^2` again), so `32 m c^2`. The
+`c x c` Cholesky inside each pass is dropped, as `flops_qr` drops its `c^3` term:
+`m >> c` everywhere this model is used. The work is all gemm, which is why the
+panel path rates it at `gemm_rate` and not at the lower `qr_rate`.
+"""
+flops_cholqr2(m::Real, c::Real) = 32 * m * c^2
+
+"Cholesky factorization of a complex `c x c` matrix (`c^3/3` complex MACs)."
+flops_cholesky(c::Real) = 8 * c^3 / 3
 "Complex gemm `(m x k) * (k x n)`."
 flops_gemm(m::Real, k::Real, n::Real) = 8 * m * k * n
 "Hermitian eigendecomposition of a `c x c` matrix."
@@ -331,9 +375,44 @@ and nothing else.
 - `*_mem_base`: fixed footprint of a process of that kind (Julia + CUDA +
   package images).
 
+# Funicular panel path
+- `panel_host_mem_factor`: multiplier on the analytic *host* byte count when the
+  tall matrices live in pinned host memory. Much smaller than
+  `rsvd_host_mem_factor` has to be, because the plan owns page-locked slabs and
+  hands out one block per panel, so the analytic count is what is actually
+  mapped. What is left over is slab doubling, the process baseline already being
+  in `rsvd_host_mem_base`.
+- `panel_workspace_bytes`: device memory the operator itself takes while it is
+  applied, held back from the panel buffer pool (Funicular's `workspace_bytes`).
+  `G0_ur_asym` is a `LinearMaps` composition and cannot carry the trait, so the
+  number has to be supplied: CUFFT plan work areas plus the composition's
+  per-apply `N_u`-vector temporaries. Trial E2 measures it. If it goes
+  unreported, the budget arithmetic hands the panel buffers memory the operator
+  will then take, and the device overflows mid-sweep.
+- `pcie_rate`: achievable pinned host-to-device bytes/s, one direction. Not the
+  link's nominal rate: it is what Funicular's own `benchmark/pinned.jl` measures
+  end to end (trial E1).
+- `overlap_factor`: fraction of the sweep traffic that is *not* hidden behind the
+  operator applies. Funicular stages `nbuffers` panels ahead, so where the apply
+  dominates most of the transfer disappears into it, and 0.15 says 85% hides. It
+  is a single number standing in for a pipeline, so it only means anything where
+  compute does dominate. That is the regime the panel path runs in, since it is
+  only chosen when the sketch is huge.
+
 # Padding
 - `time_pad`, `host_mem_pad`, `vram_pad`: safety factors applied by `predict`.
   Set these from the measured spread (see `bench/fit.jl`), not by taste.
+- `panel_host_mem_pad`: `host_mem_pad`'s replacement on the panel path. The two
+  are padding different uncertainties. `host_mem_pad` is the p95 of
+  measured/predicted host RSS over in-memory runs, where the analytic count is a
+  *floor* under a Julia heap the GC may not have swept, with JLD2's buffers on
+  top. On the panel path the count is slab arithmetic: Funicular preallocates
+  page-locked slabs and hands out one block per panel, and the positives-only
+  save never forms a host copy at all. Applying the in-memory p95 on top of the
+  already-tight `panel_host_mem_factor` would count the same margin twice, and at
+  4 λ, `k = 4000` that difference decides whether the job fits the 124.5 GB
+  single-card bundle. 1.05 covers what is left, that is, the slab allocator's
+  rounding and its doubling growth.
 """
 Base.@kwdef struct Coefficients
     name::String = "uncalibrated"
@@ -409,11 +488,29 @@ Base.@kwdef struct Coefficients
     bounds_vram_factor::Float64 = 2.0
     bounds_vram_base::Float64 = 3.0e9
 
+    #=
+    Panel-path coefficients. All four are uncalibrated defaults, replaced by
+    workstream E's funicular tier: E1 for the bus pair, E2/E3 for the two memory
+    numbers. They are `@kwdef` defaults rather than required fields so that every
+    `coeffs_<cluster>.jl` written before they existed still loads.
+
+    `panel_host_mem_factor` is close to 1 on purpose. The analytic host count on
+    this path is exact (two `N_u x c` panel matrices' worth of pinned slabs), so
+    the only slack is the slab allocator's doubling. On the in-memory path the
+    count is a floor under whatever CUDA.jl and the GC decided to hold.
+    =#
+    panel_host_mem_factor::Float64 = 1.1
+    panel_workspace_bytes::Float64 = 1.5e9
+    pcie_rate::Float64 = 20.0e9
+    overlap_factor::Float64 = 0.15
+
     time_pad::Float64 = 1.5
     # Small on purpose: the memory margin lives in `*_mem_factor`, which multiplies
     # an analytic count read off the allocations. This is only for run-to-run slop.
     host_mem_pad::Float64 = 1.15
     vram_pad::Float64 = 1.15
+    # Smaller still, and not fitted from the in-memory runs: see the field docs.
+    panel_host_mem_pad::Float64 = 1.05
 end
 
 thread_efficiency(coeffs::Coefficients, threads::Int) =
@@ -469,6 +566,202 @@ function load_coefficients!(dir::AbstractString=@__DIR__)
     end
     return loaded
 end
+
+# --------------------------------------------------------------------------- #
+# Which code path will run
+# --------------------------------------------------------------------------- #
+
+"""
+    DENSE_EXACT_MAX_N
+
+Universe length at or below which `src/rsvd.jl` skips the randomized
+factorization and computes the spectrum exactly: build dense `Asym(G0_ur)` by
+applying the operator to the identity, `eigen!` it on the device, save the
+positive prefix.
+
+12,288 covers the 1/4 λ cube (`N_u = 3,072`) with room to spare. It is a policy,
+not a threshold that falls out of anything. Past `N_u ~ k` the "rank" is the whole
+spectrum, so a rank-`k` sketch of a `3,072 x 3,072` operator at `k = 4,000`
+approximates nothing: it is a more expensive and less accurate way to compute a
+full eigendecomposition. Keep this in step with the constant in `src/rsvd.jl`.
+"""
+const DENSE_EXACT_MAX_N = 12_288
+
+"""
+    PANEL_PATH_DEVICE_FRACTION, PANEL_PATH_FLOOR_FACTOR
+
+The two constants in the path predicate, mirroring what `src/rsvd.jl` computes.
+
+`PANEL_PATH_DEVICE_FRACTION` is the plan's `device_budget` as a fraction of the
+card's total. Ten percent is held back for the driver and the pool's own
+bookkeeping, which is the reserve Funicular's residency page recommends, and it is
+why the budget is taken from `CUDA.total_memory()` rather than from
+`CUDA.free_memory()` (the latter under-reports once the pool holds cached blocks).
+
+`PANEL_PATH_FLOOR_FACTOR` is narval's fitted `vram_floor_factor`, that is, the
+*smallest* ratio of real device high-water to the analytic live-array count ever
+measured for this pipeline. It appears here rather than the request-sizing
+`rsvd_vram_factor` because the predicate asks a feasibility question, can the
+in-memory sketch be squeezed onto this card at all, and `vram_floor_factor` is the
+number that answers it. Pass a `Coefficients` to the three-argument form to use
+that cluster's fitted value instead of this default.
+"""
+const PANEL_PATH_DEVICE_FRACTION = 0.9
+const PANEL_PATH_FLOOR_FACTOR = 1.554
+
+"""
+    TARGET_PANEL_BYTES, PANEL_STAGING_BUFFERS
+
+Funicular's panel geometry, from `ResidencyPlan`'s defaults.
+
+`TARGET_PANEL_BYTES` is `target_panel_bytes = 2 GiB`. Left alone, the plan picks
+the widest panel whose staging buffers fit the device budget, capped here. Two
+gigabytes is the middle of the one-to-four-gigabyte range the design targets:
+wider panels use the bus better, but cost more device memory per buffer and give
+the pipeline a coarser unit of work to hide.
+
+`PANEL_STAGING_BUFFERS` is the plan's `nbuffers = 2` plus the one extra buffer the
+residency page lists for the operations that need a step beyond the sweep's own
+(`project`, which is a panel, and the in-place `rightmul!`, which is a row block).
+Three is therefore the count for a sweep that hits those, that is, the peak, which
+is what a memory request wants.
+"""
+const TARGET_PANEL_BYTES = 2^31
+const PANEL_STAGING_BUFFERS = 3
+
+"""
+    panel_width(N, c) -> Int
+
+Columns per panel that `Funicular.choose_panel_width` will land on for an
+`N x c` matrix: the widest panel of at most `TARGET_PANEL_BYTES`, at least one
+column, never more than the whole matrix.
+
+The real function also clamps against `device_budget / nbuffers`, which is the
+binding constraint on a small MIG slice. That is left out because the panel path
+is only selected when `N * c * 16` is enormous, and by then
+`TARGET_PANEL_BYTES / (N * 16)` is the smaller of the two. Funicular also evens
+the width out over the panel count it implies (a `k = 1000` matrix allowing
+`w = 999` is cut 500/500 rather than 999/1), which changes the ragged tail, not
+the staging-buffer size this is used for.
+"""
+panel_width(N::Integer, c::Integer; target_panel_bytes::Real=TARGET_PANEL_BYTES) =
+    clamp(fld(floor(Int, target_panel_bytes), max(N, 1) * BYTES_PER_COMPLEX), 1, c)
+
+"""
+    panel_staging_bytes(N, c; matrices=2)
+
+Device memory the staging buffers take for a sweep over `matrices` panel matrices
+of shape `N x c`: `PANEL_STAGING_BUFFERS` buffers per operand, each one panel.
+
+Two matrices is the peak for both jobs of interest here. The Hermitian power
+iteration's `panelmul!(Z, operator, Y)` and `gram(Q, Z)` each have two operands,
+and so does the bounds front-end's `rightmul!(ss, basis, T)`. This is the whole of
+the panel path's `c`-dependence on the device, and it does *not* grow with `c`:
+panels get more numerous, not larger.
+"""
+panel_staging_bytes(N::Integer, c::Integer; matrices::Integer=2) =
+    PANEL_STAGING_BUFFERS * matrices * N * panel_width(N, c) * BYTES_PER_COMPLEX
+
+"""
+    rsvd_operator_vram_bytes(pt)
+
+Device bytes the Green operators hold for the whole RSVD job, on every path:
+`G0_rs`'s external Fourier data plus `G0_rr` and the `Asym` copy `src/rsvd.jl`
+builds alongside it.
+"""
+rsvd_operator_vram_bytes(pt::SRPoint) =
+    ext_fourier_bytes(pt.receiver_cells, pt.sender_cells) +
+    2 * self_fourier_bytes(pt.receiver_cells)
+
+"""
+    rsvd_inmemory_live_bytes(pt)
+
+Live device bytes of the in-memory RSVD: the three `N_u x c` complex matrices the
+Hermitian range finder holds at once (`Omega`, `Q`, and `operator * Q`) plus the
+operators. This is both `rsvd_counts(pt).vram_bytes` and the quantity the path
+predicate tests, written once so the two cannot drift apart.
+"""
+rsvd_inmemory_live_bytes(pt::SRPoint) =
+    3 * universe_length(pt) * sketch_width(pt) * BYTES_PER_COMPLEX +
+    rsvd_operator_vram_bytes(pt)
+
+"""
+    uses_dense_path(pt) -> Bool
+
+Whether the universe is small enough for the dense-exact branch (`N_u <=
+DENSE_EXACT_MAX_N`). Independent of the card: at these sizes everything fits
+everywhere, and the reason to take this branch is accuracy, not memory.
+"""
+uses_dense_path(pt::SRPoint) = universe_length(pt) <= DENSE_EXACT_MAX_N
+
+"""
+    uses_panel_path(pt, vram_capacity_bytes; floor_factor=PANEL_PATH_FLOOR_FACTOR)
+    uses_panel_path(pt, vram_capacity_bytes, coeffs)
+
+Whether the RSVD will hand MatrixFreeRandomizedLinearAlgebra a Funicular
+`ResidencyPlan` instead of keeping the sketch on the device, that is, whether the
+in-memory sketch cannot be squeezed into `PANEL_PATH_DEVICE_FRACTION` of the card.
+
+One predicate, evaluated identically here and in `src/rsvd.jl`. The cost model is
+what sizes the SLURM request and picks the MIG slice, so guessing a different path
+than the job then takes gets the request wrong either way: a panel-path job given
+an in-memory VRAM request wastes a whole card, and an in-memory job given
+panel-path host memory dies at the first `Array`.
+
+`vram_capacity_bytes === nothing` means no card was named, and returns `false`.
+The in-memory path is the historical behaviour, and the one every existing caller
+and every fitted coefficient describes.
+
+Note, however, that this does *not* consult `uses_dense_path`. The runtime checks
+the dense branch first and never reaches the plan question for a tiny universe,
+and `rsvd_mode` reproduces that ordering. Keeping this function to the memory
+question alone makes it directly comparable with the line in `src/rsvd.jl`.
+"""
+function uses_panel_path(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real};
+                         floor_factor::Real=PANEL_PATH_FLOOR_FACTOR)
+    vram_capacity_bytes === nothing && return false
+    return floor_factor * rsvd_inmemory_live_bytes(pt) >
+           PANEL_PATH_DEVICE_FRACTION * vram_capacity_bytes
+end
+
+uses_panel_path(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real},
+                coeffs::Coefficients) =
+    uses_panel_path(pt, vram_capacity_bytes; floor_factor=coeffs.vram_floor_factor)
+
+"""
+    rsvd_mode(pt, vram_capacity_bytes[, coeffs]) -> Symbol
+    bounds_mode(pt, vram_capacity_bytes[, coeffs]) -> Symbol
+
+Which of `:in_memory`, `:panel`, `:dense_exact` the job will run, in the order the
+runtime tests them: dense-exact first (a tiny universe never wants a sketch), then
+the memory predicate.
+
+`bounds_mode` never returns `:dense_exact`. The bounds job has no dense-exact
+branch, and a universe small enough to trigger one has an `N_u x m` basis that
+fits on any card, which is the in-memory path already. It follows the *RSVD's*
+predicate rather than one of its own because the two jobs must agree: the bounds
+job reads what the RSVD wrote, and the RSVD's choice of path is what decides
+whether that is an h5 panel dataset or a dense JLD2 block.
+"""
+function rsvd_mode(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real};
+                   floor_factor::Real=PANEL_PATH_FLOOR_FACTOR)
+    vram_capacity_bytes === nothing && return :in_memory
+    uses_dense_path(pt) && return :dense_exact
+    uses_panel_path(pt, vram_capacity_bytes; floor_factor=floor_factor) && return :panel
+    return :in_memory
+end
+
+rsvd_mode(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real}, coeffs::Coefficients) =
+    rsvd_mode(pt, vram_capacity_bytes; floor_factor=coeffs.vram_floor_factor)
+
+function bounds_mode(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real};
+                     floor_factor::Real=PANEL_PATH_FLOOR_FACTOR)
+    mode = rsvd_mode(pt, vram_capacity_bytes; floor_factor=floor_factor)
+    return mode == :panel ? :panel : :in_memory
+end
+
+bounds_mode(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real}, coeffs::Coefficients) =
+    bounds_mode(pt, vram_capacity_bytes; floor_factor=coeffs.vram_floor_factor)
 
 # --------------------------------------------------------------------------- #
 # Job 1: GenerateGreens
@@ -602,6 +895,11 @@ what the previous estimator's `(2 + 2q)*(k + p)` accounted for.
 Dense work: `q + 1` thin QRs of `N_u x c` in the Hermitian range finder plus
 `2q + 2` of `N_r x c` in the SVD one, the `c x c` eigen/svd solves, and the
 `N x c x c` gemms.
+
+This is the in-memory path, with the sketch resident on the device. See
+`rsvd_panel_counts` for the Funicular panel path and `rsvd_dense_counts` for the
+dense-exact branch; `rsvd_mode` picks between the three. All three share the
+matvec counts above, which is why they are stated here only.
 """
 function rsvd_counts(pt::SRPoint)
     N_s = vector_length(pt.sender_cells)
@@ -628,11 +926,9 @@ function rsvd_counts(pt::SRPoint)
     solve_flops = flops_eigh(c_herm) + flops_svdvals(c_svd)
 
     # Peak device memory: the Hermitian range finder holds Omega, Q and the
-    # freshly applied operator*Q simultaneously, all N_u x c complex.
-    dense_vram = 3 * N_u * c_herm * BYTES_PER_COMPLEX
-    operator_vram = ext_fourier_bytes(pt.receiver_cells, pt.sender_cells) +
-                    2 * self_fourier_bytes(pt.receiver_cells) # G0_rr and its Asym copy
-    vram_bytes = dense_vram + operator_vram
+    # freshly applied operator*Q simultaneously, all N_u x c complex, plus the
+    # operators (G0_rs, G0_rr and its Asym copy).
+    vram_bytes = rsvd_inmemory_live_bytes(pt)
 
     # Host: `_save_reigen_hermitian` pulls the eigenvectors back with `Array(...)`
     # and JLD2 buffers them on the way out.
@@ -648,8 +944,185 @@ function rsvd_counts(pt::SRPoint)
             bytes_written=bytes_written)
 end
 
-"See `bounds_time_s` for why the device-bound part is reported separately."
-function rsvd_time_s(pt::SRPoint, c::Coefficients)
+"""
+    RSVD_PANEL_SWEEPS_PER_ITER, RSVD_PANEL_SWEEPS_START, RSVD_PANEL_SWEEPS_RESTRICT
+
+Sweeps, that is, traversals of an `N_u x c` panel matrix, in `reigen_hermitian`'s
+panel path, read off `panel_range_finder`, `panel_range_start` and
+`panel_restricted` in `ext/MFRLAFunicularExt.jl`. A `panelmul!` is one sweep, and
+a `cholqr2!` is four (two `cholqr_pass!`es, each a `gram` and an `rdiv_rows!`).
+
+  * start: `panelmul!(Y, operator, Omega)` then `cholqr2!(Y)`, so 1 + 4. `Omega`
+    is a `GhostPanels`, regenerated per column rather than stored or moved, so
+    the test matrix contributes no traffic at all.
+  * each power iteration: `panelmul!(Z, operator, Y)` then `cholqr2!(Z)`, 1 + 4.
+  * the reduced block: `panel_restricted` takes the two-sweep route
+    (`panelmul!(Z, operator, Q)` then `gram(Q, Z)`) whenever the host budget holds
+    a second `N_u x c` matrix, which on this pipeline it does by construction: the
+    host peak in `rsvd_panel_counts` *is* those two matrices.
+
+Left out: the final `rightmul!(V, Q, rotation)`, because the positives-only save
+runs with `factored=true` and forms only the `m` positive columns (workstream B5),
+and the `rsvdvals` side, whose sweeps are over the half-height `N_r x c_svd`
+matrices. Both are absorbed into `overlap_factor`, which is fitted against measured
+wall time, so an under-counted sweep makes the fitted factor larger. That is the
+right place for the error to land.
+"""
+const RSVD_PANEL_SWEEPS_PER_ITER = 5
+const RSVD_PANEL_SWEEPS_START = 5
+const RSVD_PANEL_SWEEPS_RESTRICT = 2
+
+"""
+    rsvd_panel_counts(pt) -> NamedTuple
+
+`rsvd_counts` for the Funicular panel path (`reigen_hermitian_panel` /
+`rsvdvals_panel` in `ext/MFRLAFunicularExt.jl`). Same algorithm, different storage,
+so the parts that count operator applications are *identical*: Funicular applies
+the operator column by column, a sketch of `c` columns still costs `c`
+applications per pass, and `mv_ext`/`mv_self` here are the same expressions as on
+the in-memory path.
+
+What changes:
+
+  * The thin QR becomes CholeskyQR2. `cholqr2!` can be computed one row block at a
+    time, which is what makes it panelizable at all. More flops
+    (`flops_cholqr2`), but all gemm, hence `gemm_rate`.
+  * Device memory stops scaling with `c`. Panels are never resident: the plan
+    allocates staging buffers once and reuses them, so the device holds
+    `panel_staging_bytes` plus the operator's own workspace plus the `c x c`
+    reduced block, and nothing that grows with the sketch.
+  * Host memory starts scaling with `c`: two `N_u x c` matrices at peak, `Y` and
+    the swapped `Z` of the Hermitian power iteration. Not three, since the test
+    matrix is a ghost, and not fewer, since `gram` and `cholqr2!` traverse *rows*
+    and so hold every panel of their matrix in host memory at once. That is the
+    floor Funicular's residency page calls out.
+  * The bus becomes a cost. `sweep_bytes` is the total traffic, upload plus
+    writeback, over every sweep in `RSVD_PANEL_SWEEPS_*`.
+  * The save shrinks. Only the positive-Γ columns are written (workstream B5),
+    streamed panel by panel to h5, so `bytes_written` is `m`-wide rather than
+    `k`-wide and no host-side `Array` of the eigenvectors is ever formed.
+"""
+function rsvd_panel_counts(pt::SRPoint)
+    N_s = vector_length(pt.sender_cells)
+    N_r = vector_length(pt.receiver_cells)
+    N_u = N_s + N_r
+    q = pt.power_iters
+
+    c_herm = sketch_width(pt)
+    c_svd = sketch_width(pt; clamp_to=min(N_r, N_s))
+
+    # Identical to the in-memory path: the panel path does the same applications.
+    herm_applications = c_herm * (q + 2)
+    mv_ext = 2 * herm_applications + c_svd * (2q + 2)
+    mv_self = herm_applications
+
+    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
+    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
+
+    cholqr_flops = (q + 1) * flops_cholqr2(N_u, c_herm) +
+                   (2q + 2) * flops_cholqr2(N_r, c_svd)
+    gemm_flops = 2 * flops_gemm(N_u, c_herm, c_herm) +       # gram(Q, Z) for B
+                 flops_gemm(N_u, c_herm, min(pt.rank, c_herm)) +  # rightmul! for the vectors
+                 flops_gemm(N_r, c_svd, c_svd)               # the svd side's reduction
+    solve_flops = flops_eigh(c_herm) + flops_svdvals(c_svd)
+
+    sweeps = RSVD_PANEL_SWEEPS_PER_ITER * q + RSVD_PANEL_SWEEPS_START +
+             RSVD_PANEL_SWEEPS_RESTRICT
+    sweep_bytes = sweeps * N_u * c_herm * BYTES_PER_COMPLEX * 2  # up and writeback
+
+    vram_bytes = panel_staging_bytes(N_u, c_herm) +
+                 rsvd_operator_vram_bytes(pt) +
+                 c_herm^2 * BYTES_PER_COMPLEX
+    host_panel_bytes = 2 * N_u * c_herm * BYTES_PER_COMPLEX
+    m = min(effective_num_pos(pt), c_herm)
+    bytes_written = N_u * m * BYTES_PER_COMPLEX +
+                    c_herm * BYTES_PER_COMPLEX + c_svd * BYTES_PER_COMPLEX
+
+    return (mv_ext=mv_ext, mv_self=mv_self,
+            ext_fft_work=mv_ext * fft_work(M_ext),
+            self_fft_work=mv_self * fft_work(M_self),
+            cholqr_flops=cholqr_flops, gemm_flops=gemm_flops,
+            solve_flops=solve_flops,
+            sketch_width_herm=c_herm, sketch_width_svd=c_svd,
+            panel_width=panel_width(N_u, c_herm), sweeps=sweeps,
+            sweep_bytes=sweep_bytes,
+            vram_bytes=vram_bytes, host_panel_bytes=host_panel_bytes,
+            num_saved=m, bytes_written=bytes_written)
+end
+
+"""
+    rsvd_dense_counts(pt) -> NamedTuple
+
+`rsvd_counts` for the dense-exact branch (workstream B6, `N_u <=
+DENSE_EXACT_MAX_N`): apply the operator to the identity, `eigen!` the result on the
+device, save the positive prefix, and get `RS/D` from dense `svdvals` of the same
+block.
+
+`N_u` applications, one column of the identity each, counted as one external and
+one self matvec per application. That is a simplification: a faithful count of
+`asym(iota_r G0_rs Pi_s) + iota_r Asym(G0_rr) Pi_r` is *two* external passes (the
+map and its adjoint) plus one self, and the dense `svdvals` adds `N_s` more
+external applications on top. At `N_u <= 12,288` the whole branch takes a minute
+or two either way, so the model keeps the simpler count.
+
+Memory is exact: three `N_u x N_u` complex matrices on the device (the operator,
+LAPACK / cuSOLVER's copy, the eigenvectors), one on the host.
+"""
+function rsvd_dense_counts(pt::SRPoint)
+    N_s = vector_length(pt.sender_cells)
+    N_r = vector_length(pt.receiver_cells)
+    N_u = N_s + N_r
+
+    mv_ext = N_u
+    mv_self = N_u
+    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
+    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
+
+    solve_flops = flops_eigh(N_u)
+    vram_bytes = 3 * N_u^2 * BYTES_PER_COMPLEX + rsvd_operator_vram_bytes(pt)
+    host_dense_bytes = N_u^2 * BYTES_PER_COMPLEX
+    m = min(effective_num_pos(pt), N_u)
+    bytes_written = N_u * m * BYTES_PER_COMPLEX
+
+    return (mv_ext=mv_ext, mv_self=mv_self,
+            ext_fft_work=mv_ext * fft_work(M_ext),
+            self_fft_work=mv_self * fft_work(M_self),
+            solve_flops=solve_flops,
+            vram_bytes=vram_bytes, host_dense_bytes=host_dense_bytes,
+            num_saved=m, bytes_written=bytes_written)
+end
+
+"""
+    rsvd_time_s(pt, c; vram_capacity_bytes=nothing) -> (total, device_bound)
+
+See `bounds_time_s` for why the device-bound part is reported separately.
+
+The bus term on the panel path is *not* device-bound. A MIG slice gets a fraction
+of the streaming multiprocessors, not a fraction of the PCIe link, so stretching
+the transfers by the slice fraction would invent time that does not exist, and in
+the wrong direction: a slower slice hides *more* of the transfer behind compute,
+not less.
+"""
+function rsvd_time_s(pt::SRPoint, c::Coefficients;
+                     vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+    if mode == :dense_exact
+        n = rsvd_dense_counts(pt)
+        device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
+        device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+        device += n.solve_flops / c.eigh_rate
+        host = n.bytes_written / c.disk_write_rate + c.gpu_startup_s
+        return (host + device, device)
+    elseif mode == :panel
+        n = rsvd_panel_counts(pt)
+        device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
+        device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+        device += n.cholqr_flops / c.gemm_rate + n.gemm_flops / c.gemm_rate
+        device += n.solve_flops / c.eigh_rate
+        host = n.sweep_bytes / c.pcie_rate * c.overlap_factor
+        host += n.bytes_written / c.disk_write_rate + c.gpu_startup_s
+        return (host + device, device)
+    end
     n = rsvd_counts(pt)
     device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
     device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
@@ -659,23 +1132,83 @@ function rsvd_time_s(pt::SRPoint, c::Coefficients)
     return (host + device, device)
 end
 
-rsvd_vram_bytes(pt::SRPoint, c::Coefficients) =
-    c.rsvd_vram_factor * rsvd_counts(pt).vram_bytes + c.rsvd_vram_base
+"""
+    rsvd_vram_bytes(pt, c; vram_capacity_bytes=nothing)
+
+Device memory to request. On the in-memory and dense-exact paths this is
+`rsvd_vram_factor` times the analytic live count: both hold plain `CuArray`s, so
+the real high-water is whatever CUDA.jl's pool grew to while holding garbage Julia
+had not collected, and the fitted factor is the measured size of that.
+
+On the panel path the factor is dropped, because the elasticity it models is gone.
+Funicular allocates its staging buffers once, at plan construction, and *nothing
+inside a sweep loop allocates device memory*. The analytic count is therefore the
+demand and the high-water at once, which is why `rsvd_vram_floor_bytes` returns
+the same number for that path.
+"""
+function rsvd_vram_bytes(pt::SRPoint, c::Coefficients;
+                         vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+    mode == :panel &&
+        return rsvd_panel_counts(pt).vram_bytes + c.panel_workspace_bytes + c.rsvd_vram_base
+    counts = mode == :dense_exact ? rsvd_dense_counts(pt) : rsvd_counts(pt)
+    return c.rsvd_vram_factor * counts.vram_bytes + c.rsvd_vram_base
+end
 
 """
-    rsvd_vram_floor_bytes(pt, c), bounds_vram_floor_bytes(pt, c)
+    rsvd_vram_floor_bytes(pt, c; vram_capacity_bytes=nothing)
+    bounds_vram_floor_bytes(pt, c; vram_capacity_bytes=nothing)
 
 Least device memory the job can be squeezed into, as opposed to what it will use
 if given room. Compare *this* against a card's capacity to decide whether the job
 can run there; see `vram_floor_factor`.
-"""
-rsvd_vram_floor_bytes(pt::SRPoint, c::Coefficients) =
-    c.vram_floor_factor * rsvd_counts(pt).vram_bytes + c.rsvd_vram_base
-bounds_vram_floor_bytes(pt::SRPoint, c::Coefficients) =
-    c.vram_floor_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
 
-rsvd_host_bytes(pt::SRPoint, c::Coefficients) =
-    c.rsvd_host_mem_factor * rsvd_counts(pt).host_dense_bytes + c.rsvd_host_mem_base
+On the panel path the floor and the request coincide. Preallocated staging buffers
+have no slack to squeeze out, so there is no smaller configuration to fall back
+to; the only way down is a narrower panel, and `panel_width` already reports what
+Funicular will choose.
+"""
+function rsvd_vram_floor_bytes(pt::SRPoint, c::Coefficients;
+                               vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+    mode == :panel &&
+        return rsvd_panel_counts(pt).vram_bytes + c.panel_workspace_bytes + c.rsvd_vram_base
+    counts = mode == :dense_exact ? rsvd_dense_counts(pt) : rsvd_counts(pt)
+    return c.vram_floor_factor * counts.vram_bytes + c.rsvd_vram_base
+end
+
+function bounds_vram_floor_bytes(pt::SRPoint, c::Coefficients;
+                                 vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
+        return bounds_panel_counts(pt).vram_bytes + c.panel_workspace_bytes +
+               c.bounds_vram_base
+    return c.vram_floor_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
+end
+
+"""
+    rsvd_host_bytes(pt, c; vram_capacity_bytes=nothing)
+
+Host memory to request.
+
+The in-memory and dense-exact paths pull the result back with `Array(...)` and let
+JLD2 buffer it on the way out, so the count is that one block and the fitted
+`rsvd_host_mem_factor` covers the buffering.
+
+The panel path has no such block: the positives-only save streams panels straight
+to h5 (workstream B5), never materializing the eigenvectors. What it has instead
+is the two pinned `N_u x c` matrices of the power iteration, which dominate the
+`k`-wide block they replace by a wide margin. At 4 λ and `c = 4050` they are 102
+GB against 50 GB, so the old term is dropped rather than added to.
+"""
+function rsvd_host_bytes(pt::SRPoint, c::Coefficients;
+                         vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+    mode == :panel &&
+        return c.panel_host_mem_factor * rsvd_panel_counts(pt).host_panel_bytes +
+               c.rsvd_host_mem_base
+    counts = mode == :dense_exact ? rsvd_dense_counts(pt) : rsvd_counts(pt)
+    return c.rsvd_host_mem_factor * counts.host_dense_bytes + c.rsvd_host_mem_base
+end
 
 # --------------------------------------------------------------------------- #
 # Job 3: ComputeBounds
@@ -761,7 +1294,100 @@ function bounds_counts(pt::SRPoint)
 end
 
 """
-    bounds_time_s(pt, c) -> (total, device_bound)
+    BOUNDS_PANEL_SWEEPS
+
+Sweeps in the panelized reverse Gram-Schmidt (workstream C2): one `gram` for
+`G = basis' basis`, then one `rightmul!` for `ss = basis * T` once the reversed
+permutation, Cholesky and triangular inverse of `G` have been done on the host at
+`m x m`. Two, where the in-memory version is an `O(m^2)` loop of BLAS-1 pairs.
+
+The blocked form is only legitimate because the basis is RSVD output and hence
+near-orthonormal, so `G` is close to the identity and the squared conditioning of
+the Cholesky route costs nothing. On a general basis it would not be.
+"""
+const BOUNDS_PANEL_SWEEPS = 2
+
+"""
+    bounds_panel_counts(pt) -> NamedTuple
+
+`bounds_counts` for the panel path. Everything downstream of the `m x m` reduction
+is untouched: the pencil stage works on `m x m` objects, about 1.7 GB on the
+device at `m = 2400`, and never wanted panels. Only the `N_u`-scale front end
+changes.
+
+  * Reverse Gram-Schmidt becomes two sweeps (see `BOUNDS_PANEL_SWEEPS`). The
+    `O(m^2)` BLAS-1 term disappears, and with it the launch-latency term that
+    dominated it. `gs_gemm_flops` is two `N_u x m x m` gemms, `gs_sweep_bytes` is
+    the traffic to feed them, and `gs_cholesky_flops` is the host-side `m x m`
+    factorization between them.
+  * Host memory holds three `N_u x m` matrices: the basis loaded from the h5
+    panel dataset, the orthonormalized `ss`, and one working matrix for the
+    projections. Row sweeps (`gram`, `rightmul!`) hold every panel of their matrix
+    at once, so this is a floor, not an average.
+  * Device memory is staging buffers plus the pencil arena. The `(3k + 2m) * N_u`
+    tall term of the in-memory count is gone, leaving the cached grid whiteners,
+    the working whitener and eigenvectors, and the projected `m x m` blocks, that
+    is, the `(2 * TAU_GRID_POINTS + 8) * m^2` term, unchanged. The operator's own
+    device workspace is charged on top of this count by `bounds_vram_bytes`, since
+    it is a coefficient rather than something countable from the code.
+  * The read shrinks to the `m` positive vectors, which is all that was saved.
+
+The `m` applications of `C` and their `4m` self plus `4m` external Green matvecs
+are unchanged: `panelmul!` applies the operator column by column, exactly as the
+resident path does.
+"""
+function bounds_panel_counts(pt::SRPoint)
+    N_u = universe_length(pt)
+    m = min(effective_num_pos(pt), N_u)
+    evals_per_index = TAU_GRID_POINTS + TAU_REFINE_EVALS
+    probes = evals_per_index * m * (m + 1) / 2
+
+    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
+    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
+    mv_ext = 4 * m
+    mv_self = 4 * m
+
+    # The panelized front end: one gram sweep, an m x m host Cholesky, one
+    # rightmul! sweep. Bytes are counted up and back for each sweep.
+    gs_gemm_flops = 2 * flops_gemm(N_u, m, m)
+    gs_sweep_bytes = BOUNDS_PANEL_SWEEPS * N_u * m * BYTES_PER_COMPLEX * 2
+    gs_cholesky_flops = flops_cholesky(m)
+
+    gemm_flops = flops_gemm(m, N_u, m) +            # ss_basis
+                 2 * m * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
+                 flops_gemm(m, N_u, m) +            # basis' * (C basis)
+                 flops_gemm(m, N_u, m)              # D: Bs' Bs on the sender rows
+    whitenings = TAU_GRID_POINTS + m * TAU_REFINE_EVALS
+    pencil_eigh_flops = (whitenings + m * evals_per_index) * flops_eigh(m)
+    pencil_gemm_flops = 2 * m * evals_per_index * flops_gemm(m, m, m)
+    probe_gemv_flops = probes * flops_gemm(m, m, 1)
+    root_work = probes * m
+
+    vram_bytes = panel_staging_bytes(N_u, m) +
+                 (2 * TAU_GRID_POINTS + 8) * m^2 * BYTES_PER_COMPLEX +
+                 2 * self_fourier_bytes(pt.receiver_cells) +
+                 2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
+    host_bytes = 3 * N_u * m * BYTES_PER_COMPLEX
+    bytes_read = N_u * m * BYTES_PER_COMPLEX
+
+    return (num_pos=m,
+            gs_gemm_flops=gs_gemm_flops, gs_sweep_bytes=gs_sweep_bytes,
+            gs_cholesky_flops=gs_cholesky_flops,
+            mv_ext=mv_ext, mv_self=mv_self,
+            ext_fft_work=mv_ext * fft_work(M_ext),
+            self_fft_work=mv_self * fft_work(M_self),
+            gemm_flops=gemm_flops,
+            pencil_eigh_flops=pencil_eigh_flops,
+            pencil_gemm_flops=pencil_gemm_flops,
+            probe_gemv_flops=probe_gemv_flops, probes=probes,
+            root_work=root_work,
+            panel_width=panel_width(N_u, m),
+            vram_bytes=vram_bytes, host_bytes=host_bytes,
+            bytes_read=bytes_read)
+end
+
+"""
+    bounds_time_s(pt, c; vram_capacity_bytes=nothing) -> (total, device_bound)
 
 Total predicted seconds, and how many of them are actually device throughput.
 
@@ -771,8 +1397,27 @@ The pencil eigendecompositions and gemms run on the device (heevd/CUBLAS) and
 stretch; the per-probe Brent root finds are single-threaded host Julia with the
 GPU idle, and scaling them by the slice fraction would over-request on exactly
 the small-body sweeps that are otherwise cheap enough to fit in a slice.
+
+The panel path adds two more terms to the host bucket for the same reason: the
+front end's sweep traffic (PCIe, not SMs) and its `m x m` Cholesky, which
+workstream C2 does on the host between the two sweeps.
 """
-function bounds_time_s(pt::SRPoint, c::Coefficients)
+function bounds_time_s(pt::SRPoint, c::Coefficients;
+                       vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    if bounds_mode(pt, vram_capacity_bytes, c) == :panel
+        n = bounds_panel_counts(pt)
+        device = n.gs_gemm_flops / c.gemm_rate
+        device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
+        device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+        device += n.gemm_flops / c.gemm_rate
+        device += n.pencil_eigh_flops / c.eigh_rate
+        device += (n.pencil_gemm_flops + n.probe_gemv_flops) / c.gemm_rate
+        host = n.gs_sweep_bytes / c.pcie_rate * c.overlap_factor
+        host += n.gs_cholesky_flops / c.eigh_rate
+        host += n.probes * c.sync_latency + n.root_work * c.host_root_find
+        host += n.bytes_read / c.disk_read_rate + c.gpu_startup_s
+        return (host + device, device)
+    end
     n = bounds_counts(pt)
     device = n.gs_bytes / c.bandwidth + n.gs_launches * c.launch_latency
     device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
@@ -787,59 +1432,117 @@ function bounds_time_s(pt::SRPoint, c::Coefficients)
     return (host + device, device)
 end
 
-bounds_vram_bytes(pt::SRPoint, c::Coefficients) =
-    c.bounds_vram_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
+"""
+    bounds_vram_bytes(pt, c; vram_capacity_bytes=nothing)
+    bounds_host_bytes(pt, c; vram_capacity_bytes=nothing)
 
-bounds_host_bytes(pt::SRPoint, c::Coefficients) =
-    c.bounds_host_mem_factor * bounds_counts(pt).host_bytes + c.bounds_host_mem_base
+As for the RSVD: the panel path's device count is preallocated and so is taken
+without `bounds_vram_factor`, while its host count is Funicular's pinned slabs and
+so is taken with the tight `panel_host_mem_factor` rather than the in-memory
+`bounds_host_mem_factor` (which has to cover a `CuArray(...)` staging copy and
+JLD2's buffering that this path does not make).
+
+`panel_workspace_bytes` is charged here too, for the same reason it is charged to
+the RSVD. The bounds front end drives the *same* `LinearMaps` composition through
+`panelmul!` for the `m` applications of `C`, so the operator's device workspace,
+that is, CUFFT plan work areas plus the composition's per-apply `N_u`-vector
+temporaries, is just as real on this side and just as invisible to the plan's own
+arithmetic unless it is declared.
+"""
+function bounds_vram_bytes(pt::SRPoint, c::Coefficients;
+                           vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
+        return bounds_panel_counts(pt).vram_bytes + c.panel_workspace_bytes +
+               c.bounds_vram_base
+    return c.bounds_vram_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
+end
+
+function bounds_host_bytes(pt::SRPoint, c::Coefficients;
+                           vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
+        return c.panel_host_mem_factor * bounds_panel_counts(pt).host_bytes +
+               c.bounds_host_mem_base
+    return c.bounds_host_mem_factor * bounds_counts(pt).host_bytes + c.bounds_host_mem_base
+end
 
 # --------------------------------------------------------------------------- #
 # Public prediction API
 # --------------------------------------------------------------------------- #
 
 """
-    predict(job, pt, coeffs; pad=true) -> NamedTuple
+    predict(job, pt, coeffs; pad=true, vram_capacity_bytes=nothing) -> NamedTuple
 
 Predicted `(time_s, host_bytes, vram_bytes)` for one job on one point.
 `vram_bytes` is zero for the CPU-only Green-function job. With `pad=true` the
 coefficient set's safety factors are applied, plus the flat
 `RECOMPILE_OVERHEAD_S` on the time (added after `time_pad`, and left out of
 `device_time_s` so MIG-slice stretching never multiplies it).
+
+`vram_capacity_bytes` is the total memory of the card (or MIG slice) the job would
+run on, which is what decides between the in-memory, panel and dense-exact paths
+(see `rsvd_mode`). Leaving it `nothing`, the default, predicts the in-memory path
+unconditionally, which is what every caller written before the Funicular
+integration means and what every fitted coefficient was calibrated against. Pass
+it once the allocation is known. Note, however, that the choice is circular: the
+prediction sizes the request, the request picks the card, and the card picks the
+path. A caller sizing a job should evaluate candidate cards and take the first
+that fits rather than expect one pass to settle it.
 """
 function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_for("molering");
-                 pad::Bool=true)
+                 pad::Bool=true, vram_capacity_bytes::Union{Nothing,Real}=nothing)
     if job == GenerateGreens
-        # CPU-only job: no device-bound share to stretch for a GPU slice.
+        # CPU-only job: no device-bound share to stretch for a GPU slice, and no
+        # card, so `vram_capacity_bytes` has nothing to select.
+        mode = :host
         t, device_t = greens_time_s(pt, coeffs), 0.0
         host, vram, floor = greens_host_bytes(pt, coeffs), 0.0, 0.0
     elseif job == GenerateRSVD
-        t, device_t = rsvd_time_s(pt, coeffs)
-        host, vram = rsvd_host_bytes(pt, coeffs), rsvd_vram_bytes(pt, coeffs)
-        floor = rsvd_vram_floor_bytes(pt, coeffs)
+        mode = rsvd_mode(pt, vram_capacity_bytes, coeffs)
+        t, device_t = rsvd_time_s(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        host = rsvd_host_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        vram = rsvd_vram_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        floor = rsvd_vram_floor_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
     elseif job == ComputeBounds
-        t, device_t = bounds_time_s(pt, coeffs)
-        host, vram = bounds_host_bytes(pt, coeffs), bounds_vram_bytes(pt, coeffs)
-        floor = bounds_vram_floor_bytes(pt, coeffs)
+        mode = bounds_mode(pt, vram_capacity_bytes, coeffs)
+        t, device_t = bounds_time_s(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        host = bounds_host_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        vram = bounds_vram_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        floor = bounds_vram_floor_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
     else
         error("Unknown job kind: $job")
     end
     if pad
         t *= coeffs.time_pad
         device_t *= coeffs.time_pad
-        host *= coeffs.host_mem_pad
+        #=
+        The host pad is the only path-aware padding factor, because it is the only
+        one whose *meaning* changes with the path: `host_mem_pad` measures the
+        spread of a GC'd heap around an analytic floor, and the panel path has no
+        such heap (see `panel_host_mem_pad`). `time_pad` and `vram_pad` stay as
+        they are. Wall time is noisy on every path for the same reasons (node
+        contention), and the panel path's device count already dropped its
+        churn-elastic factor in `rsvd_vram_bytes`, so `vram_pad` does the same
+        run-to-run job there that it does everywhere else.
+        =#
+        host *= mode == :panel ? coeffs.panel_host_mem_pad : coeffs.host_mem_pad
         vram *= coeffs.vram_pad
         floor *= coeffs.vram_pad
         t += RECOMPILE_OVERHEAD_S
     end
+    # `mode` is reported so a caller can log which path it sized for. With one
+    # predicate, the log and the job agree.
     return (time_s=t, device_time_s=device_t, host_bytes=host, vram_bytes=vram,
-            vram_floor_bytes=floor)
+            vram_floor_bytes=floor, mode=mode)
 end
 
-predict_time_s(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true) =
-    predict(job, pt, coeffs; pad=pad).time_s
-predict_host_bytes(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true) =
-    predict(job, pt, coeffs; pad=pad).host_bytes
-predict_vram_bytes(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true) =
-    predict(job, pt, coeffs; pad=pad).vram_bytes
+predict_time_s(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true,
+               vram_capacity_bytes::Union{Nothing,Real}=nothing) =
+    predict(job, pt, coeffs; pad=pad, vram_capacity_bytes=vram_capacity_bytes).time_s
+predict_host_bytes(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true,
+                   vram_capacity_bytes::Union{Nothing,Real}=nothing) =
+    predict(job, pt, coeffs; pad=pad, vram_capacity_bytes=vram_capacity_bytes).host_bytes
+predict_vram_bytes(job::JobKind, pt::SRPoint, coeffs::Coefficients; pad::Bool=true,
+                   vram_capacity_bytes::Union{Nothing,Real}=nothing) =
+    predict(job, pt, coeffs; pad=pad, vram_capacity_bytes=vram_capacity_bytes).vram_bytes
 
 end # module

@@ -13,6 +13,7 @@ using NLopt
 using Random
 # using .Projectors
 using MatrixFreeRandomizedLinearAlgebra
+import Funicular
 
 """
     bracket_root(f, λs, b; btol=0.0, maxsteps=200)
@@ -406,23 +407,444 @@ function _compute_bounds_smr(::ComputeEnvironment, ::SMRSystem, ::RSVDParams)
     throw("Not implemented yet")
 end
 
-function load_bounds_inputs(compute_env::ComputeEnvironment, smr::SMRSystem)
+# Path selection for the N_u-scale front end (FUNICULAR_PLAN.md, workstream C).
+#
+# The pencil stage is m × m and is left alone. What can outgrow the device is the
+# handful of N_u × m matrices in front of it: in the in-memory path, the basis,
+# the `ss` probes, and the working matrix `opmat(C, basis)` builds. Those are the
+# same three the cost model bills the panel path's host tier for. Above the
+# device budget they become `PanelMatrix` objects streamed through the device one
+# column panel at a time.
+#
+# The predicate mirrors `use_panel_path` in rsvd.jl, fudge factor included, so
+# that the cost model and the run agree on which regime a job is in.
+
+# basis + ss + one working matrix, the peak of the in-memory front end.
+const BOUNDS_FRONT_END_MATRICES = 3
+
+"""
+    bounds_footprint_bytes(N_u, m) -> Int
+
+Device bytes the in-memory bounds front end wants: the
+`$(BOUNDS_FRONT_END_MATRICES)` `N_u × m` ComplexF64 matrices it holds at its
+peak (the basis, the `ss` probes, and `opmat(C, basis)`'s destination). The
+`m × m` pencil objects are not counted: they stay dense on the device in both
+regimes.
+"""
+bounds_footprint_bytes(N_u::Integer, m::Integer) =
+    BOUNDS_FRONT_END_MATRICES * Int(N_u) * Int(m) * 16
+
+"""
+    use_panel_bounds(N_u, m, compute_env) -> Bool
+
+Whether the bounds front end has outgrown the device, in which case the tall
+matrices go to Funicular's panel storage. Same shape and same `RSVD_PEAK_FUDGE`
+as [`use_panel_path`](@ref), so the two stages of a job agree on the regime.
+"""
+function use_panel_bounds(N_u::Integer, m::Integer, compute_env::ComputeEnvironment)
+    use_gpu(compute_env) || return false
+    return RSVD_PEAK_FUDGE * bounds_footprint_bytes(N_u, m) > device_budget_bytes()
+end
+
+# A plan that only exists to read an h5 panel matrix back into one host array.
+# Nothing is swept through it, so the "device" budget is only there for
+# `resolve_panel_width`'s arithmetic (2 staging buffers of one panel each) and
+# never allocates. The host budget has to cover the panels themselves, which
+# `Matrix` then copies into the array it returns.
+function _dense_read_plan(N_u::Integer, m::Integer)
+    bytes = Int(N_u) * Int(m) * 16
+    return Funicular.ResidencyPlan(backend=Funicular.CPUBackend(),
+                                   device_budget=max(4 * bytes, 2^20),
+                                   host_budget=max(bytes + (bytes >> 2), 2^20))
+end
+
+# Which of the three save formats the RSVD job left behind, in priority order:
+#
+#   1. `vectors_file`: the basename of an h5 Funicular.save'd `PanelMatrix` next
+#      to the JLD (rsvd.jl's panel branch).
+#   2. `V_pos`: the N_u × m block inline in the JLD (dense/in-memory and
+#      dense-exact branches).
+#   3. `V`: the legacy full N_u × k basis. We no longer write it, but existing
+#      sweeps on disk still carry it, and the leading `num_pos` columns of the
+#      descending ordering are exactly the block the other two formats store.
+function _ur_asym_vectors_source(jld, vectors_path::String)
+    if haskey(jld, "UR_asym/vectors_file")
+        path = joinpath(dirname(vectors_path), jld["UR_asym/vectors_file"])
+        isfile(path) || error("UR_asym/vectors_file names $(basename(path)) but there " *
+            "is no such file next to the JLD; the RSVD job wrote its eigenvalues but " *
+            "not its vectors, so it has to be rerun")
+        return (:h5, path)
+    end
+    haskey(jld, "UR_asym/V_pos") && return (:v_pos, "")
+    haskey(jld, "UR_asym/V") && return (:legacy, "")
+    error("the JLD has none of UR_asym/vectors_file, UR_asym/V_pos or the legacy " *
+          "UR_asym/V, so there is no Asym(G⁰ᵤᵣ) basis to run the bounds on")
+end
+
+# The positive-Γ block as a host `Matrix{ComplexF64}`. `cols` are the columns of
+# the *sorted* basis that are wanted, that is, `sorted_idxs[1:num_pos]`. The
+# positives-only formats already hold that block, so for them the ordering has to
+# be the identity: a file whose `D` is not descending has vectors we cannot
+# reorder, and we error rather than pair the wrong vector with an eigenvalue.
+function _read_ur_asym_dense(jld, source::Symbol, path::String,
+                             cols::AbstractVector{Int}, N_u::Integer)
+    m = length(cols)
+    if source === :h5
+        _assert_positive_prefix(cols, "UR_asym/vectors_file")
+        @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the $(N_u) × $(m) positive block from $(path)"
+        plan = _dense_read_plan(N_u, m)
+        pm = Funicular.load(Funicular.PanelMatrix, path; plan=plan, readonly=true)
+        try
+            return Matrix(pm; max_bytes=plan.host_budget)
+        finally
+            Funicular.free!(pm)
+        end
+    elseif source === :v_pos
+        _assert_positive_prefix(cols, "UR_asym/V_pos")
+        @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the $(N_u) × $(m) positive block from UR_asym/V_pos"
+        return Matrix{ComplexF64}(jld["UR_asym/V_pos"])
+    end
+    @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the legacy full UR_asym/V and taking its leading $(m) sorted columns"
+    return Matrix{ComplexF64}(view(jld["UR_asym/V"], :, cols))
+end
+
+# The same block as an `N_u × m` `PanelMatrix` on the run's plan. The h5 is opened
+# as the matrix's cold tier and its panels stream up as they are swept, so nothing
+# dense of that size is ever built. The other two formats have to come through
+# host memory once, since that is how they are stored.
+function _read_ur_asym_panel(jld, source::Symbol, path::String,
+                             cols::AbstractVector{Int}, N_u::Integer, plan)
+    if source === :h5
+        _assert_positive_prefix(cols, "UR_asym/vectors_file")
+        @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] Opening $(path) as a $(N_u) × $(length(cols)) panel matrix"
+        return Funicular.load(Funicular.PanelMatrix, path; plan=plan, readonly=true)
+    end
+    @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] The JLD holds the basis densely; cutting it into panels"
+    dense = _read_ur_asym_dense(jld, source, path, cols, N_u)
+    pm = Funicular.PanelMatrix(dense; plan=plan)
+    dense = nothing
+    run_gc()
+    return pm
+end
+
+function _assert_positive_prefix(cols::AbstractVector{Int}, key::AbstractString)
+    cols == collect(1:length(cols)) || error("$key stores only the positive-Γ block, " *
+        "in the order the RSVD wrote it, but sorting UR_asym/D descending does not " *
+        "leave that block as the leading $(length(cols)) columns (wanted columns " *
+        "$(first(cols)):… ). The values and the vectors in this file do not line up")
+    return nothing
+end
+
+"""
+    load_bounds_inputs(compute_env, smr; kwargs...)
+
+Reads the `Asym(G⁰ᵤᵣ)` spectrum the RSVD job left in scratch and returns it
+ready for [`bounds_from_spectrum`](@ref): `Γ` (every eigenvalue, host, sorted
+descending), `Vur_asym` (the `N_u × num_pos` positive block), `Γrs`,
+`sorted_idxs` (the descending permutation, saved as `ordering_idxs`), `num_pos`
+and the `ResidencyPlan` the basis was built from, if any.
+
+`Vur_asym` comes back as a `Funicular.PanelMatrix` when the front end has
+outgrown the device (see [`use_panel_bounds`](@ref)), and otherwise as a plain
+matrix, on the device if the run is a GPU run. Only the positive block is staged,
+since nothing reads the negative-Γ half of the legacy `V`.
+
+# Keyword arguments
+- `plan_override`: use this `ResidencyPlan` and take the panel path regardless
+  of the predicate. Mirrors `_save_ur_asym`'s kwarg of the same name, and is how
+  a CPU test exercises the panel front end.
+- `panel_mode`: `true`/`false` to force the choice, `nothing` (the default) to
+  let [`use_panel_bounds`](@ref) make it. `verify_bounds` passes `false`: its
+  full-space math wants one dense basis, not panels.
+- `to_device`: whether a dense basis is moved to the GPU. Defaults to
+  `use_gpu(compute_env)`, and is ignored on the panel path.
+"""
+function load_bounds_inputs(compute_env::ComputeEnvironment, smr::SMRSystem;
+                            plan_override=nothing,
+                            panel_mode::Union{Nothing,Bool}=nothing,
+                            to_device::Bool=use_gpu(compute_env))
     jld_in_path = joinpath(scratch_dir(compute_env), "$(file_prefix(smr)).jld")
     jld_in = jldopen(jld_in_path, "r")
+    try
+        haskey(jld_in, "UR_asym/D") || error("Key UR_asym/D not found in $(jld_in_path)")
+        Γ_raw = Array(jld_in["UR_asym/D"])
+        # NO MORE SIGN TYPO (this is fixed in rsvd.jl)
+        # Γ_raw .*= -one(eltype(Γ_raw)) # Sign typo in the original notes
 
-    Γ = read_array(jld_in, "UR_asym/D", use_gpu(compute_env))
-    # NO MORE SIGN TYPO (this is fixed in rsvd.jl)
-    # Γ .*= -one(eltype(Γ)) # Sign typo in the original notes
-    Vur_asym = read_array(jld_in, "UR_asym/V", use_gpu(compute_env))
+        # Sort the eigenvalues descending; the vectors are sliced to match below.
+        sorted_idxs = Array(sortperm(Γ_raw, rev=true))
+        Γ = Γ_raw[sorted_idxs]
+        Γrs = Array(jld_in["RS/D"])
 
-    # Sort the singular values and vectors in descending order
-    sorted_idxs = sortperm(Γ, rev=true)
-    Vur_asym = Vur_asym[:, sorted_idxs]
-    Γ = Array(Γ[sorted_idxs])
-    Γrs = Array(jld_in["RS/D"])
+        num_pos = haskey(jld_in, "UR_asym/num_pos") ? Int(jld_in["UR_asym/num_pos"]) :
+                  count(>(zero(eltype(Γ))), Γ)
+        num_pos > 0 || error("UR_asym has no positive eigenvalue, so there is no " *
+                             "basis and nothing for the bounds to run on")
+        num_pos == count(>(zero(eltype(Γ))), Γ) || error(
+            "UR_asym/num_pos is $(num_pos) but $(count(>(zero(eltype(Γ))), Γ)) of the " *
+            "$(length(Γ)) saved eigenvalues are positive; the RSVD output is inconsistent")
 
-    close(jld_in)
-    return (Γ=Γ, Vur_asym=Vur_asym, Γrs=Γrs, sorted_idxs=Array(sorted_idxs))
+        sender_size = prod(sender(smr).cel) * 3
+        receiver_size = prod(receiver(smr).cel) * 3
+        N_u = sender_size + receiver_size
+
+        plan = if plan_override !== nothing
+            @info string(now()) * " [bounds_bargaining::load_bounds_inputs] Path: panel front end (plan supplied by the caller)" plan_override
+            plan_override
+        elseif panel_mode === false
+            nothing
+        elseif panel_mode === true || use_panel_bounds(N_u, num_pos, compute_env)
+            residency_plan(compute_env; workspace_bytes=gila_workspace_bytes(N_u))
+        else
+            nothing
+        end
+
+        cols = sorted_idxs[1:num_pos]
+        source, path = _ur_asym_vectors_source(jld_in, ur_asym_vectors_path(compute_env, smr))
+        footprint = round(bounds_footprint_bytes(N_u, num_pos) / 2^30; digits=2)
+
+        if plan === nothing
+            @info string(now()) * " [bounds_bargaining::load_bounds_inputs] Path: in-memory front end (the $(N_u) × $(num_pos) basis, ss and working matrix want $(footprint) GiB)"
+            Vpos = _read_ur_asym_dense(jld_in, source, path, cols, N_u)
+            size(Vpos) == (N_u, num_pos) || error(
+                "the saved basis is $(size(Vpos, 1)) × $(size(Vpos, 2)) but the universe " *
+                "is $(N_u) cells' worth of currents and num_pos is $(num_pos)")
+            Vur_asym = to_device ? CuArray(Vpos) : Vpos
+            return (Γ=Γ, Vur_asym=Vur_asym, Γrs=Γrs, sorted_idxs=sorted_idxs,
+                    num_pos=num_pos, plan=nothing)
+        end
+
+        @info string(now()) * " [bounds_bargaining::load_bounds_inputs] Path: panel front end (the $(N_u) × $(num_pos) basis, ss and working matrix want $(footprint) GiB on the device)" plan
+        basis = _read_ur_asym_panel(jld_in, source, path, cols, N_u, plan)
+        size(basis) == (N_u, num_pos) || error(
+            "the saved basis is $(size(basis, 1)) × $(size(basis, 2)) but the universe " *
+            "is $(N_u) cells' worth of currents and num_pos is $(num_pos)")
+        return (Γ=Γ, Vur_asym=basis, Γrs=Γrs, sorted_idxs=sorted_idxs,
+                num_pos=num_pos, plan=plan)
+    finally
+        close(jld_in)
+    end
+end
+
+"""
+    reverse_gram_schmidt!(ss, gs_pos, s_projector, num_pos) -> ss
+
+The probe vectors `sₖ`, built by modified Gram-Schmidt on the columns of
+`A = Πₛ · gs_pos` taken in reverse order: column `i` is `Πₛgᵢ` orthogonalized
+against `s_{i+1}, …, s_m` and normalized. Column `i` of the result therefore
+spans `Πₛ·span(gᵢ, …, g_m)` together with the later columns, which is what makes
+the outer loop's probe set `k ≥ n` shrink with `n`.
+
+This is `O(m²)` BLAS-1 work over `N_u`-vectors. `blocked_reverse_gs_transform`
+is its blocked equivalent, which is what the panel front end runs instead.
+"""
+function reverse_gram_schmidt!(ss::AbstractMatrix, gs_pos::AbstractMatrix,
+                               s_projector, num_pos::Int)
+    for i in num_pos:-1:1
+        gᵢ = view(gs_pos, :, i)
+        wᵢ = s_projector * gᵢ
+        for j in (i+1):num_pos
+            sⱼ = view(ss, :, j)
+            cᵢⱼ = dot(sⱼ, wᵢ)
+            wᵢ .-= cᵢⱼ * sⱼ
+        end
+        nrm = norm(wᵢ)
+        if nrm < 1e-12
+            @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] Warning: vector $i is nearly linearly dependent on the later vectors, norm after orthogonalization is $nrm (we should stop the basis generation here, but I'm too lazy to fix the code right now; hopfully we never see this warning)"
+        end
+        ss[:, i] .= wᵢ ./ nrm
+    end
+    return ss
+end
+
+"""
+    blocked_reverse_gs_transform(S) -> T
+
+The `m × m` factor with `ss = A · T` for `A = Πₛ · gs_pos` and the `ss` that
+[`reverse_gram_schmidt!`](@ref) builds, given only `S = Aᴴ A`.
+
+The loop is modified Gram-Schmidt on the columns of `A` in the order
+`m, m−1, …, 1`, normalizing each to unit length. Let `J` be the reversal
+permutation, so that `Ã = A J` has those columns in the order the loop visits
+them. MGS is a QR factorization: `Ã = Q̃ R̃` with `R̃` upper triangular and
+`R̃ⱼⱼ = ‖wⱼ‖ > 0` real, and the loop's `sᵢ` is column `m+1−i` of `Q̃`, i.e.
+`ss = Q̃ J`. A QR with a positive real diagonal is unique, so the same `R̃` is
+the Cholesky factor of
+
+    ÃᴴÃ = J Aᴴ A J = J S J,
+
+and
+
+    ss = Q̃ J = Ã R̃⁻¹ J = A (J R̃⁻¹ J),   so   T = J R̃⁻¹ J.
+
+`R̃⁻¹` is upper triangular, so `T` is lower triangular: column `i` of `ss` draws
+on `aᵢ, …, a_m` and nothing earlier, exactly as the loop does. In panel terms
+this replaces `m` orthogonalization passes with one `gram` sweep for `S`, this
+`m × m` host factorization, and one `rightmul!` sweep for `A · T`.
+
+The basis is RSVD output and hence near-orthonormal, so squaring its condition
+number in the Gram matrix is harmless. A Cholesky that fails outright is the
+blocked version of the loop's "nearly linearly dependent" warning, since `Πₛ` can
+only have rank `sender_size` and an `m` past that is genuinely singular. It gets
+the same shifted retry Funicular's `cholqr2!` uses.
+"""
+function blocked_reverse_gs_transform(S::AbstractMatrix)
+    m = size(S, 1)
+    m == size(S, 2) || throw(ArgumentError("the Gram matrix must be square, got $(size(S))"))
+    rev = m:-1:1
+    T = eltype(S)
+    G = Matrix{T}(view(Matrix(S), rev, rev)) # J S J
+    F = cholesky(Hermitian(G); check=false)
+    if !issuccess(F)
+        shift = 11 * m * m * eps(real(T)) * norm(G)
+        @warn string(now()) * " [bounds_bargaining::blocked_reverse_gs_transform] the $(m)×$(m) Gram matrix of Πₛ·basis is not numerically positive definite, so some basis vector is nearly linearly dependent on the later ones (the reverse Gram-Schmidt loop would have warned about a vanishing norm here). Retrying the Cholesky with a shift of $shift"
+        F = cholesky(Hermitian(G + shift * I); check=false)
+        issuccess(F) || error("the $(m)×$(m) Gram matrix of Πₛ·basis is not positive " *
+            "definite even after a shift of $shift: the projected basis is rank " *
+            "deficient (Πₛ has rank at most sender_size), so the probe vectors are not " *
+            "defined. Reduce basis_size below the sender's dimension")
+    end
+    # κ(A) = κ(R̃), and the Cholesky route squares it before factoring, so the
+    # blocked probes drift from the loop's at the κ(A)² · eps level. The diagonal
+    # of R̃ bounds κ(R̃) from below and costs O(m) to look at. Measured against the
+    # loop: κ(A) ≈ 1e3 drifts by 1e-10, κ(A) ≈ 1e6 by 1e-3. Both remain
+    # orthonormal bases of the same reverse-nested spans, so a large ratio only
+    # costs us agreement on which representative we get.
+    d = abs.(diag(F.U))
+    ratio = maximum(d) / max(minimum(d), floatmin(real(T)))
+    if ratio > 1e6
+        @warn string(now()) * " [bounds_bargaining::blocked_reverse_gs_transform] Πₛ·basis has κ ≥ $(round(ratio; sigdigits=3)); the blocked reverse Gram-Schmidt squares that before factoring, so its probes differ from the O(m²) loop's by roughly κ²·eps ≈ $(round(ratio^2 * eps(real(T)); sigdigits=2)). Both are orthonormal bases of the same nested spans, but the bounds will not reproduce the loop's to full precision"
+    end
+    Rinv = inv(UpperTriangular(F.U))
+    return Matrix{T}(view(Matrix(Rinv), rev, rev)) # J R̃⁻¹ J, lower triangular
+end
+
+# The N_u-scale front end, written two ways. Both produce the four objects the
+# m × m pencil stage consumes (`ss`, `ss_basis`, `C_basis`, `D_basis`) and the
+# three stage timings the cost model is fitted against. Nothing downstream of
+# here knows which one ran.
+
+function _bounds_front_end_dense(compute_env::ComputeEnvironment, gs_pos, basis,
+                                 Γ_pos, Γ_pos_cpu, ζ, s_projector, G⁰ᵤᵤ_asym,
+                                 num_pos::Int, RSVD_BASIS_SIZE::Int, sender_size::Int)
+    N_u = size(gs_pos, 1)
+
+    # Reverse Gram-Schmidt
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Performing reverse Gram-Schmidt to construct the ss basis"
+    t_gram_schmidt = time_ns()
+    ss = similar(gs_pos, N_u, num_pos)
+    reverse_gram_schmidt!(ss, gs_pos, s_projector, num_pos)
+    t_gram_schmidt = (time_ns() - t_gram_schmidt) / 1e9
+
+    t_ss_basis = time_ns()
+    ss_basis = basis' * ss
+    t_ss_basis = (time_ns() - t_ss_basis) / 1e9
+
+    B_matvec(n::Int, v::AbstractVector) = begin
+        idxs = n:num_pos
+        G = view(gs_pos, :, idxs) # N × (num_pos - n + 1)
+        weights = (G' * v) .* Γ_pos[idxs]
+        return (4/ζ) .* (G * weights) # Computes (4/ζ) ∑  γₗ gₗ gₗ' v for all m ≥ l ≥ n (with m = num_pos)
+    end
+    B(n) = LinearMap(v -> B_matvec(n, v), N_u, N_u; ishermitian=true)
+    B_basis(n) = basis' * opmat(B(n), basis)
+
+    C_matvec(v::AbstractVector) = begin
+        out = similar_fill(v, zero(eltype(v)))
+
+        out .+= (1/ζ) * (s_projector * v) # ζ⁻¹ Pₛ action
+
+        G = gs_pos # N × num_pos
+        A_weights = (G' * v) .* Γ_pos
+        out .+= (G * A_weights) # A₊ action
+
+        out .+= G⁰ᵤᵤ_asym * v # (G⁰ᵤᵤ)ᵃ
+        return out
+    end
+    C = LinearMap(C_matvec, N_u, N_u; ishermitian=true)
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Projecting C into the basis of size $(size(basis, 2))"
+    t_c_projection = time_ns()
+    C_basis = basis' * opmat(C, basis)
+    t_c_projection = (time_ns() - t_c_projection) / 1e9
+
+    Bₛ = view(basis, 1:sender_size, :)
+    S_basis = Bₛ' * Bₛ # = basis' Πₛ basis, exact whether or not the basis is orthonormal
+    D_basis = (1 / ζ) .* S_basis # −ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1 in the basis
+    D_basis[diagind(D_basis)] .+= view(Γ_pos, 1:RSVD_BASIS_SIZE) .- (1 / ζ)
+
+    return (ss=ss, ss_basis=ss_basis, C_basis=C_basis, D_basis=D_basis,
+            t_gram_schmidt=t_gram_schmidt, t_ss_basis=t_ss_basis,
+            t_c_projection=t_c_projection)
+end
+
+"""
+The panel version of the same front end (FUNICULAR_PLAN.md, workstream C1-C3).
+The basis is an `N_u × m` `PanelMatrix`, as is every other `N_u`-scale object.
+Every `m × m` object is formed on the host and handed to the pencil stage in the
+compute device's array space, exactly as the dense path hands it over.
+
+This takes a fixed number of sweeps, against the dense path's `m`
+orthogonalization passes over `N_u`-vectors:
+
+1. `panelmul!(ss, Πₛ, basis)`, then `gram(ss)` for `S = basisᴴΠₛbasis`, the host
+   [`blocked_reverse_gs_transform`](@ref), and `rightmul!(ss, T)`.
+2. `gram(basis, ss)` for `ss_basis`.
+3. `panelmul!(work, (G⁰ᵤᵤ)ᵃ, basis)` and `gram(basis, work)`.
+
+`C(1) = ζ⁻¹Πₛ + (−G⁰ᵤᵣ)ᵃ₊ + (G⁰ᵤᵤ)ᵃ` only needs the Green term swept: with
+`basis = gs_pos` the other two are already in hand, since
+`basisᴴΠₛbasis = S` and `basisᴴ(−G⁰ᵤᵣ)ᵃ₊basis = (basisᴴbasis) diag(Γ₊)
+(basisᴴbasis)ᴴ`. `D_basis` reuses `S` as well, so the whole `τ` family comes out
+of the same three sweeps.
+"""
+function _bounds_front_end_panel(compute_env::ComputeEnvironment, basis,
+                                 Γ_pos_cpu, ζ, s_projector, G⁰ᵤᵤ_asym,
+                                 num_pos::Int, RSVD_BASIS_SIZE::Int)
+    RSVD_BASIS_SIZE == num_pos || error(
+        "the panel front end assumes the basis is the whole positive block " *
+        "(basis_size = num_pos = $(num_pos)), got RSVD_BASIS_SIZE = $(RSVD_BASIS_SIZE). " *
+        "A truncated basis would need basisᴴgs_pos as well, which is a fourth sweep " *
+        "nothing in production asks for")
+    size(basis, 2) == num_pos || error(
+        "the panel basis has $(size(basis, 2)) columns but num_pos is $(num_pos)")
+    to_device = use_gpu(compute_env) ? CuArray : identity
+
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Performing the blocked reverse Gram-Schmidt (two panel sweeps) to construct the ss basis"
+    t_gram_schmidt = time_ns()
+    ss = similar(basis)
+    Funicular.panelmul!(ss, s_projector, basis) # ss = Πₛ basis
+    S_basis = Funicular.gram(ss)                # = basisᴴ Πₛ basis, on the host
+    T = blocked_reverse_gs_transform(S_basis)
+    Funicular.rightmul!(ss, T)                  # ss = Πₛ basis T
+    t_gram_schmidt = (time_ns() - t_gram_schmidt) / 1e9
+
+    t_ss_basis = time_ns()
+    ss_basis = Funicular.gram(basis, ss)
+    t_ss_basis = (time_ns() - t_ss_basis) / 1e9
+    Funicular.free!(ss)
+
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Projecting C into the basis of size $(size(basis, 2))"
+    t_c_projection = time_ns()
+    work = similar(basis)
+    Funicular.panelmul!(work, G⁰ᵤᵤ_asym, basis)
+    C_basis = Funicular.gram(basis, work) # basisᴴ (G⁰ᵤᵤ)ᵃ basis
+    Funicular.free!(work)
+    gram_bb = Funicular.gram(basis)       # basisᴴ basis, near the identity
+    C_basis .+= (1 / ζ) .* S_basis                             # ζ⁻¹Πₛ
+    C_basis .+= gram_bb * (Γ_pos_cpu .* gram_bb')              # (−G⁰ᵤᵣ)ᵃ₊
+    t_c_projection = (time_ns() - t_c_projection) / 1e9
+    Funicular.free!(basis)
+
+    D_basis = (1 / ζ) .* S_basis # −ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1 in the basis
+    D_basis[diagind(D_basis)] .+= Γ_pos_cpu .- (1 / ζ)
+
+    # `ss` comes back empty: the probes cannot be held as a dense N_u × m array,
+    # which is why this path exists at all. `verify_bounds` is the only consumer,
+    # and it runs with panel_mode = false for that reason.
+    return (ss=nothing, ss_basis=to_device(ss_basis), C_basis=to_device(C_basis),
+            D_basis=to_device(D_basis),
+            t_gram_schmidt=t_gram_schmidt, t_ss_basis=t_ss_basis,
+            t_c_projection=t_c_projection)
 end
 
 """
@@ -430,6 +852,12 @@ end
 
 Compute the σₙ(Pᵣₛ) bounds from an already-loaded `Asym(G⁰ᵤᵣ)` spectrum. `Γ` must
 be sorted in descending order and `Vur_asym`'s columns must be ordered to match.
+
+`Vur_asym` is either a matrix, holding the whole `N_u × k` basis or just the
+`N_u × num_pos` positive block as [`load_bounds_inputs`](@ref) returns it, or a
+`Funicular.PanelMatrix` holding that block. In the panel case the `N_u`-scale
+front end runs as panel sweeps and the returned `ss` is `nothing`, since the
+panel matrices, `Vur_asym` included, are freed before the pencil stage.
 
 # Keyword arguments
 - `basis_size`: how many leading eigenvectors to use as the projection basis,
@@ -490,7 +918,7 @@ returned, in their compute-device array space, so that `verify_bounds` can
 rebuild any `C(τ)` pencil and its probes without re-deriving them.
 """
 function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
-                              Γ::AbstractVector, Vur_asym::AbstractMatrix,
+                              Γ::AbstractVector, Vur_asym,
                               Γrs::AbstractVector;
                               basis_size::Int=size(Vur_asym, 2),
                               G₀_uu=nothing,
@@ -536,67 +964,13 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     if use_gpu(compute_env)
         Γ_pos = CuArray(Γ_pos)
     end
-    gs_pos = Vur_asym[:, 1:num_pos] # These have been sorted in descending order of the corresponding Γ values; keep only the eigenvectors with positive eigenvalues
-
     # The projection basis is the m-dimensional span of the gₖ
     RSVD_BASIS_SIZE = min(basis_size, num_pos)
-    basis = RSVD_BASIS_SIZE == num_pos ? gs_pos : gs_pos[:, 1:RSVD_BASIS_SIZE] # aliased when full, to avoid a second N × m copy
     # basis = cat(U_uu, Vur_asym; dims=2)
     # basis = qthin!(basis) # Orthonormalize the basis using QR factorization
-    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Using RSVD_BASIS_SIZE = $RSVD_BASIS_SIZE (num_pos = $num_pos of $(size(Vur_asym, 2)) RSVD directions)"
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Using RSVD_BASIS_SIZE = $RSVD_BASIS_SIZE (num_pos = $num_pos of $(length(Γ)) RSVD directions)"
 
-    # Reverse Gram-Schmidt
-    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Performing reverse Gram-Schmidt to construct the ss basis"
-    t_gram_schmidt = time_ns()
-    ss = similar(gs_pos, size(gs_pos, 1), num_pos)
-    for i in num_pos:-1:1
-        gᵢ = view(gs_pos, :, i)
-        wᵢ = s_projector * gᵢ
-        for j in (i+1):num_pos
-            sⱼ = view(ss, :, j)
-            cᵢⱼ = dot(sⱼ, wᵢ)
-            wᵢ .-= cᵢⱼ * sⱼ
-        end
-        nrm = norm(wᵢ)
-        if nrm < 1e-12
-            @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] Warning: vector $i is nearly linearly dependent on the later vectors, norm after orthogonalization is $nrm (we should stop the basis generation here, but I'm too lazy to fix the code right now; hopfully we never see this warning)"
-        end
-        ss[:, i] .= wᵢ ./ nrm
-    end
-    t_gram_schmidt = (time_ns() - t_gram_schmidt) / 1e9
-
-    t_ss_basis = time_ns()
-    ss_basis = basis' * ss
-    t_ss_basis = (time_ns() - t_ss_basis) / 1e9
-
-    B_matvec(n::Int, v::AbstractVector) = begin
-        idxs = n:num_pos
-        G = view(gs_pos, :, idxs) # N × (num_pos - n + 1)
-        weights = (G' * v) .* Γ_pos[idxs]
-        return (4/ζ) .* (G * weights) # Computes (4/ζ) ∑  γₗ gₗ gₗ' v for all m ≥ l ≥ n (with m = num_pos)
-    end
-    B(n) = LinearMap(v -> B_matvec(n, v), size(G₀_uu)...; ishermitian=true)
-    B_basis(n) = basis' * opmat(B(n), basis)
-
-    C_matvec(v::AbstractVector) = begin
-        out = similar_fill(v, zero(eltype(v)))
-
-        out .+= (1/ζ) * (s_projector * v) # ζ⁻¹ Pₛ action
-
-        G = gs_pos # N × num_pos
-        A_weights = (G' * v) .* Γ_pos
-        out .+= (G * A_weights) # A₊ action
-
-        out .+= G⁰ᵤᵤ_asym * v # (G⁰ᵤᵤ)ᵃ
-        return out
-    end
-    C = LinearMap(C_matvec, size(G₀_uu)...; ishermitian=true)
-    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Projecting C into the basis of size $(size(basis, 2))"
-    t_c_projection = time_ns()
-    C_basis = basis' * opmat(C, basis)
-    t_c_projection = (time_ns() - t_c_projection) / 1e9
-
-    # The C projected above is the τ = 1 endpoint of the constraint family
+    # The C the front end projects is the τ = 1 endpoint of the constraint family
     #
     #     C(τ) = ζ⁻¹(Πₛ + (1−τ)Πᵣ) + τ(−G⁰ᵤᵣ)ᵃ₊ + (G⁰ᵤᵤ)ᵃ,
     #
@@ -611,14 +985,28 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     # diagonal, and basis'Πₛbasis is the Gram matrix of the stored sender rows.
     sender_size = prod(sender(smr).cel) * 3
     receiver_size = prod(receiver(smr).cel) * 3
-    size(basis, 1) == sender_size + receiver_size || error(
-        "the universe is not [sender; receiver] ($(size(basis, 1)) ≠ " *
+    size(Vur_asym, 1) == sender_size + receiver_size || error(
+        "the universe is not [sender; receiver] ($(size(Vur_asym, 1)) ≠ " *
         "$sender_size + $receiver_size), so Πᵣ ≠ 1 − Πₛ and the τ family " *
         "cannot be assembled from the sender projector alone")
-    Bₛ = view(basis, 1:sender_size, :)
-    S_basis = Bₛ' * Bₛ # = basis' Πₛ basis, exact whether or not the basis is orthonormal
-    D_basis = (1 / ζ) .* S_basis # −ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1 in the basis
-    D_basis[diagind(D_basis)] .+= view(Γ_pos, 1:RSVD_BASIS_SIZE) .- (1 / ζ)
+
+    front = if Vur_asym isa Funicular.PanelMatrix
+        _bounds_front_end_panel(compute_env, Vur_asym, Γ_pos_cpu, ζ, s_projector,
+                                G⁰ᵤᵤ_asym, num_pos, RSVD_BASIS_SIZE)
+    else
+        # These have been sorted in descending order of the corresponding Γ values;
+        # keep only the eigenvectors with positive eigenvalues. Aliased when the
+        # loaded block is already positives-only.
+        gs_pos = size(Vur_asym, 2) == num_pos ? Vur_asym : Vur_asym[:, 1:num_pos]
+        basis = RSVD_BASIS_SIZE == num_pos ? gs_pos : gs_pos[:, 1:RSVD_BASIS_SIZE] # aliased when full, to avoid a second N × m copy
+        _bounds_front_end_dense(compute_env, gs_pos, basis, Γ_pos, Γ_pos_cpu, ζ,
+                                s_projector, G⁰ᵤᵤ_asym, num_pos, RSVD_BASIS_SIZE,
+                                sender_size)
+    end
+    ss, ss_basis = front.ss, front.ss_basis
+    C_basis, D_basis = front.C_basis, front.D_basis
+    t_gram_schmidt, t_ss_basis = front.t_gram_schmidt, front.t_ss_basis
+    t_c_projection = front.t_c_projection
 
     # None of the C(τ) depend on n, so the grid pencils are eigendecomposed once
     # here; the golden-section refinement builds throwaway pencils on demand
@@ -658,7 +1046,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         t_outer = time_ns()
         @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] [$n/$(num_pos)] Computing σₙ(Pᵣₛ) bound"
 
-        @info string(now()) * " [$n/$(num_pos)] Projecting Bₙ into the basis of size $(size(basis, 2))"
+        @info string(now()) * " [$n/$(num_pos)] Projecting Bₙ into the basis of size $(RSVD_BASIS_SIZE)"
         # B_basis_n = B_basis(n)
         fill!(B_basis_diagonal, zero(eltype(B_basis_diagonal)))
         B_basis_diagonal[n:RSVD_BASIS_SIZE] .= (4/ζ) .* Γ_pos_cpu[n:RSVD_BASIS_SIZE] # Bₙ is diagonal in the gs_pos basis, so no projection is needed
@@ -796,10 +1184,12 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             stage_times=stage_times, outer_times=outer_times)
 end
 
-function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
+function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams;
+                            plan_override=nothing, panel_mode::Union{Nothing,Bool}=nothing)
     @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Computing bounds for SR system"
 
-    inputs = load_bounds_inputs(compute_env, smr)
+    inputs = load_bounds_inputs(compute_env, smr; plan_override=plan_override,
+                                panel_mode=panel_mode)
     Γ, Vur_asym, Γrs, sorted_idxs = inputs.Γ, inputs.Vur_asym, inputs.Γrs, inputs.sorted_idxs
 
     # Written up front (truncating any previous run's file) so that the ordering

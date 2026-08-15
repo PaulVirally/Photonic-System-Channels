@@ -310,6 +310,38 @@ function append_csv_row(path::AbstractString, row::AbstractDict)
 end
 
 """
+    panel_bus_row(; cluster, gpu_name="", threads=Threads.nthreads(),
+                  device_total=0, time_s, extras) -> Dict{String,Any}
+
+One `kind="panel_bus"` row, in the shape `bench/fit.jl`'s `fit_panel_bus` reads.
+
+That fitter is the only consumer, and its contract is worth restating here. A row
+contributes to `pcie_rate` when `extras` carries `bytes=<moved>` and `time_s` is
+the seconds those bytes took, and it contributes to `overlap_factor` when `extras`
+carries `overlap=<fraction in (0, 1]>`. A row may carry both, either or neither,
+and a row with neither is recorded but ignored by the fit. That is how trial E1's
+summary row and its informational rows (the pageable comparison, the overlap
+benchmark's own sweep rate) stay in the CSV without dragging the fitted slope
+around. Keep an informational byte count under a *different* key
+(`bytes_pageable=`, `bytes_sweep=`) for that reason.
+
+Not routed through `bench/point.jl`'s `emit`. `panel_bus` is the one measurement
+that produces several independent samples in one process (several transfer sizes,
+several compute-to-copy ratios), and `rate_through_origin` wants them as separate
+rows so that a fixed per-transfer overhead cannot be amortised into the slope by a
+single point. Peak RSS and the device high-water are left empty for the same
+reason: they are per-process, so they would be the same number on every row and
+describe none of them.
+"""
+function panel_bus_row(; cluster::AbstractString, gpu_name::AbstractString="",
+                       threads::Integer=Threads.nthreads(), device_total::Integer=0,
+                       time_s::Real, extras::AbstractVector{<:AbstractString})
+    return csv_row(cluster=cluster, kind="panel_bus", device="gpu", gpu_name=gpu_name,
+                   threads=threads, device_total_bytes=device_total,
+                   time_s=Float64(time_s), extra=join(extras, ";"))
+end
+
+"""
     read_csv_rows(path) -> Vector{Dict{String,String}}
 
 Minimal RFC4180-ish reader, enough for the files this harness writes. Unknown

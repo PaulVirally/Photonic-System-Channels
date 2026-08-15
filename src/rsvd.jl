@@ -4,7 +4,70 @@ using LinearAlgebra
 using JLD2
 using CUDA
 using GilaElectromagnetics
- 
+import Funicular
+
+# Path selection. There are three ways to get the spectrum of Asym(G⁰ᵤᵣ), in
+# order of priority (FUNICULAR_PLAN.md, workstream B3/B6):
+#
+#   1. dense-exact, when the universe is small enough to build and diagonalize
+#      the whole operator. No RSVD error, and the "rank" is the full spectrum.
+#   2. in-memory RSVD, whenever the sketch fits on the device. A resident
+#      CuArray sketch pays no upload per sweep, so it beats the panel path.
+#   3. panel RSVD, above that.
+
+# 1/4 λ at x-scale 1/32 is N_u = 3,072, so the cap covers it with room to spare.
+# The dense eigensolve is still a few minutes at the top end.
+const DENSE_EXACT_MAX_N_U = 12_288
+# The RS values come from a rectangular operator, so the dense branch there is
+# bounded by the smaller side. Half the Hermitian cap, since a dense N_r × N_s
+# block is a full matrix rather than a triangle.
+const DENSE_EXACT_MAX_N_R = 6_144
+# Measured ratio of the in-memory `reigen_hermitian` device high-water mark to
+# the 3 × (N_u × c) ComplexF64 matrices the algorithm nominally holds (the
+# sketch, its image, and the rotation's destination). From bench/cost_model.jl.
+const RSVD_PEAK_FUDGE = 1.554
+# The LinearMaps composition's per-apply temporaries, in N_u-vectors: the two
+# inclusions, the two clips, and the two halves of the asymmetrization. Trial E2
+# replaces this estimate with a measurement.
+const GILA_N_TEMPORARIES = 6
+# Gila's CUFFT plans hold work areas the residency plan cannot see, so we have to
+# declare them or the buffer pool hands out memory the operator takes for itself
+# mid-sweep. Flat, since the work area does not scale with N_u the way the
+# temporaries do. Trial E2 replaces this too.
+const CUFFT_WORKSPACE_BYTES = 512 * 2^20
+
+"""
+    use_dense_path(N_u; max_N_u=DENSE_EXACT_MAX_N_U) -> Bool
+
+Whether the universe is small enough to diagonalize exactly. Takes priority over
+both RSVD paths.
+"""
+use_dense_path(N_u::Integer; max_N_u::Integer=DENSE_EXACT_MAX_N_U) = N_u <= max_N_u
+
+"""
+    use_panel_path(N_u, c, compute_env) -> Bool
+
+Whether the `reigen_hermitian` sketch has outgrown the device, in which case the
+tall matrices go to Funicular's panel storage. The cost model calls this too, so
+that it and the run agree on which regime a job is in.
+"""
+function use_panel_path(N_u::Integer, c::Integer, compute_env::ComputeEnvironment)
+    use_gpu(compute_env) || return false
+    return RSVD_PEAK_FUDGE * 3 * Int(N_u) * Int(c) * 16 > device_budget_bytes()
+end
+
+"""
+    gila_workspace_bytes(N_u) -> Int
+
+Estimated device memory the `Asym(G⁰ᵤᵣ)` composition needs for itself while it is
+applied: `$(GILA_N_TEMPORARIES)` N_u-vectors of ComplexF64 for its temporaries,
+plus $(CUFFT_WORKSPACE_BYTES >> 20) MiB for Gila's CUFFT plan work areas. A
+LinearMaps composition cannot carry `Funicular.workspace_bytes` as a trait, so
+this goes to the plan as a keyword instead. Trial E2 measures the real number and
+replaces this estimate.
+"""
+gila_workspace_bytes(N_u::Integer) = GILA_N_TEMPORARIES * Int(N_u) * 16 + CUFFT_WORKSPACE_BYTES
+
 function generate_rsvd()
     @info string(now()) * " [rsvd::generate_rsvd] Starting RSVD generation"
     compute_env, smr, rsvd_params = parse_args()
@@ -174,49 +237,213 @@ end
 #     return vec(cropped_tens)
 # end
 
-function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
-    fname = file_prefix(smr)
-    jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
+"""
+    ur_asym_vectors_path(compute_env, smr) -> String
 
-    jld_key = "UR_asym/"
-    if ispath(jld_path)
-        jld = jldopen(jld_path, "r")
-        if haskey(jld, jld_key * "D") && haskey(jld, jld_key * "V")
-            @info string(now()) * " [rsvd::generate_rsvd] RSVD for $(jld_key) already exists at $(jld_path): skipping"
-            close(jld)
-            return
-        else
-            close(jld)
+Where the positive-Γ eigenvectors go when they are streamed to disk rather than
+written into the JLD. One HDF5 file per experiment, chunked one panel per chunk,
+next to the JLD that names it.
+"""
+ur_asym_vectors_path(compute_env::ComputeEnvironment, smr::SMRSystem) =
+    joinpath(scratch_dir(compute_env), "$(file_prefix(smr))_UR_asym_Vpos.h5")
+
+# Complete means `D` (all returned eigenvalues) and `num_pos` are present and the
+# positive vectors are reachable, either inline in the JLD or in the h5 file the
+# JLD names. A run that wrote the values but died before the vectors landed is
+# not complete.
+function _ur_asym_is_complete(jld_path::String, jld_key::String, vectors_path::String)
+    ispath(jld_path) || return false
+    jld = jldopen(jld_path, "r")
+    try
+        (haskey(jld, jld_key * "D") && haskey(jld, jld_key * "num_pos")) || return false
+        haskey(jld, jld_key * "V_pos") && return true
+        haskey(jld, jld_key * "vectors_file") || return false
+        return isfile(joinpath(dirname(vectors_path), jld[jld_key*"vectors_file"]))
+    finally
+        close(jld)
+    end
+end
+
+# The number of positive eigenvalues, which is the `m` everything downstream is
+# sized by. `reigen_hermitian` and the dense branch both sort descending, so the
+# positives are a prefix and `m` is all bounds needs to slice them out. We check
+# that here rather than assume it.
+function _num_positive(evals::AbstractVector)
+    issorted(evals, rev=true) || error("the eigenvalues are not sorted in descending order, so the positive ones are not a prefix and num_pos does not describe them")
+    m = count(>(zero(eltype(evals))), evals)
+    m == 0 || all(>(zero(eltype(evals))), view(evals, 1:m)) || error("the $(m) positive eigenvalues are not the leading $(m) entries")
+    return m
+end
+
+"""
+    materialize_columns(f::PanelFactored, cols) -> PanelMatrix
+
+Columns `cols` of the product `f.Q * f.C`, formed without building the whole
+product. `MatrixFreeRandomizedLinearAlgebra.materialize` builds all `k` columns,
+but we only ever want the positive-Γ prefix, and at 4 λ the difference is tens of
+terabytes over a sweep (FUNICULAR_PLAN.md, workstream B5).
+"""
+function materialize_columns(f::PanelFactored, cols)
+    C = f.C[:, cols]
+    V = similar(f.Q, eltype(f.Q), (size(f.Q, 1), size(C, 2)))
+    Funicular.rightmul!(V, f.Q, C) # V = Q * C[:, cols]
+    return V
+end
+
+# Assembles the operator densely by applying it to the identity, a batch of
+# columns at a time. The operator is matrix-free, so this costs `size(op, 2)`
+# matvecs, which is only affordable because this branch is gated on a small
+# universe. On a GPU run the identity batch is staged through the device, but the
+# assembled matrix is a host array either way since it goes straight to LAPACK.
+function _dense_matrix(op, on_gpu::Bool; batch_size::Int=256)
+    rows, cols = size(op)
+    T = ComplexF64
+    M = Matrix{T}(undef, rows, cols)
+    for start in 1:batch_size:cols
+        stop = min(start + batch_size - 1, cols)
+        E = zeros(T, cols, stop - start + 1)
+        for (c, j) in enumerate(start:stop)
+            E[j, c] = one(T)
         end
+        block = op * (on_gpu ? CuArray(E) : E)
+        copyto!(view(M, :, start:stop), Array(block))
+    end
+    return M
+end
+
+# The exact spectrum of the assembled operator, descending. `eigen!` runs on the
+# host: at the sizes this branch takes (1/4 λ is N_u = 3,072) it is seconds, and
+# the eigenvectors go into the JLD as a host array anyway. The vectors come back
+# as a permuted view, not a permuted copy, so only the positive block the caller
+# slices out is materialized.
+function _dense_hermitian_eigen(M::Matrix{ComplexF64})
+    F = eigen!(Hermitian(M)) # ascending, as LAPACK returns it
+    idxs = sortperm(F.values, rev=true)
+    return F.values[idxs], view(F.vectors, :, idxs)
+end
+
+function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams;
+                       plan_override=nothing, max_dense_N_u::Integer=DENSE_EXACT_MAX_N_U)
+    jld_path = joinpath(scratch_dir(compute_env), "$(file_prefix(smr)).jld")
+    vectors_path = ur_asym_vectors_path(compute_env, smr)
+    jld_key = "UR_asym/"
+
+    if _ur_asym_is_complete(jld_path, jld_key, vectors_path)
+        @info string(now()) * " [rsvd::_save_ur_asym] RSVD for $(jld_key) already exists at $(jld_path): skipping"
+        return
     end
 
-    @info string(now()) * " [rsvd::generate_rsvd] Computing RSVD for UR_asym"
-    @info string(now()) * " [rsvd::generate_rsvd] Loading G₀ operators"
-    # G₀_uu = load_green_function(compute_env, smr, Design, Design) # universe -> universe
-    # G₀_ur_asym = asym_ur(G₀_uu, smr)
-    # G₀_ru = load_green_function(compute_env, smr, [Receiver], [Sender, Receiver]) # universe -> receiver
+    @info string(now()) * " [rsvd::_save_ur_asym] Computing RSVD for UR_asym"
+    @info string(now()) * " [rsvd::_save_ur_asym] Loading G₀ operators"
     G₀_rs = load_green_function(compute_env, smr, Receiver, Sender) # sender -> receiver
     G₀_rr = load_green_function(compute_env, smr, Receiver, Receiver) # receiver -> receiver
-    G₀_ur_asym, positive_seeder = asym_ur(G₀_rs, G₀_rr, smr)
-    sample_vec = zeros(ComplexF64, 0)
-    if use_gpu(compute_env)
-        sample_vec = CuArray(sample_vec)
+    G₀_ur_asym, _positive_seeder = asym_ur(G₀_rs, G₀_rr, smr)
+    # We tried seeding the rSVD with the off-diagonal block's range (`seed_Q`),
+    # but it didn't help and just costs us an extra rSVD, so we skip it.
+
+    N_u = size(G₀_ur_asym, 1)
+    c = rank(rsvd_params)
+    seed_value = seed(rsvd_params)
+
+    if use_dense_path(N_u; max_N_u=max_dense_N_u)
+        @info string(now()) * " [rsvd::_save_ur_asym] Path: dense-exact (N_u = $(N_u) ≤ $(max_dense_N_u)). No RSVD error: the whole spectrum is computed exactly"
+        M = _dense_matrix(G₀_ur_asym, use_gpu(compute_env))
+        evals, V = _dense_hermitian_eigen(M)
+        M = nothing
+        m = _num_positive(evals)
+        _log_positive_fraction(m, length(evals))
+        @info string(now()) * " [rsvd::_save_ur_asym] Saving exact eigendecomposition to $(jld_path)"
+        _save_ur_asym_components(jld_path, jld_key, evals, m, seed_value, true; V_pos=view(V, :, 1:m))
+        run_gc()
+        return
     end
 
-    # @info string(now()) * " [rsvd::generate_rsvd] Performing rSVD of off diagonals of Asym(G0_ur) to seed Asym(G0_ur) rSVD"
-    # @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(positive_seeder)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
-    # out = reigen_hermitian(positive_seeder, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
-    # seed_Q = out.vectors
-    #
-    # @info string(now()) * " [rsvd::generate_rsvd] Saving reigen to $(jld_path)"
-    # _save_reigen_hermitian(out.vectors, out.values, jld_path, "UR_asym_offdiagonal/")
-    seed_Q = nothing # We tried this seeding technique, but it didn't help and just costs us an extra rSVD so we skip it
+    plan = plan_override === nothing ?
+           (use_panel_path(N_u, c, compute_env) ? residency_plan(compute_env; workspace_bytes=gila_workspace_bytes(N_u)) : nothing) :
+           plan_override
 
-    @info string(now()) * " [rsvd::generate_rsvd] Computing $(rank(rsvd_params)) components of a randomized eigen decomposition for a $(size(G₀_ur_asym)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
-    out = reigen_hermitian(G₀_ur_asym, rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec, seed_Q=seed_Q)
+    if plan === nothing
+        @info string(now()) * " [rsvd::_save_ur_asym] Path: in-memory RSVD (the $(N_u) × $(c) sketch fits on the device)"
+        sample_vec = zeros(ComplexF64, 0)
+        if use_gpu(compute_env)
+            sample_vec = CuArray(sample_vec)
+        end
+        @info string(now()) * " [rsvd::_save_ur_asym] Computing $(c) components of a randomized eigen decomposition for a $(size(G₀_ur_asym)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+        out = reigen_hermitian(G₀_ur_asym, c; num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+        evals = Array(out.values)
+        m = _num_positive(evals)
+        _log_positive_fraction(m, length(evals))
+        @info string(now()) * " [rsvd::_save_ur_asym] Saving reigen to $(jld_path)"
+        _save_ur_asym_components(jld_path, jld_key, evals, m, seed_value, false; V_pos=view(out.vectors, :, 1:m))
+        run_gc()
+        return
+    end
 
-    @info string(now()) * " [rsvd::generate_rsvd] Saving reigen to $(jld_path)"
-    _save_reigen_hermitian(out.vectors, out.values, jld_path, jld_key)
+    @info string(now()) * " [rsvd::_save_ur_asym] Path: panel RSVD (the $(N_u) × $(c) sketch does not fit on the device)" plan
+    @info string(now()) * " [rsvd::_save_ur_asym] Computing $(c) components of a randomized eigen decomposition for a $(size(G₀_ur_asym)) Hermitian operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations, seed $(seed_value)"
+    out = reigen_hermitian(G₀_ur_asym, c; num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), plan=plan, seed=seed_value, factored=true, validate=true)
+    evals = Array(out.values)
+    m = _num_positive(evals)
+    _log_positive_fraction(m, length(evals))
+    m > 0 || error("no positive eigenvalues of Asym(G⁰ᵤᵣ) were found, so there is no basis to save and the bounds have nothing to run on")
+
+    # `factored=true` left the product Q * rotation unevaluated, so only the
+    # positive prefix is ever formed: an N_u × m panel matrix instead of N_u × c.
+    @info string(now()) * " [rsvd::_save_ur_asym] Forming the $(N_u) × $(m) positive block and streaming it to $(vectors_path)"
+    V_pos = materialize_columns(out.vectors, 1:m)
+    try
+        Funicular.save(V_pos, vectors_path)
+    finally
+        Funicular.free!(V_pos)
+        Funicular.free!(out.vectors.Q)
+    end
+
+    @info string(now()) * " [rsvd::_save_ur_asym] Saving reigen to $(jld_path)"
+    _save_ur_asym_components(jld_path, jld_key, evals, m, seed_value, false; vectors_file=basename(vectors_path))
+    run_gc()
+    return
+end
+
+# Both the bounds' time (∝ m⁴) and the sweep's disk usage hang off the positive
+# fraction. The cost model assumes 0.6, so we print the measured value: a run that
+# comes back well above it shows up in the RSVD log rather than in a blown bounds
+# job.
+function _log_positive_fraction(m::Int, total::Int)
+    @info string(now()) * " [rsvd::_save_ur_asym] num_pos = $(m) of $(total) directions (positive fraction $(round(m / total; digits=3)))"
+end
+
+"""
+    _save_ur_asym_components(jld_path, jld_key, evals, num_pos, seed_value, exact; V_pos=nothing, vectors_file=nothing)
+
+Writes the `UR_asym/` group. `D` is every eigenvalue the solve returned, in
+descending order, and `num_pos` is how many of them are positive, which is the
+`m` that slices the basis. Exactly one of `V_pos` (the N_u × m block, inline) and
+`vectors_file` (the basename of the h5 the block was streamed to) is given. We do
+not write the legacy full `V` key: at 4 λ its negative-Γ half is 7 TB of vectors
+nothing reads.
+"""
+function _save_ur_asym_components(jld_path::String, jld_key::String, evals::AbstractVector, num_pos::Int, seed_value::Int, exact::Bool; V_pos=nothing, vectors_file=nothing)
+    if jld_path == ""
+        @info string(now()) * " [rsvd::_save_ur_asym_components] Empty jld_path provided: skipping save"
+        return
+    end
+    jld = jldopen(jld_path, "a+")
+    try
+        _save_component(jld, jld_key * "D", Array(evals))
+        _save_scalar(jld, jld_key * "num_pos", num_pos)
+        _save_scalar(jld, jld_key * "seed", seed_value)
+        _save_scalar(jld, jld_key * "exact", exact)
+        if V_pos !== nothing
+            @info string(now()) * " [rsvd::_save_ur_asym_components] Saving the positive-Γ eigenvectors"
+            _save_component(jld, jld_key * "V_pos", V_pos)
+        end
+        if vectors_file !== nothing
+            _save_scalar(jld, jld_key * "vectors_file", vectors_file)
+        end
+    finally
+        close(jld)
+    end
+    return
 end
 
 function _save_constraint_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
@@ -320,7 +547,8 @@ function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params:
     run_gc()
 end
 
-function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, jld_key::String)
+function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, jld_key::String;
+                       plan_override=nothing, max_dense_N_r::Integer=DENSE_EXACT_MAX_N_R)
     fname = file_prefix(smr)
     jld_path = joinpath(scratch_dir(compute_env), "$(fname).jld")
     if ispath(jld_path)
@@ -343,13 +571,40 @@ function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
         @info string(now()) * " [rsvd::_run_rsvdvals] Applying disjoint union projector to G₀_uu for universe -> universe case"
         G₀_ab = uu_disjoint_union(G₀_ab, smr) # For the universe -> universe case, we need to zero out the gap to get a basis that is more useful in the bounds
     end
-    sample_vec = zeros(ComplexF64, 0)
-    if use_gpu(compute_env)
-        sample_vec = CuArray(sample_vec)
+    G₀_ab = LinearMap(G₀_ab)
+    dims = size(G₀_ab)
+    N_r = minimum(dims)
+    c = rank(rsvd_params)
+
+    # Same three-way split as the UR_asym branch, but on the smaller side of the
+    # operator. The rsvdvals peak is two N × c matrices, half the reigen peak, so
+    # this is never the binding path; it uses the same plan anyway.
+    if N_r <= max_dense_N_r
+        @info string(now()) * " [rsvd::_run_rsvdvals] Path: dense-exact singular values for $(jld_key) (min side $(N_r) ≤ $(max_dense_N_r))"
+        out = svdvals!(_dense_matrix(G₀_ab, use_gpu(compute_env)))
+        @info string(now()) * " [rsvd::_run_rsvdvals] Saving exact singular values to $(jld_path)"
+        _save_rsvd(out, jld_path, jld_key)
+        run_gc()
+        return
     end
 
-    @info string(now()) * " [rsvd::_run_rsvdvals] Computing $(rank(rsvd_params)) components of a randomized SVD for a $(size(G₀_ab)) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
-    out = rsvdvals(LinearMap(G₀_ab), rank(rsvd_params); num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+    plan = plan_override === nothing ?
+           (use_panel_path(maximum(dims), c, compute_env) ? residency_plan(compute_env; workspace_bytes=gila_workspace_bytes(maximum(dims))) : nothing) :
+           plan_override
+
+    if plan === nothing
+        @info string(now()) * " [rsvd::_run_rsvdvals] Path: in-memory RSVD for $(jld_key)"
+        sample_vec = zeros(ComplexF64, 0)
+        if use_gpu(compute_env)
+            sample_vec = CuArray(sample_vec)
+        end
+        @info string(now()) * " [rsvd::_run_rsvdvals] Computing $(c) components of a randomized SVD for a $(dims) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations"
+        out = rsvdvals(G₀_ab, c; num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+    else
+        @info string(now()) * " [rsvd::_run_rsvdvals] Path: panel RSVD for $(jld_key)" plan
+        @info string(now()) * " [rsvd::_run_rsvdvals] Computing $(c) components of a randomized SVD for a $(dims) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations, seed $(seed(rsvd_params))"
+        out = rsvdvals(G₀_ab, c; num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), plan=plan, seed=seed(rsvd_params))
+    end
 
     @info string(now()) * " [rsvd::_run_rsvdvals] Saving RSVD to $(jld_path)"
     _save_rsvd(out, jld_path, jld_key)
@@ -373,6 +628,17 @@ function _save_component(jld::JLD2.JLDFile, key::String, component::AbstractArra
     else
         @info string(now()) * " [rsvd::_save_component] Saving $(key)"
         jld[key] = Array(component) # Ensure the data is copied to the host
+    end
+end
+
+# Same skip-and-log behaviour as `_save_component`, for the metadata scalars
+# (`num_pos`, `seed`, `exact`, `vectors_file`) that are not arrays.
+function _save_scalar(jld::JLD2.JLDFile, key::String, value)
+    if haskey(jld, key)
+        @info string(now()) * " [rsvd::_save_scalar] $(key) already exists: skipping"
+    else
+        @info string(now()) * " [rsvd::_save_scalar] Saving $(key) = $(value)"
+        jld[key] = value
     end
 end
 
