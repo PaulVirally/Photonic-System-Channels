@@ -1,0 +1,5 @@
+hostname && sleep 5 && echo task 1 done
+hostname && sleep 5 && echo task 2 done
+hostname && sleep 5 && echo task 3 done
+hostname && sleep 5 && echo task 4 done
+hostname && sleep 5 && echo task 5 done
