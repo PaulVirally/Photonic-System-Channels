@@ -305,7 +305,13 @@ function _dense_matrix(op, on_gpu::Bool; batch_size::Int=256)
         for (c, j) in enumerate(start:stop)
             E[j, c] = one(T)
         end
-        block = op * (on_gpu ? CuArray(E) : E)
+        # NB: `op * E` would NOT be a multiplication: LinearMaps composes a map
+        # with a matrix, and materializing that composition uses *host* basis
+        # vectors, which breaks on the CuArray-backed blocks inside `op`. mul!
+        # applies the operator column by column with arrays on the right device.
+        X = on_gpu ? CuArray(E) : E
+        block = similar(X, T, (rows, stop - start + 1))
+        mul!(block, op, X)
         copyto!(view(M, :, start:stop), Array(block))
     end
     return M
