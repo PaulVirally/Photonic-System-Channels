@@ -290,29 +290,32 @@ function materialize_columns(f::PanelFactored, cols)
     return V
 end
 
-# Assembles the operator densely by applying it to the identity, a batch of
-# columns at a time. The operator is matrix-free, so this costs `size(op, 2)`
-# matvecs, which is only affordable because this branch is gated on a small
-# universe. On a GPU run the identity batch is staged through the device, but the
-# assembled matrix is a host array either way since it goes straight to LAPACK.
-function _dense_matrix(op, on_gpu::Bool; batch_size::Int=256)
+# Assembles the operator densely by applying it to the identity, one column at a
+# time. The operator is matrix-free, so this costs `size(op, 2)` matvecs, which is
+# only affordable because this branch is gated on a small universe.
+#
+# The columns MUST be applied as vectors, not batched into a matrix. LinearMaps
+# has no true matrix application for an N-ary FunctionMap composition: it
+# re-composes the intermediate result (`op_i * X` is a CompositeMap, not a
+# product) and materializes it through `convert(AbstractMatrix, ...)`, which
+# allocates a host `Matrix` no matter where the operands live. With CuArray-backed
+# blocks inside `op` that mixes host and device memory and dies in BLAS. The
+# vector path allocates its intermediates with `similar(x)` and is the same one
+# every other GPU code path (the CG solve, reigen's matvecs) already exercises.
+# The assembled matrix is a host array either way since it goes straight to LAPACK.
+function _dense_matrix(op, on_gpu::Bool)
     rows, cols = size(op)
     T = ComplexF64
     M = Matrix{T}(undef, rows, cols)
-    for start in 1:batch_size:cols
-        stop = min(start + batch_size - 1, cols)
-        E = zeros(T, cols, stop - start + 1)
-        for (c, j) in enumerate(start:stop)
-            E[j, c] = one(T)
-        end
-        # NB: `op * E` would NOT be a multiplication: LinearMaps composes a map
-        # with a matrix, and materializing that composition uses *host* basis
-        # vectors, which breaks on the CuArray-backed blocks inside `op`. mul!
-        # applies the operator column by column with arrays on the right device.
-        X = on_gpu ? CuArray(E) : E
-        block = similar(X, T, (rows, stop - start + 1))
-        mul!(block, op, X)
-        copyto!(view(M, :, start:stop), Array(block))
+    e = zeros(T, cols)
+    x = on_gpu ? CuVector{T}(undef, cols) : e
+    y = on_gpu ? CuVector{T}(undef, rows) : Vector{T}(undef, rows)
+    for j in 1:cols
+        e[j] = one(T)
+        on_gpu && copyto!(x, e)
+        mul!(y, op, x)
+        copyto!(view(M, :, j), Array(y))
+        e[j] = zero(T)
     end
     return M
 end
