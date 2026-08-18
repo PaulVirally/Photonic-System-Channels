@@ -991,16 +991,26 @@ What changes:
     allocates staging buffers once and reuses them, so the device holds
     `panel_staging_bytes` plus the operator's own workspace plus the `c x c`
     reduced block, and nothing that grows with the sketch.
-  * Host memory starts scaling with `c`: two `N_u x c` matrices at peak, `Y` and
-    the swapped `Z` of the Hermitian power iteration. Not three, since the test
-    matrix is a ghost, and not fewer, since `gram` and `cholqr2!` traverse *rows*
-    and so hold every panel of their matrix in host memory at once. That is the
-    floor Funicular's residency page calls out.
+  * Host memory starts scaling with `c`: two `N_u x c` matrices during the sweeps,
+    `Y` and the swapped `Z` of the Hermitian power iteration. Two and not three
+    during the sweeps, since the test matrix is a ghost, and not fewer, since
+    `gram` and `cholqr2!` traverse *rows* and so hold every panel of their matrix
+    in host memory at once. That is the floor Funicular's residency page calls
+    out. The *peak* is one matrix higher than the sweep floor, and that extra
+    matrix is the whole point of `host_panel_bytes` being
+    `(2c + m) * N_u * 16` rather than `2c * N_u * 16`; see the save bullet.
   * The bus becomes a cost. `sweep_bytes` is the total traffic, upload plus
     writeback, over every sweep in `RSVD_PANEL_SWEEPS_*`.
-  * The save shrinks. Only the positive-Γ columns are written (workstream B5),
-    streamed panel by panel to h5, so `bytes_written` is `m`-wide rather than
-    `k`-wide and no host-side `Array` of the eigenvectors is ever formed.
+  * The save shrinks but is *not* free. Only the positive-Γ columns are written
+    (workstream B5), streamed panel by panel to h5, so `bytes_written` is `m`-wide
+    rather than `k`-wide and no host-side `Array` of the eigenvectors is ever
+    formed. What still costs is the `N_u x m` `PanelMatrix` itself:
+    `_save_ur_asym` calls `materialize_columns(out.vectors, 1:m)`, which allocates
+    a third tall matrix out of the plan, and it does so *on top of* the sketch
+    high-water rather than in place of it, because `Funicular.free!` hands a block
+    back to the plan's pinned slab pool instead of to the OS. Nothing the RSVD
+    frees before the save shrinks the process's RSS, so the cgroup sees
+    `2c + m` columns even though only `m` of them are live at that instant.
 """
 function rsvd_panel_counts(pt::SRPoint)
     N_s = vector_length(pt.sender_cells)
@@ -1033,8 +1043,14 @@ function rsvd_panel_counts(pt::SRPoint)
     vram_bytes = panel_staging_bytes(N_u, c_herm) +
                  rsvd_operator_vram_bytes(pt) +
                  c_herm^2 * BYTES_PER_COMPLEX
-    host_panel_bytes = 2 * N_u * c_herm * BYTES_PER_COMPLEX
     m = min(effective_num_pos(pt), c_herm)
+    #=
+    Three `N_u`-tall matrices' worth of pinned slabs, not two: the two `c`-wide
+    sweep matrices plus the `m`-wide positive block, which is formed *after* them
+    and does not replace them. See the host-memory bullet in the docstring, and
+    the narval OOM it was written for.
+    =#
+    host_panel_bytes = (2 * c_herm + m) * N_u * BYTES_PER_COMPLEX
     bytes_written = N_u * m * BYTES_PER_COMPLEX +
                     c_herm * BYTES_PER_COMPLEX + c_svd * BYTES_PER_COMPLEX
 
@@ -1195,10 +1211,43 @@ JLD2 buffer it on the way out, so the count is that one block and the fitted
 `rsvd_host_mem_factor` covers the buffering.
 
 The panel path has no such block: the positives-only save streams panels straight
-to h5 (workstream B5), never materializing the eigenvectors. What it has instead
-is the two pinned `N_u x c` matrices of the power iteration, which dominate the
-`k`-wide block they replace by a wide margin. At 4 λ and `c = 4050` they are 102
-GB against 50 GB, so the old term is dropped rather than added to.
+to h5 (workstream B5), never materializing a host `Array` of the eigenvectors.
+What it has instead is `(2c + m) * N_u * 16`, that is, the two pinned `N_u x c`
+matrices of the power iteration *plus* the `N_u x m` positive block the save
+forms. The old `k`-wide `Array` term is dropped rather than added to: the two
+sweep matrices dominate it by a wide margin (at 4 λ and `c = 4050` they are 102
+GB against 50 GB), but the positive block is not the same thing as that `Array`
+and does not go away with it.
+
+# Why the positive block is added and not maximised over
+
+The obvious reading of `_save_ur_asym` is that the sketch is finished by the time
+`materialize_columns(out.vectors, 1:m)` runs, so the peak should be
+`max(2c, m) * N_u * 16`. It is not, for two reasons, and a sweep of 1 λ, `k =
+4000` panel jobs on narval was OOM-killed proving it. Those jobs asked for
+`--mem=34G` on a whole A100, which is exactly what the two-matrix count
+predicted; the plan reported a 28 GiB host budget, the sketch peaked at the
+predicted `2 * N_u * c * 16 = 25.5` GB, and the process was then killed at
+`Forming the 196608 x 1919 positive block and streaming it`, i.e. after the
+sketch had completed and while the save was allocating. 31 of 333 jobs got
+through, which is the signature of a request sitting right at the edge rather
+than of a different failure.
+
+  1. `Funicular.free!` returns a block to the plan's pinned slab pool, not to the
+     OS. Slabs are page-locked and are not unmapped, so the sketch's high-water
+     is still charged to the cgroup when the positive block is allocated. Unless
+     the block is served *entirely* out of freed slabs -- which it is not, since
+     the sketch matrices are still live when `materialize_columns` starts -- the
+     new pinned pages stack on the old ones.
+  2. The h5 stream's dirty page cache is charged to the same cgroup. Slurm's
+     memory accounting counts page cache, and pages dirtied faster than
+     writeback retires them cannot be reclaimed on demand, so an `m`-wide
+     streamed write shows up in the job's memory footprint as well as on disk.
+
+`effective_num_pos` supplies `m`, so this term inherits the pessimistic
+`NUM_POS_FRACTION = 0.6` and the cap at `rank` / `N_u`. The killed jobs measured
+0.48, so the assumed `m` is about 25% above what they actually formed; that
+margin is deliberate, because this is the term whose under-count killed them.
 """
 function rsvd_host_bytes(pt::SRPoint, c::Coefficients;
                          vram_capacity_bytes::Union{Nothing,Real}=nothing)
@@ -1324,6 +1373,25 @@ changes.
     panel dataset, the orthonormalized `ss`, and one working matrix for the
     projections. Row sweeps (`gram`, `rightmul!`) hold every panel of their matrix
     at once, so this is a floor, not an average.
+
+    Three is deliberately one more than the front end's live peak, and that slack
+    is what stands in for the effect that broke the RSVD side (see
+    `rsvd_host_bytes`). Walking `_bounds_front_end_panel` in `src/bounds.jl`: the
+    basis is live throughout, `ss = similar(basis)` makes two, `free!(ss)` returns
+    its blocks to the plan's pinned slab pool, and `work = similar(basis)` then
+    comes back out of that pool -- so the *live* count never exceeds two, and even
+    a pool that reuses nothing at all tops out at the three this counts. There is
+    no fourth: `gram_bb`, `S_basis`, `ss_basis`, `C_basis` and `D_basis` are all
+    `m x m`.
+
+    Nor is there a save term to add here, which is the other half of the RSVD
+    bug. The bounds job writes only `m`-scale results to its output JLD, so it
+    never forms an `N_u`-tall matrix at save time the way `_save_ur_asym` does
+    with `materialize_columns`. Its one `N_u`-scale file operation is a *read*:
+    `_read_ur_asym_panel` opens the basis h5 with `readonly=true` as the matrix's
+    cold tier. Read page cache is clean and the kernel can drop it under cgroup
+    pressure, unlike the dirty pages an h5 stream writes, so it does not need a
+    reserve of its own. The count is therefore right as it stands.
   * Device memory is staging buffers plus the pencil arena. The `(3k + 2m) * N_u`
     tall term of the in-memory count is gone, leaving the cached grid whiteners,
     the working whitener and eigenvectors, and the projected `m x m` blocks, that

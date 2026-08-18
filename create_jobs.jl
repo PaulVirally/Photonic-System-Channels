@@ -39,8 +39,9 @@ using .CostModel
 # universe is big enough to hold them. 1/4 λ has N_u = 3072 < 4000, so its "rank" is
 # the full spectrum and it goes down the dense-exact path instead.
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_0p25x0p25x0p25_3072comps_50oversamples_32scale"
+const PROJECT_NAME = "molering_Ge1000_arxivV3_0p25x0p25x0p25_3072comps_50oversamples_32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_0p5x0p5x0p5_4000comps_50oversamples_32scale"
-const PROJECT_NAME = "narval_Ge1000_arxivV3_1x1x1_4000comps_50oversamples_32scale"
+# const PROJECT_NAME = "narval_Ge1000_arxivV3_1x1x1_4000comps_50oversamples_32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_2x2x2_4000comps_50oversamples_aniso-64-n32-n32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_4x4x4_4000comps_50oversamples_aniso-128-n8-n8scale"
 
@@ -98,7 +99,7 @@ Alliance module stack, so `:glost` requires a SLURM cluster. Molering has neithe
 the module nor a queue to relieve, and `validate_greens_launcher` refuses it there
 at generation time rather than emitting a script that cannot run.
 """
-const GREENS_LAUNCHER = :glost
+const GREENS_LAUNCHER = :sbatch # :glost for the Alliance sweeps; molering refuses :glost
 
 """
     GLOST_NTASKS, GLOST_CPUS_PER_TASK, GLOST_MEM_GB
@@ -493,6 +494,16 @@ summary table can show its work.
   `vram_GB` is what it will take if the card has room. Only the floor decides
   feasibility (see `select_gpu`), so only the floor belongs in the `over_vram`
   warning: the capped request would name a number that is an artifact of the cap.
+- `host_uncapped_GB`: what the cost model asked for before `cluster.max_host_GB`
+  clamped it, which is the same thing `vram_floor_GB` is for device memory: the
+  demand, as opposed to the request. On the panel path the two differ at the top
+  of the sweep, and the difference is not an error. Funicular's plan has an NVMe
+  tier (`scratch_dir`, `\$SLURM_TMPDIR`; see `residency_plan` in `src/common.jl`),
+  so a host budget below the whole sketch means panels spill to node-local disk
+  rather than that the job dies. Capping at the bundle and letting it spill is the
+  intended behaviour, since exceeding the bundle is billed as several GPUs and buys
+  nothing. `print_plan` says so on the rows where it happens, because a silent cap
+  looks identical to a request that happened to fit.
 """
 struct Resources
     time_s::Int
@@ -504,6 +515,7 @@ struct Resources
     over_vram::Bool
     mode::Symbol
     vram_floor_GB::Int
+    host_uncapped_GB::Int
 end
 
 """
@@ -628,8 +640,8 @@ function select_gpu(job::JobType, exp::Experiment, cluster::ClusterConfig,
     candidate = nothing
     for (name, capacity_GB, fraction, bundle_host_GB) in gpu_options(cluster)
         p = predict(cost_job(job), pt, coeffs; vram_capacity_bytes=capacity_GB * 1e9)
-        host_GB = max(MIN_MEMORY_GB,
-                      min(ceil(Int, p.host_bytes / 1e9), cluster.max_host_GB))
+        host_uncapped_GB = ceil(Int, p.host_bytes / 1e9)
+        host_GB = max(MIN_MEMORY_GB, min(host_uncapped_GB, cluster.max_host_GB))
         vram_GB = ceil(Int, p.vram_bytes / 1e9)
         floor_GB = ceil(Int, p.vram_floor_bytes / 1e9)
         #=
@@ -644,7 +656,8 @@ function select_gpu(job::JobType, exp::Experiment, cluster::ClusterConfig,
         candidate = (gpu_name=name, fraction=fraction, mode=p.mode,
                      time_s=(p.time_s - p.device_time_s) + p.device_time_s / fraction,
                      host_GB=host_GB, vram_GB=min(vram_GB, capacity_GB),
-                     vram_floor_GB=floor_GB, over_vram=floor_GB > capacity_GB)
+                     vram_floor_GB=floor_GB, over_vram=floor_GB > capacity_GB,
+                     host_uncapped_GB=host_uncapped_GB)
         vram_GB <= capacity_GB && host_GB <= bundle_host_GB && return candidate
     end
     # Nothing fitted: the last candidate is the largest allocation the cluster has,
@@ -658,17 +671,17 @@ function resources_for(job::JobType, exp::Experiment, cluster::ClusterConfig,
         s = select_gpu(job, exp, cluster, coeffs, cores)
         return Resources(max(MIN_TIME_S, ceil(Int, s.time_s)), s.host_GB, s.vram_GB,
                          cores, s.gpu_name, s.fraction, s.over_vram, s.mode,
-                         s.vram_floor_GB)
+                         s.vram_floor_GB, s.host_uncapped_GB)
     end
 
     if is_sr(exp)
         # The Green-function job: CPU only, so there is no card to select and no
         # device-bound share to stretch. `predict` reports `mode = :host`.
         p = predict(cost_job(job), to_cost_point(exp, cores), coeffs)
-        host_GB = max(MIN_MEMORY_GB,
-                      min(ceil(Int, p.host_bytes / 1e9), cluster.max_host_GB))
+        host_uncapped_GB = ceil(Int, p.host_bytes / 1e9)
+        host_GB = max(MIN_MEMORY_GB, min(host_uncapped_GB, cluster.max_host_GB))
         return Resources(max(MIN_TIME_S, ceil(Int, p.time_s)), host_GB, 0, cores,
-                         "", 1.0, false, p.mode, 0)
+                         "", 1.0, false, p.mode, 0, host_uncapped_GB)
     end
 
     #=
@@ -678,16 +691,17 @@ function resources_for(job::JobType, exp::Experiment, cluster::ClusterConfig,
     reports no host/device split, so the whole prediction is treated as device-bound
     and stretched by the slice fraction.
     =#
-    time_s, host_GB, vram_GB = fallback_resources(job, exp, cluster)
-    host_GB = max(MIN_MEMORY_GB, min(host_GB, cluster.max_host_GB))
+    time_s, host_uncapped_GB, vram_GB = fallback_resources(job, exp, cluster)
+    host_GB = max(MIN_MEMORY_GB, min(host_uncapped_GB, cluster.max_host_GB))
     uses_gpu(job) || return Resources(max(MIN_TIME_S, ceil(Int, time_s)), host_GB, 0,
-                                      cores, "", 1.0, false, :host, 0)
+                                      cores, "", 1.0, false, :host, 0, host_uncapped_GB)
     over_vram = vram_GB > cluster.max_vram_GB
     floor_GB = vram_GB
     vram_GB = min(vram_GB, cluster.max_vram_GB)
     gpu_name, fraction = choose_gpu(cluster, vram_GB, host_GB)
     return Resources(max(MIN_TIME_S, ceil(Int, time_s / fraction)), host_GB, vram_GB,
-                     cores, gpu_name, fraction, over_vram, :in_memory, floor_GB)
+                     cores, gpu_name, fraction, over_vram, :in_memory, floor_GB,
+                     host_uncapped_GB)
 end
 
 function seconds2string(seconds::Real)
@@ -815,11 +829,15 @@ Note the `-t` argument is `\\\$SLURM_CPUS_PER_TASK` (escaped) under SLURM: these
 commands go into an unquoted `<<EOF` heredoc, and the submitting shell, where the
 variable is not set, would otherwise expand it. The GLOST task file is not a heredoc,
 so `glost_task_line` strips the escape.
+
+`gpu_index` is which CUDA device the GPU jobs pin (`CUDA.device!` in each main
+file). Under SLURM it stays 0, since the allocation exposes exactly the card it
+granted; on molering it is how two launcher scripts share the two A6000s.
 """
 function job_command(job::JobType, cluster::ClusterConfig, smr::SMRSystem,
-                     params::RSVDParams)
+                     params::RSVDParams; gpu_index::Int=0)
     job_args = args(smr, params)
-    job_args *= uses_gpu(job) ? " --gpu 0" : " --gpu false"
+    job_args *= uses_gpu(job) ? " --gpu $(gpu_index)" : " --gpu false"
     return "julia --project=. -t $(num_threads(cluster)) $(main_file(job)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/"
 end
 
@@ -980,7 +998,7 @@ module load StdEnv/2023 julia/1.12.5
 # wrong module line here fails all $(length(experiments)) tasks at once.
 module load gcc openmpi glost
 
-# Every task runs `julia -t \\\$SLURM_CPUS_PER_TASK`. srun sets it for the farm
+# Every task runs julia -t \\\$SLURM_CPUS_PER_TASK. srun sets it for the farm
 # ranks; pin it here too so the serial pre-step below gets the same thread count.
 export SLURM_CPUS_PER_TASK=\\\${SLURM_CPUS_PER_TASK:-$(GLOST_CPUS_PER_TASK)}
 
@@ -1028,9 +1046,13 @@ caller can print a summary, and a named tuple describing the farm, including the
 file the caller has to write next to the launcher. That third value is `nothing`
 unless `GREENS_LAUNCHER == :glost` and the Green-function job is being run, and on
 that default path nothing else about the output changes either.
+
+`gpu_index` is forwarded to `job_command`: every GPU job in this launcher pins
+that CUDA device. See `NUM_GPUS` at the bottom of the file.
 """
 function job_launcher_script(jobs::AbstractVector{JobType}, cluster::ClusterConfig,
-                             experiments::AbstractVector{Experiment})
+                             experiments::AbstractVector{Experiment};
+                             gpu_index::Int=0)
     validate_greens_launcher(cluster)
     coeffs = coefficients_for(cluster.name)
     coeffs.calibrated ||
@@ -1109,7 +1131,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
                 header, footer = slurm_header_footer(job, cluster, smr, res, dependency)
             end
             script *= header
-            script *= job_command(job, cluster, smr, params) * "\n"
+            script *= job_command(job, cluster, smr, params; gpu_index=gpu_index) * "\n"
             script *= footer
         end
         script *= "\n"
@@ -1228,6 +1250,39 @@ function print_plan(plan, jobs::AbstractVector{JobType}, cluster::ClusterConfig;
         end
     end
 
+    #=
+    A host request that hit `cluster.max_host_GB` is the one place where the number
+    in the table is not the number the model asked for, and on the panel path the
+    gap can be tens of gigabytes. That is by design (see `Resources.host_uncapped_GB`):
+    asking past the per-GPU bundle is billed as several GPUs, and Funicular's plan
+    spills panels to the node-local NVMe under $SLURM_TMPDIR instead of failing. But
+    a cap that says nothing reads exactly like a request that fitted, so say it.
+    =#
+    capped = [(exp, job, res) for (exp, resources) in plan for job in ORDERED_JOBS
+              if haskey(resources, job)
+              for res in (resources[job],)
+              if res.host_uncapped_GB > cluster.max_host_GB]
+    if !isempty(capped)
+        println(stderr)
+        println(stderr, "  $(length(capped)) job(s) want more host memory than $(cluster.name)'s $(cluster.max_host_GB) GB bundle;")
+        println(stderr, "  the request is capped there and the run leans on the NVMe spill tier:")
+        shown = Set{Tuple{Symbol,Int,Int}}()
+        for (exp, job, res) in capped
+            key = (res.mode, res.host_uncapped_GB, exp.rank)
+            key in shown && continue
+            push!(shown, key)
+            short = job == GenerateGreensJob ? "greens" :
+                    job == GenerateRSVDJob ? "rsvd" : "bounds"
+            println(stderr, "    $(join(exp.sender_cells, "x")) k=$(exp.rank) $(short) [$(mode_label(res.mode))]: ",
+                    "wants $(res.host_uncapped_GB) G, asking for $(res.host_GB) G")
+        end
+        println(stderr, "  Funicular's ResidencyPlan gets scratch_dir = \$SLURM_TMPDIR (src/common.jl,")
+        println(stderr, "  residency_plan), so panels beyond the host budget go to node-local disk rather")
+        println(stderr, "  than out of memory. This is expected at the top of the sweep, not a mis-sizing.")
+        println(stderr, "  It does cost bus time, and it needs SLURM_TMPDIR to be real: if the node has no")
+        println(stderr, "  local NVMe the plan has nowhere to spill and the job will die at the sketch.")
+    end
+
     if !isnothing(glost)
         glost_core_hours = glost.time_s * glost.ntasks * glost.cpus_per_task / 3600
         println(stderr)
@@ -1263,11 +1318,30 @@ end
 
 load_coefficients!(joinpath(@__DIR__, "bench"))
 
-# cluster = ClusterConfig("molering")
+cluster = ClusterConfig("molering")
 # cluster = ClusterConfig("fir")
-cluster = ClusterConfig("narval")
+# cluster = ClusterConfig("narval")
 # cluster = ClusterConfig("nibi")
 # cluster = ClusterConfig("rorqual")
+
+"""
+    NUM_GPUS
+
+How many launcher scripts to split the sweep across, one CUDA device per script
+(`--gpu 0`, `--gpu 1`, ...). Molering has two A6000s and no scheduler, so two
+scripts running side by side is how both cards get used. Keep this at 1 on the
+SLURM clusters: there the scheduler hands every job its own card and `--gpu 0`
+is always right inside an allocation (the loop below enforces this).
+
+The split is round-robin over the experiment list, so whatever run order is set
+below survives within each script, and both scripts cover the whole separation
+range rather than one taking the cheap half. The scripts share every directory:
+outputs are keyed by experiment name, the ext Green blocks are keyed by
+separation (disjoint between the scripts), and the one shared self Green block
+is written through `serialize_atomic`, so concurrent scripts at worst build it
+redundantly once each instead of corrupting it.
+"""
+const NUM_GPUS = 2
 
 valid_clusters = ["molering", "fir", "narval", "nibi", "rorqual"]
 for cluster_name in valid_clusters
@@ -1280,7 +1354,31 @@ end
 
 
 ### Metasurface: lambda/4 cubes at lambda/32 cells, swept in separation
-separations = unique(round.(Int, logrange(1, 10000 * 32, 415))) .// 32 # 415 points gives us 333 actual points (times 3 = 999 < 1000 which is the number of points we can submit to the queue at once (× 3 because 3 jobs per experiment))
+# separations = unique(round.(Int, logrange(1, 10000 * 32, 415))) .// 32 # 415 points gives us 333 actual points (times 3 = 999 < 1000 which is the number of points we can submit to the queue at once (× 3 because 3 jobs per experiment))
+
+"""
+    unique_log_separations(count) -> Vector{Rational{Int}}
+
+`count` log-spaced separations with the production grid's endpoints, 1/32 λ to
+10000 λ. Rounding to integer cells collapses log-spaced points at the small end
+(415 requested points give 333 on the production grid), so the argument to
+`logrange` is searched for until the unique count comes out exactly right.
+"""
+function unique_log_separations(count::Int)
+    for n in count:20*count
+        seps = unique(round.(Int, logrange(1, 10000 * 32, n))) .// 32
+        length(seps) == count && return seps
+    end
+    error("no logrange length gives exactly $count unique separations")
+end
+
+# Molering two-GPU 1/4 λ sweep: 100 points total, 50 per card.
+separations = unique_log_separations(NUM_GPUS * 50)
+
+# Run the 1 λ to 10 λ decade first, then everything else, both halves in
+# increasing separation. The round-robin split preserves this order per script.
+separations = vcat(filter(s -> 1 <= s <= 10, separations),
+                   filter(s -> !(1 <= s <= 10), separations))
 
 # chi = 13.6 + 0.05im # "Silicon like"
 chi = 4.250 + 0.0342557im # Germanium with ζ = 1000
@@ -1291,7 +1389,7 @@ chi = 4.250 + 0.0342557im # Germanium with ζ = 1000
 # at the top of the file, and run. Each of the five writes its own launcher.
 
 # 1/4
-# experiments = sr_sweep(cells=(8, 8, 8), separations=separations, scale=1 // 32, chi=chi, rank=3072, oversamples=50, power_iters=14)
+experiments = sr_sweep(cells=(8, 8, 8), separations=separations, scale=1 // 32, chi=chi, rank=3072, oversamples=50, power_iters=14)
 # experiments = sr_sweep(cells=(8, 8, 8), separations=separations, scale=1 // 32, chi=chi, rank=1350, oversamples=50, power_iters=14)
 
 # 1/2
@@ -1299,7 +1397,7 @@ chi = 4.250 + 0.0342557im # Germanium with ζ = 1000
 # experiments = sr_sweep(cells=(16, 16, 16), separations=separations, scale=1 // 32, chi=chi, rank=1350, oversamples=50, power_iters=14)
 
 # 1
-experiments = sr_sweep(cells=(32, 32, 32), separations=separations, scale=1 // 32, chi=chi, rank=4000, oversamples=50, power_iters=14)
+# experiments = sr_sweep(cells=(32, 32, 32), separations=separations, scale=1 // 32, chi=chi, rank=4000, oversamples=50, power_iters=14)
 # experiments = sr_sweep(cells=(32, 32, 32), separations=separations, scale=1 // 32, chi=chi, rank=1350, oversamples=50, power_iters=14)
 
 # 2
@@ -1321,37 +1419,53 @@ experiments = sr_sweep(cells=(32, 32, 32), separations=separations, scale=1 // 3
 # the list anyway: on cold scratch it is the only thing that builds them.
 jobs_to_run  = [GenerateGreensJob, GenerateRSVDJob, ComputeBoundsJob]
 # jobs_to_run  = [GenerateRSVDJob, ComputeBoundsJob]
-command, plan, glost_summary = job_launcher_script(
-    jobs_to_run,
-    cluster,
-    experiments,
-)
 
-# print(command)
-print_plan(plan, jobs_to_run, cluster; glost=glost_summary)
+NUM_GPUS > 1 && cluster.has_slurm &&
+    error("NUM_GPUS > 1 is for unscheduled machines: under SLURM every job gets " *
+          "its own allocation and --gpu 0 is always the right device. Set NUM_GPUS = 1.")
 
+# One launcher per GPU, round-robin over the experiment list. NUM_GPUS == 1
+# reproduces the old single-launcher flow, same filename and all.
 mkpath(joinpath(@__DIR__, "jobs"))
-script_path = joinpath(@__DIR__, "jobs", "launch_$(PROJECT_NAME).sh")
-open(script_path, "w") do f
-    write(f, command)
-end
-println(stderr, "\nJob launcher script written to $(script_path)")
-if !isnothing(glost_summary)
-    # The launcher submits the farm, but the task file is what the farm reads, so
-    # it has to travel with it. The sbatch block looks for it at
-    # <code_dir>jobs/<name>.
-    tasks_path = joinpath(@__DIR__, "jobs", glost_summary.tasks_filename)
-    open(tasks_path, "w") do f
-        write(f, glost_summary.tasks)
+script_paths = String[]
+for gpu_index in 0:(NUM_GPUS - 1)
+    gpu_experiments = experiments[(gpu_index + 1):NUM_GPUS:end]
+    command, plan, glost_summary = job_launcher_script(jobs_to_run, cluster,
+                                                       gpu_experiments;
+                                                       gpu_index=gpu_index)
+    # print(command)
+    print_plan(plan, jobs_to_run, cluster; glost=glost_summary)
+
+    suffix = NUM_GPUS == 1 ? "" : "_gpu$(gpu_index)"
+    script_path = joinpath(@__DIR__, "jobs", "launch_$(PROJECT_NAME)$(suffix).sh")
+    open(script_path, "w") do f
+        write(f, command)
     end
-    println(stderr, "GLOST task file written to $(tasks_path) ($(glost_summary.num_tasks) tasks)")
-    println(stderr, "Copy BOTH over (the launcher is useless without the task file):")
-    println(stderr, "  scp \"$(script_path)\" \"$(tasks_path)\" \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(cluster.code_dir)jobs/\"")
+    push!(script_paths, script_path)
+    println(stderr, "\nJob launcher script written to $(script_path)")
+    if !isnothing(glost_summary)
+        # The launcher submits the farm, but the task file is what the farm reads, so
+        # it has to travel with it. The sbatch block looks for it at
+        # <code_dir>jobs/<name>.
+        tasks_path = joinpath(@__DIR__, "jobs", glost_summary.tasks_filename)
+        open(tasks_path, "w") do f
+            write(f, glost_summary.tasks)
+        end
+        println(stderr, "GLOST task file written to $(tasks_path) ($(glost_summary.num_tasks) tasks)")
+        println(stderr, "Copy BOTH over (the launcher is useless without the task file):")
+        println(stderr, "  scp \"$(script_path)\" \"$(tasks_path)\" \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(cluster.code_dir)jobs/\"")
+    end
 end
+
+quoted_paths = join(("\"$p\"" for p in script_paths), " ")
 if cluster.has_slurm
-    println(stderr, "Copy it over:  scp \"$(script_path)\" \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(cluster.code_dir)jobs/\"")
+    println(stderr, "Copy it over:  scp $(quoted_paths) \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(cluster.code_dir)jobs/\"")
     println(stderr, "Then run it:   ssh $(CC_UNAME)@$(cluster.name).alliancecan.ca 'cd $(cluster.code_dir) && bash jobs/launch_$(PROJECT_NAME).sh'")
 else
-    println(stderr, "Copy it over:  scp \"$(script_path)\" \"$(MOLERING_UNAME)@molering:$(cluster.code_dir)jobs/\"")
-    println(stderr, "Then run it:   ssh $(MOLERING_UNAME)@molering 'cd $(cluster.code_dir) && bash jobs/launch_$(PROJECT_NAME).sh'")
+    println(stderr, "Copy over:  scp $(quoted_paths) \"$(MOLERING_UNAME)@molering:$(cluster.code_dir)jobs/\"")
+    for p in script_paths
+        name = basename(p)
+        log = replace(name, r"\.sh$" => "") * ".log"
+        println(stderr, "Then run:   ssh $(MOLERING_UNAME)@molering 'cd $(cluster.code_dir) && nohup bash jobs/$(name) > jobs/$(log) 2>&1 &'")
+    end
 end

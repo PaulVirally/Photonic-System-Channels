@@ -30,6 +30,6 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 
 [sources]
-Funicular = {url = "https://github.com/PaulVirally/Funicular.jl", rev = "5cc402849a59fe312d0aa5daab90dd06d24cf091"}
-GilaElectromagnetics = {url = "https://github.com/PaulVirally/GilaElectromagnetics.jl/", rev = "b7c747d07ebc5eb83dff3c08790f23b8a8c005a1"}
+Funicular = {url = "https://github.com/PaulVirally/Funicular.jl", rev = "b7c2046af936828bf2167451c14de1f3c795e70f"}
+GilaElectromagnetics = {url = "https://github.com/PaulVirally/GilaElectromagnetics.jl/", rev = "2db766f70d635bc1b58553bf441c7a72ab5f65e3"}
 MatrixFreeRandomizedLinearAlgebra = {url = "https://github.com/PaulVirally/MatrixFreeRandomizedLinearAlgebra.jl", rev = "2aa57f19db18c5ec2c9a84a94f6c6eff11fe5e3f"}

@@ -261,9 +261,19 @@ function resolve_seed(requested::Int, project_name::AbstractString)
 end
 
 # Host memory the process needs for itself outside the panel tier: the Julia
-# runtime, the Gila operator's host side, the JLD writes, and the page-locking
-# slack. Trial E2 pins the real number down; 6 GB is the plan's working estimate.
-const HOST_OVERHEAD_RESERVE_BYTES = 6 * 2^30
+# runtime, the Gila operator's host side, the JLD writes, the page-locking slack,
+# and the page cache the h5 stream in `_save_ur_asym` dirties on its way out --
+# Slurm charges dirty pages to the job's cgroup, and writeback does not retire
+# them fast enough for them to be reclaimable on demand. Trial E2 pins the real
+# number down. Was 6 GB, the plan's working estimate; raised to 8 GB after a
+# sweep of 1 λ, k = 4000 panel jobs on narval was OOM-killed at the positive-block
+# save with a 28 GiB budget carved out of a 34 GB request, i.e. with the whole
+# margin already spent. The extra 2 GB is the measured shortfall, not a guess at a
+# comfortable number: the analytic under-count that caused it is fixed on the
+# request side, in `rsvd_host_bytes` in bench/cost_model.jl, and this reserve only
+# has to keep the plan from handing the sketch memory the save and the page cache
+# will then want.
+const HOST_OVERHEAD_RESERVE_BYTES = 8 * 2^30
 # Below this there is no point starting, since one row sweep has to hold a whole
 # matrix.
 const HOST_BUDGET_FLOOR_BYTES = 2^30
@@ -319,9 +329,11 @@ free:
   here. The operator's own device footprint goes in through `workspace_bytes`,
   which the plan holds back from the buffer pool itself.
 - `host_budget` is the Slurm memory request minus a $(HOST_OVERHEAD_RESERVE_BYTES >> 30) GB overhead
-  reserve for the runtime and the operator's host side, floored at
+  reserve for the runtime, the operator's host side and the page cache the
+  positive-block h5 stream dirties (Slurm charges that to the cgroup), floored at
   $(HOST_BUDGET_FLOOR_BYTES >> 30) GB. Off a cluster it is the machine's total memory, same
-  reserve.
+  reserve. The reserve is a measured OOM margin, not a round number: see the
+  comment on `HOST_OVERHEAD_RESERVE_BYTES`.
 - `scratch_dir` is node-local NVMe (`\$SLURM_TMPDIR`) when Slurm gave us one.
   With a scratch dir the host tier no longer has to hold a whole sketch, only
   what a sweep touches at once.
