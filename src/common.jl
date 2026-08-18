@@ -176,6 +176,11 @@ function ArgParse.parse_args()
             help = "Seed for the panel path's regenerated test matrix (0 derives it from --name)"
             arg_type = Int
             default = 0
+
+        "--gamma-rtol"
+            help = "Relative cut on the positive Asym(G⁰ᵤᵣ) spectrum for the bounds: keep only Γ ≥ gamma-rtol * Γ₁ (0 keeps the whole positive block)"
+            arg_type = Float64
+            default = DEFAULT_GAMMA_RTOL
     end
     args = parse_args(settings)
 
@@ -242,7 +247,13 @@ function ArgParse.parse_args()
     )
     @info string(now()) * " [common::parse_args] Using RSVD parameters:" rank(rsvd_params) oversamples(rsvd_params) power_iter(rsvd_params) seed(rsvd_params)
 
-    return compute_env, smr, rsvd_params
+    # `gamma_rtol` belongs to the bounds stage, not the RSVD, so it rides alongside
+    # RSVDParams instead of going into it. The RSVD entry points destructure the
+    # leading three and let this one fall off the end.
+    gamma_rtol = args["gamma-rtol"]
+    @info string(now()) * " [common::parse_args] Using gamma_rtol = $(gamma_rtol) for the bounds' spectral cut"
+
+    return compute_env, smr, rsvd_params, gamma_rtol
 end
 
 """
@@ -316,9 +327,9 @@ end
     residency_plan(compute_env; workspace_bytes=0) -> Funicular.ResidencyPlan or nothing
 
 The `ResidencyPlan` the panel path streams its sketches through, sized from the
-allocation this process is running inside. Returns `nothing` on a CPU run: with
-no device in the picture and the sketch already in host memory, the panel
-machinery only adds bookkeeping, so CPU runs keep the in-memory path
+allocation this process is running inside. Returns `nothing` on a CPU run: with no
+device in the picture the sketch is already in host memory, so the panel machinery
+would only add bookkeeping and CPU runs keep the in-memory path
 (FUNICULAR_PLAN.md, workstream B1/B3).
 
 Both budgets come from what the job was granted, not from what is momentarily

@@ -583,7 +583,8 @@ positive prefix.
 not a threshold that falls out of anything. Past `N_u ~ k` the "rank" is the whole
 spectrum, so a rank-`k` sketch of a `3,072 x 3,072` operator at `k = 4,000`
 approximates nothing: it is a more expensive and less accurate way to compute a
-full eigendecomposition. Keep this in step with the constant in `src/rsvd.jl`.
+full eigendecomposition. Keep this in step with `DENSE_EXACT_MAX_N_U` in
+`src/rsvd.jl`, which is the same number under a different name.
 """
 const DENSE_EXACT_MAX_N = 12_288
 
@@ -702,11 +703,12 @@ Whether the RSVD will hand MatrixFreeRandomizedLinearAlgebra a Funicular
 `ResidencyPlan` instead of keeping the sketch on the device, that is, whether the
 in-memory sketch cannot be squeezed into `PANEL_PATH_DEVICE_FRACTION` of the card.
 
-One predicate, evaluated identically here and in `src/rsvd.jl`. The cost model is
-what sizes the SLURM request and picks the MIG slice, so guessing a different path
-than the job then takes gets the request wrong either way: a panel-path job given
-an in-memory VRAM request wastes a whole card, and an in-memory job given
-panel-path host memory dies at the first `Array`.
+One predicate, evaluated identically here and in `use_panel_path` in `src/rsvd.jl`
+(the names differ by a letter; they must not differ in what they compute). The cost
+model is what sizes the SLURM request and picks the MIG slice, so guessing a
+different path than the job then takes gets the request wrong either way: a
+panel-path job given an in-memory VRAM request wastes a whole card, and an
+in-memory job given panel-path host memory dies at the first `Array`.
 
 `vram_capacity_bytes === nothing` means no card was named, and returns `false`.
 The in-memory path is the historical behaviour, and the one every existing caller
@@ -715,7 +717,7 @@ and every fitted coefficient describes.
 Note, however, that this does *not* consult `uses_dense_path`. The runtime checks
 the dense branch first and never reaches the plan question for a tiny universe,
 and `rsvd_mode` reproduces that ordering. Keeping this function to the memory
-question alone makes it directly comparable with the line in `src/rsvd.jl`.
+question alone makes it directly comparable with `use_panel_path` in `src/rsvd.jl`.
 """
 function uses_panel_path(pt::SRPoint, vram_capacity_bytes::Union{Nothing,Real};
                          floor_factor::Real=PANEL_PATH_FLOOR_FACTOR)
@@ -1221,17 +1223,17 @@ and does not go away with it.
 
 # Why the positive block is added and not maximised over
 
-The obvious reading of `_save_ur_asym` is that the sketch is finished by the time
-`materialize_columns(out.vectors, 1:m)` runs, so the peak should be
-`max(2c, m) * N_u * 16`. It is not, for two reasons, and a sweep of 1 λ, `k =
-4000` panel jobs on narval was OOM-killed proving it. Those jobs asked for
-`--mem=34G` on a whole A100, which is exactly what the two-matrix count
-predicted; the plan reported a 28 GiB host budget, the sketch peaked at the
-predicted `2 * N_u * c * 16 = 25.5` GB, and the process was then killed at
-`Forming the 196608 x 1919 positive block and streaming it`, i.e. after the
-sketch had completed and while the save was allocating. 31 of 333 jobs got
-through, which is the signature of a request sitting right at the edge rather
-than of a different failure.
+Reading `_save_ur_asym`, the sketch looks finished by the time
+`materialize_columns(out.vectors, 1:m)` runs, which would make the peak
+`max(2c, m) * N_u * 16`. It is not, and a sweep of 1 λ, `k = 4000` panel jobs on
+narval was OOM-killed showing it. Those jobs asked for `--mem=34G` on a whole
+A100, which is exactly what the two-matrix count predicted; the plan reported a 28
+GiB host budget, the sketch peaked at the predicted `2 * N_u * c * 16 = 25.5` GB,
+and the process was then killed at `Forming the 196608 x 1919 positive block and
+streaming it`, i.e. after the sketch had completed and while the save was
+allocating. 31 of 333 jobs got through, which is a request sitting right at the
+edge rather than a different failure. Two things keep the sketch's memory on the
+books:
 
   1. `Funicular.free!` returns a block to the plan's pinned slab pool, not to the
      OS. Slabs are page-locked and are not unmapped, so the sketch's high-water
@@ -1245,9 +1247,10 @@ than of a different failure.
      streamed write shows up in the job's memory footprint as well as on disk.
 
 `effective_num_pos` supplies `m`, so this term inherits the pessimistic
-`NUM_POS_FRACTION = 0.6` and the cap at `rank` / `N_u`. The killed jobs measured
-0.48, so the assumed `m` is about 25% above what they actually formed; that
-margin is deliberate, because this is the term whose under-count killed them.
+`NUM_POS_FRACTION = 0.6` and the cap at `rank` / `N_u`. The killed jobs measured a
+positive fraction of 0.48, so the assumed `m` sits about 25% above what they
+actually formed. This is the term whose under-count killed them, so the margin
+stays.
 """
 function rsvd_host_bytes(pt::SRPoint, c::Coefficients;
                          vram_capacity_bytes::Union{Nothing,Real}=nothing)
@@ -1374,24 +1377,22 @@ changes.
     projections. Row sweeps (`gram`, `rightmul!`) hold every panel of their matrix
     at once, so this is a floor, not an average.
 
-    Three is deliberately one more than the front end's live peak, and that slack
-    is what stands in for the effect that broke the RSVD side (see
-    `rsvd_host_bytes`). Walking `_bounds_front_end_panel` in `src/bounds.jl`: the
-    basis is live throughout, `ss = similar(basis)` makes two, `free!(ss)` returns
-    its blocks to the plan's pinned slab pool, and `work = similar(basis)` then
-    comes back out of that pool -- so the *live* count never exceeds two, and even
-    a pool that reuses nothing at all tops out at the three this counts. There is
-    no fourth: `gram_bb`, `S_basis`, `ss_basis`, `C_basis` and `D_basis` are all
-    `m x m`.
+    Three is one more than the front end's live peak, and that slack stands in for
+    the effect that broke the RSVD side (see `rsvd_host_bytes`). Walking
+    `_bounds_front_end_panel` in `src/bounds.jl`: the basis is live throughout,
+    `ss = similar(basis)` makes two, `free!(ss)` returns its blocks to the plan's
+    pinned slab pool, and `work = similar(basis)` then comes back out of that pool.
+    The *live* count never exceeds two, and even a pool that reuses nothing at all
+    tops out at the three this counts. There is no fourth: `gram_bb`, `S_basis`,
+    `ss_basis`, `C_basis` and `D_basis` are all `m x m`.
 
-    Nor is there a save term to add here, which is the other half of the RSVD
-    bug. The bounds job writes only `m`-scale results to its output JLD, so it
-    never forms an `N_u`-tall matrix at save time the way `_save_ur_asym` does
-    with `materialize_columns`. Its one `N_u`-scale file operation is a *read*:
-    `_read_ur_asym_panel` opens the basis h5 with `readonly=true` as the matrix's
-    cold tier. Read page cache is clean and the kernel can drop it under cgroup
-    pressure, unlike the dirty pages an h5 stream writes, so it does not need a
-    reserve of its own. The count is therefore right as it stands.
+    There is no save term either. The bounds job writes only `m`-scale results to
+    its output JLD, so it never forms an `N_u`-tall matrix at save time the way
+    `_save_ur_asym` does with `materialize_columns`. Its one `N_u`-scale file
+    operation is a *read*: `_read_ur_asym_panel` opens the basis h5 with
+    `readonly=true` as the matrix's cold tier. Read page cache is clean and the
+    kernel can drop it under cgroup pressure, unlike the dirty pages an h5 stream
+    writes, so it needs no reserve of its own.
   * Device memory is staging buffers plus the pencil arena. The `(3k + 2m) * N_u`
     tall term of the in-memory count is gone, leaving the cached grid whiteners,
     the working whitener and eigenvectors, and the projected `m x m` blocks, that

@@ -171,6 +171,21 @@ larger runs. 0.60 is deliberately on the high side so the bounds job does not ru
 const NUM_POS_FRACTION = 0.60
 
 """
+    GAMMA_RTOL
+
+`--gamma-rtol` for the bounds jobs: keep only the positive `Asym(G⁰ᵤᵣ)` eigenvalues
+with `Γ[i] >= GAMMA_RTOL * Γ[1]`. This is `DEFAULT_GAMMA_RTOL` in `src/bounds.jl`
+written out explicitly, so that a generated launcher records the cut its numbers
+were produced under instead of inheriting whatever the default happens to be when
+it is run.
+
+Bounds-only: the flag is parsed by every main file (it comes out of `parse_args`),
+but only `load_bounds_inputs` reads it, so the greens and RSVD command lines are
+left without it rather than carrying an argument that does nothing to them.
+"""
+const GAMMA_RTOL = 1e-12
+
+"""
     MIN_MEMORY_GB, MIN_TIME_S
 
 Floors on every request. 4 GB because nothing useful runs in less and the
@@ -518,12 +533,8 @@ struct Resources
     host_uncapped_GB::Int
 end
 
-"""
-    mode_label(mode) -> String
-
-Short name for the plan table's `mode` column. `:host` is the Green-function job,
-which has no device storage path to report.
-"""
+# Short name for the plan table's `mode` column. `:host` is the Green-function job,
+# which has no device storage path to report, hence the dash.
 mode_label(mode::Symbol) =
     mode == :dense_exact ? "dense" :
     mode == :in_memory ? "inmem" :
@@ -838,6 +849,8 @@ function job_command(job::JobType, cluster::ClusterConfig, smr::SMRSystem,
                      params::RSVDParams; gpu_index::Int=0)
     job_args = args(smr, params)
     job_args *= uses_gpu(job) ? " --gpu $(gpu_index)" : " --gpu false"
+    # See GAMMA_RTOL: the spectral cut belongs to the bounds stage alone.
+    job == ComputeBoundsJob && (job_args *= " --gamma-rtol $(GAMMA_RTOL)")
     return "julia --project=. -t $(num_threads(cluster)) $(main_file(job)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/"
 end
 
@@ -919,13 +932,9 @@ function glost_task_line(cluster::ClusterConfig, exp::Experiment)
     return "$(cmd) >> $(log) 2>&1"
 end
 
-"""
-    glost_tasks_file(cluster, experiments) -> String
-
-The whole task file: one line per experiment, with no header and no comments. GLOST
-counts lines as tasks, `glost_filter` reads them back positionally, and the pre-step
-below takes line 1 literally.
-"""
+# One line per experiment, with no header and no comments: GLOST counts lines as
+# tasks, `glost_filter` reads them back positionally, and the pre-step below takes
+# line 1 literally.
 glost_tasks_file(cluster::ClusterConfig, experiments::AbstractVector{Experiment}) =
     join((glost_task_line(cluster, exp) for exp in experiments), "\n") * "\n"
 
@@ -1122,7 +1131,7 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
             glost_active && job == GenerateGreensJob && continue
             res = resources[job]
             if res.over_vram
-                @warn "$(experiment_name(smr)) $(string(job)) cannot be squeezed below about $(res.vram_floor_GB) GB of VRAM on the $(mode_label(res.mode)) path, more than the $(cluster.max_vram_GB) GB on $(cluster.name). Submitting anyway on a whole GPU, but expect an out-of-memory failure. Reduce the rank or move it to a bigger card."
+                @warn "$(experiment_name(smr)) $(string(job)) cannot be squeezed below about $(res.vram_floor_GB) GB of VRAM on the $(mode_label(res.mode)) path, against the $(cluster.max_vram_GB) GB on $(cluster.name). Submitting on a whole GPU anyway, but expect it to run out of memory; reduce the rank or move it to a bigger card."
             end
 
             header, footer = "", ""
@@ -1356,14 +1365,10 @@ end
 ### Metasurface: lambda/4 cubes at lambda/32 cells, swept in separation
 # separations = unique(round.(Int, logrange(1, 10000 * 32, 415))) .// 32 # 415 points gives us 333 actual points (times 3 = 999 < 1000 which is the number of points we can submit to the queue at once (× 3 because 3 jobs per experiment))
 
-"""
-    unique_log_separations(count) -> Vector{Rational{Int}}
-
-`count` log-spaced separations with the production grid's endpoints, 1/32 λ to
-10000 λ. Rounding to integer cells collapses log-spaced points at the small end
-(415 requested points give 333 on the production grid), so the argument to
-`logrange` is searched for until the unique count comes out exactly right.
-"""
+# `count` log-spaced separations over the production grid's endpoints, 1/32 λ to
+# 10000 λ. Rounding to integer cells collapses log-spaced points at the small end
+# (415 requested points give 333 on the production grid), so the `logrange` length
+# is searched for until the unique count comes out exactly right.
 function unique_log_separations(count::Int)
     for n in count:20*count
         seps = unique(round.(Int, logrange(1, 10000 * 32, n))) .// 32
@@ -1462,10 +1467,10 @@ if cluster.has_slurm
     println(stderr, "Copy it over:  scp $(quoted_paths) \"$(CC_UNAME)@$(cluster.name).alliancecan.ca:$(cluster.code_dir)jobs/\"")
     println(stderr, "Then run it:   ssh $(CC_UNAME)@$(cluster.name).alliancecan.ca 'cd $(cluster.code_dir) && bash jobs/launch_$(PROJECT_NAME).sh'")
 else
-    println(stderr, "Copy over:  scp $(quoted_paths) \"$(MOLERING_UNAME)@molering:$(cluster.code_dir)jobs/\"")
+    println(stderr, "Copy it over:  scp $(quoted_paths) \"$(MOLERING_UNAME)@molering:$(cluster.code_dir)jobs/\"")
     for p in script_paths
         name = basename(p)
         log = replace(name, r"\.sh$" => "") * ".log"
-        println(stderr, "Then run:   ssh $(MOLERING_UNAME)@molering 'cd $(cluster.code_dir) && nohup bash jobs/$(name) > jobs/$(log) 2>&1 &'")
+        println(stderr, "Then run it:   ssh $(MOLERING_UNAME)@molering 'cd $(cluster.code_dir) && nohup bash jobs/$(name) > jobs/$(log) 2>&1 &'")
     end
 end

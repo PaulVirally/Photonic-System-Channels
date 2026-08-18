@@ -292,17 +292,16 @@ end
 
 # Assembles the operator densely by applying it to the identity, one column at a
 # time. The operator is matrix-free, so this costs `size(op, 2)` matvecs, which is
-# only affordable because this branch is gated on a small universe.
+# only affordable because this branch is gated on a small universe. The assembled
+# matrix is a host array either way, since it goes straight to LAPACK.
 #
-# The columns MUST be applied as vectors, not batched into a matrix. LinearMaps
-# has no true matrix application for an N-ary FunctionMap composition: it
-# re-composes the intermediate result (`op_i * X` is a CompositeMap, not a
-# product) and materializes it through `convert(AbstractMatrix, ...)`, which
-# allocates a host `Matrix` no matter where the operands live. With CuArray-backed
-# blocks inside `op` that mixes host and device memory and dies in BLAS. The
-# vector path allocates its intermediates with `similar(x)` and is the same one
-# every other GPU code path (the CG solve, reigen's matvecs) already exercises.
-# The assembled matrix is a host array either way since it goes straight to LAPACK.
+# The columns have to go through one at a time as vectors: LinearMaps has no true
+# matrix application for an N-ary FunctionMap composition. It re-composes the
+# intermediate result (`op_i * X` is a CompositeMap, not a product) and materializes
+# it through `convert(AbstractMatrix, ...)`, which allocates a host `Matrix`
+# wherever the operands live. With CuArray-backed blocks inside `op` that mixes
+# host and device memory and dies in BLAS. The vector path takes its intermediates
+# from `similar(x)`, which is what every other GPU path here already relies on.
 function _dense_matrix(op, on_gpu::Bool)
     rows, cols = size(op)
     T = ComplexF64
@@ -425,10 +424,10 @@ end
     _save_ur_asym_components(jld_path, jld_key, evals, num_pos, seed_value, exact; V_pos=nothing, vectors_file=nothing)
 
 Writes the `UR_asym/` group. `D` is every eigenvalue the solve returned, in
-descending order, and `num_pos` is how many of them are positive, which is the
-`m` that slices the basis. Exactly one of `V_pos` (the N_u × m block, inline) and
-`vectors_file` (the basename of the h5 the block was streamed to) is given. We do
-not write the legacy full `V` key: at 4 λ its negative-Γ half is 7 TB of vectors
+descending order, and `num_pos` is how many of them are positive, which is the `m`
+that slices the basis. Exactly one of `V_pos` (the N_u × m block, inline) and
+`vectors_file` (the basename of the h5 the block was streamed to) is given. The
+legacy full `V` key is not written: at 4 λ its negative-Γ half is 7 TB of vectors
 nothing reads.
 """
 function _save_ur_asym_components(jld_path::String, jld_key::String, evals::AbstractVector, num_pos::Int, seed_value::Int, exact::Bool; V_pos=nothing, vectors_file=nothing)

@@ -17,10 +17,10 @@ making the certificate systems comfortably definite.
 const VERIFY_ALPHA_INFLATION = 0.05
 
 #=
-Cap on the number of full-space probe solves per index. The certified bound is
-a max over probes k ∈ n:num_pos, so a truncated probe set is reported as such
-Tthe probes with the largest basis duals are kept, which is where the max is
-overwhelmingly likely to live, but it is no longer a strict certificate over
+Cap on the number of full-space probe solves per index. The certified bound is a
+max over probes k ∈ n:num_pos, so a truncated probe set is reported as such. The
+probes kept are the ones with the largest basis duals, which is where the max
+almost certainly lives, but the result is then no longer a strict certificate over
 all probes.
 =#
 const VERIFY_MAX_PROBES = 512
@@ -86,12 +86,12 @@ end
 Full-space dual certificate for index `n` at the production-optimal `τ`.
 `records` are the basis-side per-probe solutions from `pencil_probe_duals`.
 
-Feasibility logic: `C(τ) ⪰ 0` (certified separately, once, at the τ = 0, 1
-endpoints, `C` is affine in τ so the endpoints cover the family) makes
-`λ_min(αC − Bₙ)` non-decreasing in α, so one Lanczos check at the smallest
-evaluated multiplier certifies every larger one. If the basis multiplier is
-infeasible in the full space the floor is doubled until feasible and every
-probe is clamped to at least the floor.
+`C(τ) ⪰ 0` makes `λ_min(αC − Bₙ)` non-decreasing in `α`, so one Lanczos check at
+the smallest evaluated multiplier certifies every larger one. (`C ⪰ 0` is itself
+certified once, at `τ = 0` and `τ = 1`; `C` is affine in `τ`, so the endpoints
+cover the family.) A basis multiplier that turns out to be infeasible in the full
+space has the floor doubled until it is feasible, and every probe is then clamped
+to at least that floor.
 """
 function certify_index(n::Int, τ::Real, records, family, ss::AbstractMatrix,
                        x₀::AbstractVector)
@@ -187,15 +187,11 @@ function certify_index(n::Int, τ::Real, records, family, ss::AbstractMatrix,
             best_probe=ks[i_best])
 end
 
-"""
-    production_bounds_checks(jld_path)
-
-Nearly-free internal-consistency checks on the saved production bounds, over
-all indices: the dual bounds must be non-increasing in `n` (`Bₙ ⪯ Bₙ₋₁` and
-the probe set shrinks), and should not meaningfully exceed the semi-analytic
-Eq. (40) curve, which is a further relaxation of the same program. Returns
-`nothing` when the production file is absent.
-"""
+# Consistency checks on the saved production bounds, over every index. The dual
+# bounds have to be non-increasing in n, since Bₙ ⪯ Bₙ₋₁ and the probe set shrinks,
+# and they should not meaningfully exceed the semi-analytic Eq. (40) curve, which
+# is a further relaxation of the same program. Returns nothing when there is no
+# production file to read.
 function production_bounds_checks(jld_path::AbstractString)
     ispath(jld_path) || return nothing
     jld = jldopen(jld_path, "r")
@@ -270,17 +266,17 @@ function _verify_summary(smr::SMRSystem, result, per_index, rsvd_check, λC0, λ
         println(io, "Production output file not found; skipped saved-bounds checks")
     end
 
-    println(io, "Reading the ratios: full/basis slightly above 1 is expected (the full dual is")
-    println(io, "evaluated at (1+ε)α, ε = $(VERIFY_ALPHA_INFLATION), and each probe is padded by its CG")
-    println(io, "error bar ‖s‖‖r‖/λ_min); ratios well")
-    println(io, "above 1 mean the sketch under-reported.")
+    println(io, "Reading the ratios: full/basis slightly above 1 is expected, since the full dual is")
+    println(io, "evaluated at (1+ε)α with ε = $(VERIFY_ALPHA_INFLATION) and each probe is padded by its CG")
+    println(io, "error bar ‖s‖‖r‖/λ_min. Ratios well above 1 mean the sketch under-reported.")
     println(io, "Caveat: with floor inflations > 0 the basis multipliers were infeasible in the full")
-    println(io, "space (itself a red flag), and the certificate is then evaluated far from each")
-    println(io, "probe's optimum. The sketch's true optimism lies somewhere between 1 and the printed ratio.")
+    println(io, "space, which is a red flag on its own, and the certificate is then evaluated far from")
+    println(io, "each probe's optimum. The sketch's true optimism lies between 1 and the printed ratio.")
     print(String(take!(io)))
 end
 
-function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
+function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem;
+                           gamma_rtol::Float64=DEFAULT_GAMMA_RTOL)
     Random.seed!(0xdeadbeef)
 
     # `panel_mode=false` because this job's full-space math wants one dense basis:
@@ -289,7 +285,10 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
     # stages only the `N_u × num_pos` positive block; an h5 `vectors_file` is
     # collected with `Matrix(Funicular.load(...))`, whose host-memory guard is
     # what refuses a block too large to hold densely.
-    inputs = load_bounds_inputs(compute_env, smr; panel_mode=false)
+    #
+    # `gamma_rtol` has to match the production run's, or the subspace certified here
+    # is not the one the bounds were computed on.
+    inputs = load_bounds_inputs(compute_env, smr; gamma_rtol=gamma_rtol, panel_mode=false)
     Γ, Vur_asym, Γrs = inputs.Γ, inputs.Vur_asym, inputs.Γrs
 
     χ = susceptibility(smr)
@@ -304,7 +303,7 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
     # Reproduce the production basis computation at the selected indices
     # This also returns the probes and projected constraint
     result = bounds_from_spectrum(compute_env, smr, Γ, Vur_asym, Γrs;
-                                  G₀_uu=G₀_uu, outer_indices=ns)
+                                  num_pos=num_pos, G₀_uu=G₀_uu, outer_indices=ns)
     result.basis_size == num_pos || error(
         "verify_bounds assumes the production default basis_size = num_pos, got " *
         "$(result.basis_size) ≠ $num_pos")
@@ -419,7 +418,7 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
 end
 
 function verify_bounds()
-    compute_env, smr, _ = parse_args()
+    compute_env, smr, _, gamma_rtol = parse_args()
 
     if use_gpu(compute_env)
         @info string(now()) * " [verify_bounds::verify_bounds] Using GPU acceleration on device $(gpu_device(compute_env))"
@@ -432,5 +431,5 @@ function verify_bounds()
 
     isnothing(mediator(smr)) ||
         error("verify_bounds only handles sender/receiver systems (mirroring _compute_bounds_sr)")
-    return _verify_bounds_sr(compute_env, smr)
+    return _verify_bounds_sr(compute_env, smr; gamma_rtol=gamma_rtol)
 end
