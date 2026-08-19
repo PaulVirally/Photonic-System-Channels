@@ -302,6 +302,98 @@ at k = 4000 the old in-memory front-end would want the `N_u x m` basis as one
 `CuArray`, which is ~30 GB at 4 lambda. Submit them only once C has landed. The
 generated script says so, and commenting out the E4 block leaves the rest runnable.
 
+## The `backfill` tier
+
+    julia bench/plan.jl --cluster narval --tier backfill
+
+Eleven jobs, none of them asking for more than three hours, whose only purpose is to
+refit the two counts that the `--gamma-rtol` truncation and the windowed tau search
+changed. A 1 lambda bounds job is currently requested at 18 h; nothing that asks for
+18 h gets through narval's backfill window, so the sweep does not run at all.
+
+What the tier measures, and why each piece is cheap:
+
+| | jobs | asks for | measures |
+|---|---|---|---|
+| A | 4 x `stage_bounds` | <= 02:30:00, `a100` or `a100_3g.20gb` | the tau shape, the truncated `m`, the per-index outer cost, host and device high-water |
+| B | 6 x `stage_rsvd` | <= 01:05:00 | the per-operator-pass rate at 1/2 and 1 lambda, at `q = 1, 3, 5` |
+| | 1 x `stage_greens` | <= 01:03:00, CPU | the 1/2 lambda blocks, which no sweep has built yet |
+
+Three ideas make it fit in three hours.
+
+**The bounds points sample the outer loop.** `--outer-blocks 4 --outer-block-len 24`
+runs four runs of 24 consecutive indices spread over `1:m` instead of all `m`. The
+front end is measured in full either way, `outer_times` reports each index
+separately, and the sample is a few percent of the loop. Consecutive within a block
+because the windowed sweep only narrows for an `n` that follows the last index
+evaluated; spread between blocks because index `n` probes `m - n + 1` vectors, so a
+sample taken only at the top would put the per-index cost at twice its average. A
+pick whose `m` is small enough runs `--outer-blocks 0`, the whole loop, production
+exactly.
+
+**The RSVD points run at low `q`.** RSVD cost is affine in the power iteration count,
+so two low-`q` runs give the per-pass slope and the third checks the line is straight.
+`rsvd_time_parts` in `cost_model.jl` splits the prediction the same way, and
+`rsvd_pass_scale` is the ratio between them.
+
+**The bounds points reuse RSVD output already on scratch.** The cancelled 1 lambda
+sweep left finished bases behind, so there is no production-rank RSVD to pay for.
+Which separations survived is not knowable when the script is generated, so
+`bench/pick_bounds_points.jl` runs on the login node first: it lists what is there,
+reads each spectrum, applies the same `--gamma-rtol` cut `load_bounds_inputs`
+applies, and picks four spread over the range of surviving `m`. It sizes each job
+from its own `m` -- allocation, memory, time limit and outer-loop mode -- and writes
+the whole kept-count table alongside, which is the truncation measurement in its own
+right. Look before submitting:
+
+```bash
+bash bench/launch_calibration_narval_backfill.sh --pick
+```
+
+### `--design rs`
+
+Every point in this tier passes it, and it is load-bearing. `src/common.jl` sorts the
+letters of `--design`, so production sweeps write
+`<cells>__<cells>__<n>ss<d>__RS`, while `bench/point.jl` historically built
+`[Sender, Receiver]` and looked for `__SR`. Same geometry, different filename; a
+bounds point that spells it the old way finds none of the outputs it came to read.
+`sr` remains the default so the other tiers keep reading their own scratch.
+
+### When a bounds job is cut short anyway
+
+The three-hour cap can still land on a job whose `m` was larger than the picker's
+spectrum read suggested. The process is killed before it can write its row, but the
+log holds everything: `bounds_from_spectrum` stamps a timestamp into every message,
+so per-index times are differences between consecutive "Computing" lines, the
+truncation warning carries the kept and stored counts, and each index logs which grid
+points it swept. `bench/measure.jl` reads it back:
+
+```bash
+julia --project=. bench/measure.jl --parse-bounds-log <log> --summary
+julia --project=. bench/measure.jl --parse-bounds-log <log> --out <row.csv> \
+    --cells 32,32,32 --scale 1//32 --sep <sep> --rank 4000 --cluster narval --jobid <id>
+```
+
+`--summary` prints what it found and writes nothing. With `--out` it appends a
+`stage_bounds` row in the same schema `bench/point.jl` writes, tagged `from_log=1`
+and `log_complete=0`, so the fit cannot tell the two apart but a reader can.
+`--jobid` fetches `MaxRSS` from `sacct`, since the process that would have read
+`/proc/self/status` is gone. It works on production `compute_bounds.jl` logs too.
+
+### What the refit changes, and what it must not
+
+Three coefficient groups, and all three default to leaving the model exactly as it
+was: `bounds_tau_mode = "legacy"`, `bounds_m_mode = "fraction"`,
+`rsvd_pass_scale = 1.0`. A calibration CSV with none of the new columns -- which is
+every CSV written before the windowed sweep existed -- produces byte-identical
+predictions. `bench/parity_cost_model.jl` is the check:
+
+```bash
+julia bench/parity_cost_model.jl > after.txt
+git stash && julia bench/parity_cost_model.jl > before.txt && git stash pop
+diff before.txt after.txt
+```
+
 ## Running a single point by hand
 
 Useful when a point failed and you want to see why:

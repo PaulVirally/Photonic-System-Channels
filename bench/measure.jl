@@ -416,3 +416,436 @@ end
 human_bytes(b::Real) = b >= 1024^3 ? @sprintf("%.2f GiB", b / 1024^3) :
                        b >= 1024^2 ? @sprintf("%.1f MiB", b / 1024^2) :
                        @sprintf("%.0f B", b)
+
+# --------------------------------------------------------------------------- #
+# Reading a bounds log back
+# --------------------------------------------------------------------------- #
+
+#=
+Everything above measures work this process is doing. This section does the
+opposite: it reconstructs a measurement from the *log* of a job that has already
+finished, or has been killed.
+
+It exists for one case. A bounds job on the backfill queue is capped at three
+hours, and the run it is sampling may be longer than that. `bench/point.jl`'s
+`--outer-blocks` is the first line of defence -- it bounds the work so the row gets
+written -- but a job can still be cut short, and when it is, the process dies
+before `emit` and the row is lost even though the log holds the numbers. Every
+useful quantity is in there:
+
+  * `bounds_from_spectrum` stamps `string(now())` into every message, so the wall
+    time of any stage is the difference between two timestamps, and the per-index
+    outer time is the gap between consecutive "Computing" lines. That is the same
+    quantity `outer_times` records, measured from outside.
+  * the truncation `@warn` in `load_bounds_inputs` prints `gamma_rtol` with the kept
+    and stored positive counts, which is the truncation measurement.
+  * each index logs which grid points it swept ("the tau grid window LO:HI of A:B"
+    when the window applied, "over N grid point(s)" when the whole grid was swept),
+    so the per-index grid evaluation count and the window-edge fallback rate are
+    both recoverable. An index that logged *both* lines is one that fell back.
+  * the run's closing summary line carries the refinement pencil cache's hits and
+    misses. A killed run has no summary line, and then the cache counts are simply
+    absent from the row rather than guessed at.
+
+Host and device high-water marks are the one thing the log does not carry, because
+the process that would have printed them was killed. Slurm's accounting does have
+them, so `sacct_peak_rss_bytes` fetches `MaxRSS` for a job id; pass `--jobid` and
+the row gets a memory number, omit it and the memory columns stay empty (which is
+what "not measured" looks like everywhere else in this schema).
+=#
+
+const _LOG_TIMESTAMP = r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+
+"First ISO 8601 timestamp on a line, or `nothing`."
+function _log_timestamp(line::AbstractString)
+    m = match(_LOG_TIMESTAMP, line)
+    m === nothing && return nothing
+    return tryparse(DateTime, m.captures[1])
+end
+
+_seconds_between(a::DateTime, b::DateTime) = (b - a).value / 1000
+
+"""
+    parse_bounds_log(path) -> NamedTuple
+
+Reconstruct what a `compute_bounds.jl` (or `bench/point.jl --kind stage_bounds`)
+run did, from its log alone. Tolerates truncation everywhere: a field that the run
+never got as far as printing comes back `nothing`, and the per-index vectors hold
+whatever indices did complete.
+
+Returned fields:
+
+- `num_pos`, `basis_size`, `total_directions`: from the `RSVD_BASIS_SIZE` line.
+- `gamma_rtol`, `gamma_kept`, `gamma_stored`: from the truncation warning. Absent
+  when nothing was truncated, which is itself information (`gamma_kept ==
+  gamma_stored` then, and the caller can say so from `num_pos`).
+- `tau_grid_points`: length of the grid the sweep announced.
+- `outer_indices`, `outer_seconds`: per-index wall times, by differencing the
+  "Computing" timestamps. The *last* started index has no successor to difference
+  against, so it is dropped unless the run printed its "Dual is" line, in which
+  case that line closes it.
+- `grid_evals`: grid points swept per index, from the window/full-sweep lines.
+- `fallbacks`: indices that logged a window and then the whole grid, that is, the
+  window-edge fallback.
+- `cache_hits`, `cache_misses`, `summary_fallbacks`, `tau_window`,
+  `pencil_cache_max`: from the closing summary line, or `nothing` if the run was
+  cut before it.
+- `stage_times`: the `(gram_schmidt = ..., ...)` named tuple as a `Dict`, from the
+  "Stage times" line, or from timestamp differences when that line is missing.
+- `complete`: whether the closing summary line was reached at all.
+- `killed_after_s`: seconds from the first timestamp in the log to the last, which
+  is the wall time actually spent when the job was killed.
+"""
+function parse_bounds_log(path::AbstractString)
+    isfile(path) || error("no such log: $path")
+
+    num_pos = basis_size = total_directions = nothing
+    gamma_rtol = gamma_kept = gamma_stored = nothing
+    tau_grid_points = nothing
+    cache_hits = cache_misses = summary_fallbacks = nothing
+    tau_window = pencil_cache_max = nothing
+    stage_times = Dict{String,Float64}()
+    first_stamp = last_stamp = nothing
+
+    # index -> timestamp of its "Computing" line, and index -> grid points swept.
+    started = Tuple{Int,DateTime}[]
+    closed = Dict{Int,DateTime}()
+    grid_evals = Dict{Int,Int}()
+    windowed = Set{Int}()
+    fell_back = Set{Int}()
+    marks = Dict{String,DateTime}()   # front-end stage boundaries
+
+    for line in eachline(path)
+        stamp = _log_timestamp(line)
+        if stamp !== nothing
+            first_stamp === nothing && (first_stamp = stamp)
+            last_stamp = stamp
+        end
+
+        if (m = match(r"Using RSVD_BASIS_SIZE = (\d+) \(num_pos = (\d+) of (\d+)", line)) !== nothing
+            basis_size = parse(Int, m.captures[1])
+            num_pos = parse(Int, m.captures[2])
+            total_directions = parse(Int, m.captures[3])
+        elseif (m = match(r"Spectral truncation at gamma_rtol = ([0-9.eE+-]+): keeping (\d+) of the (\d+)", line)) !== nothing
+            gamma_rtol = tryparse(Float64, m.captures[1])
+            gamma_kept = parse(Int, m.captures[2])
+            gamma_stored = parse(Int, m.captures[3])
+        elseif (m = match(r"Eigendecomposing C\(.\) in the basis for .* \[(.*)\]", line)) !== nothing
+            tau_grid_points = count(==(','), m.captures[1]) + 1
+            stamp === nothing || (marks["c_range_start"] = stamp)
+        elseif (m = match(r"grid window (\d+):(\d+) of (\d+):(\d+)", line)) !== nothing
+            n = _log_outer_index(line)
+            if n !== nothing
+                lo, hi = parse(Int, m.captures[1]), parse(Int, m.captures[2])
+                grid_evals[n] = hi - lo + 1
+                push!(windowed, n)
+            end
+        elseif (m = match(r"over (\d+) .? ?grid point\(s\)", line)) !== nothing
+            n = _log_outer_index(line)
+            if n !== nothing
+                # A windowed index that also sweeps the whole grid is a window-edge
+                # fallback, and the full sweep is what it actually paid for.
+                n in windowed && push!(fell_back, n)
+                grid_evals[n] = parse(Int, m.captures[1])
+            end
+        elseif occursin("Computing", line) && occursin("bound", line)
+            n = _log_outer_index(line)
+            (n === nothing || stamp === nothing) || push!(started, (n, stamp))
+        elseif occursin("Dual is", line)
+            n = _log_outer_index(line)
+            (n === nothing || stamp === nothing) || (closed[n] = stamp)
+        elseif (m = match(r"cache (\d+) hit\(s\) / (\d+) miss\(es\) \(pencil_cache_max = (\d+)\), (\d+) full-grid fallback\(s\) \(tau_window = (-?\d+)\)", line)) !== nothing
+            cache_hits = parse(Int, m.captures[1])
+            cache_misses = parse(Int, m.captures[2])
+            pencil_cache_max = parse(Int, m.captures[3])
+            summary_fallbacks = parse(Int, m.captures[4])
+            tau_window = parse(Int, m.captures[5])
+        elseif (m = match(r"stage_times = \((.*)\)", line)) !== nothing
+            for field in split(m.captures[1], ',')
+                kv = split(field, '='; limit=2)
+                length(kv) == 2 || continue
+                v = tryparse(Float64, strip(kv[2]))
+                v === nothing || (stage_times[strip(kv[1])] = v)
+            end
+        elseif occursin("reverse Gram-Schmidt", line) && occursin("Performing", line)
+            stamp === nothing || (marks["gs_start"] = stamp)
+        elseif occursin("Projecting C into the basis", line)
+            stamp === nothing || (marks["c_projection_start"] = stamp)
+        end
+    end
+
+    # Per-index durations. The gap to the next index's "Computing" line is the
+    # honest number: it includes everything that index did, the same way
+    # `outer_times` does. The last started index has no successor, so it is closed
+    # by its own "Dual is" line when there is one and dropped otherwise.
+    sort!(started; by=last)
+    idxs, secs = Int[], Float64[]
+    for (i, (n, t0)) in enumerate(started)
+        t1 = i < length(started) ? last(started[i + 1]) : get(closed, n, nothing)
+        t1 === nothing && continue
+        dt = _seconds_between(t0, t1)
+        dt >= 0 || continue
+        push!(idxs, n)
+        push!(secs, dt)
+    end
+
+    # Front-end stage times, when the summary line never printed them.
+    if isempty(stage_times) && haskey(marks, "gs_start")
+        if haskey(marks, "c_projection_start")
+            stage_times["gram_schmidt_plus_ss_basis"] =
+                _seconds_between(marks["gs_start"], marks["c_projection_start"])
+        end
+        if haskey(marks, "c_projection_start") && haskey(marks, "c_range_start")
+            stage_times["c_projection"] =
+                _seconds_between(marks["c_projection_start"], marks["c_range_start"])
+        end
+        if haskey(marks, "c_range_start") && !isempty(started)
+            stage_times["c_range"] =
+                _seconds_between(marks["c_range_start"], last(first(started)))
+        end
+    end
+
+    killed_after = (first_stamp === nothing || last_stamp === nothing) ? nothing :
+                   _seconds_between(first_stamp, last_stamp)
+
+    return (num_pos=num_pos, basis_size=basis_size, total_directions=total_directions,
+            gamma_rtol=gamma_rtol, gamma_kept=gamma_kept, gamma_stored=gamma_stored,
+            tau_grid_points=tau_grid_points,
+            outer_indices=idxs, outer_seconds=secs,
+            outer_started=length(started),
+            grid_evals=grid_evals, fallbacks=length(fell_back),
+            cache_hits=cache_hits, cache_misses=cache_misses,
+            summary_fallbacks=summary_fallbacks, tau_window=tau_window,
+            pencil_cache_max=pencil_cache_max,
+            stage_times=stage_times, complete=cache_hits !== nothing,
+            killed_after_s=killed_after)
+end
+
+"The `n` of a `[n/m]` progress prefix, or `nothing`."
+function _log_outer_index(line::AbstractString)
+    m = match(r"\[(\d+)/(\d+)\]", line)
+    m === nothing && return nothing
+    return parse(Int, m.captures[1])
+end
+
+"""
+    sacct_peak_rss_bytes(jobid) -> Union{Nothing,Int}
+
+`MaxRSS` for a Slurm job, in bytes, as the largest value over its steps. The
+memory high-water of a job that was killed before it could read
+`/proc/self/status` itself, which is the whole reason this exists.
+
+Returns `nothing` when `sacct` is unavailable or reports nothing, rather than
+throwing: a missing memory number must not cost the row its timings.
+"""
+function sacct_peak_rss_bytes(jobid::AbstractString)
+    out = try
+        read(`sacct -j $jobid --noheader --parsable2 --format=MaxRSS`, String)
+    catch
+        return nothing
+    end
+    best = nothing
+    for field in split(out, '\n')
+        s = strip(field)
+        isempty(s) && continue
+        m = match(r"^([0-9.]+)([KMGT]?)$", s)
+        m === nothing && continue
+        v = tryparse(Float64, m.captures[1])
+        v === nothing && continue
+        scale = m.captures[2] == "K" ? 1024.0 : m.captures[2] == "M" ? 1024.0^2 :
+                m.captures[2] == "G" ? 1024.0^3 : m.captures[2] == "T" ? 1024.0^4 : 1.0
+        bytes = round(Int, v * scale)
+        best = best === nothing ? bytes : max(best, bytes)
+    end
+    return best
+end
+
+"""
+    bounds_log_row(parsed; kwargs...) -> Dict{String,Any}
+
+Turn a `parse_bounds_log` result into a `kind = "stage_bounds"` CSV row in the same
+schema `bench/point.jl` writes, so that `bench/fit.jl` cannot tell the two apart.
+
+The geometry cannot be recovered reliably from the log (`parse_args` logs it
+through a named tuple whose formatting is Julia's, not ours), so it is passed in.
+The launcher that submitted the job knows it; that is where the values come from.
+
+`extra` carries the same `key=value` notes `_bounds_result_notes` emits, plus
+`from_log=1` and `log_complete=0/1`, so a row reconstructed from a killed job is
+identifiable as one and the tau-shape fit can weight it as it sees fit.
+"""
+function bounds_log_row(parsed; cluster::AbstractString, cells::NTuple{3,Int},
+                        scale::Rational{Int}, separation::Rational{Int},
+                        rank::Integer, oversamples::Integer, power_iters::Integer,
+                        threads::Integer=0, gpu_name::AbstractString="",
+                        peak_rss_bytes::Union{Nothing,Integer}=nothing,
+                        peak_vram_bytes::Union{Nothing,Integer}=nothing,
+                        device_total_bytes::Union{Nothing,Integer}=nothing,
+                        note::AbstractString="")
+    notes = ["from_log=1", "log_complete=$(parsed.complete ? 1 : 0)",
+             "outer_mode=$(parsed.complete ? "full" : "walltime_cut")"]
+    parsed.num_pos === nothing || push!(notes, "num_pos=$(parsed.num_pos)")
+    parsed.basis_size === nothing || push!(notes, "basis_size=$(parsed.basis_size)")
+    parsed.gamma_rtol === nothing ||
+        push!(notes, "gamma_rtol=$(@sprintf("%.6g", parsed.gamma_rtol))")
+    parsed.gamma_stored === nothing || push!(notes, "stored_num_pos=$(parsed.gamma_stored)")
+    parsed.tau_grid_points === nothing ||
+        push!(notes, "tau_grid_points=$(parsed.tau_grid_points)")
+    parsed.cache_hits === nothing || push!(notes, "tau_cache_hits=$(parsed.cache_hits)")
+    parsed.cache_misses === nothing || push!(notes, "tau_cache_misses=$(parsed.cache_misses)")
+    parsed.tau_window === nothing || push!(notes, "tau_window=$(parsed.tau_window)")
+    parsed.pencil_cache_max === nothing ||
+        push!(notes, "pencil_cache_max=$(parsed.pencil_cache_max)")
+
+    n_eval = length(parsed.outer_indices)
+    push!(notes, "outer_indices_done=$n_eval", "outer_indices_started=$(parsed.outer_started)")
+    if n_eval > 0
+        secs = sort(copy(parsed.outer_seconds))
+        total = sum(secs)
+        push!(notes, "outer_s_total=$(@sprintf("%.6g", total))",
+              "outer_s_mean=$(@sprintf("%.6g", total / n_eval))",
+              "outer_s_median=$(@sprintf("%.6g", secs[(n_eval + 1) ÷ 2]))",
+              "outer_s_min=$(@sprintf("%.6g", first(secs)))",
+              "outer_s_max=$(@sprintf("%.6g", last(secs)))",
+              "outer_n_min=$(minimum(parsed.outer_indices))",
+              "outer_n_max=$(maximum(parsed.outer_indices))")
+        fallbacks = parsed.summary_fallbacks === nothing ? parsed.fallbacks :
+                    parsed.summary_fallbacks
+        push!(notes, "tau_grid_fallbacks=$fallbacks",
+              "tau_grid_fallback_fraction=$(@sprintf("%.6g", fallbacks / n_eval))")
+        parsed.cache_misses === nothing ||
+            push!(notes, "tau_refine_whitenings_per_index=$(@sprintf("%.6g", parsed.cache_misses / n_eval))")
+    end
+    evaluated_grid = [parsed.grid_evals[n] for n in parsed.outer_indices
+                      if haskey(parsed.grid_evals, n)]
+    isempty(evaluated_grid) ||
+        push!(notes, "tau_grid_evals_per_index=$(@sprintf("%.6g", sum(evaluated_grid) / length(evaluated_grid)))")
+    for (name, seconds) in sort(collect(parsed.stage_times))
+        push!(notes, "t_$(name)=$(@sprintf("%.6g", seconds))")
+    end
+    isempty(note) || push!(notes, note)
+
+    return csv_row(
+        cluster=cluster, kind="stage_bounds",
+        device=isempty(gpu_name) ? "gpu" : "gpu", gpu_name=gpu_name,
+        threads=threads == 0 ? "" : threads,
+        n_x=cells[1], n_y=cells[2], n_z=cells[3], n_cells=prod(cells),
+        scale_num=numerator(scale), scale_den=denominator(scale),
+        sep_num=numerator(separation), sep_den=denominator(separation),
+        contact=iszero(separation) ? 1 : 0,
+        rank=rank, oversamples=oversamples, power_iters=power_iters,
+        sketch_width=rank + oversamples,
+        num_pos=parsed.num_pos === nothing ? "" : parsed.num_pos,
+        time_s=parsed.killed_after_s === nothing ? NaN : parsed.killed_after_s,
+        peak_rss_bytes=peak_rss_bytes === nothing ? "" : peak_rss_bytes,
+        peak_vram_bytes=peak_vram_bytes === nothing ? "" : peak_vram_bytes,
+        device_total_bytes=device_total_bytes === nothing ? "" : device_total_bytes,
+        extra=join(notes, ";"),
+    )
+end
+
+# --------------------------------------------------------------------------- #
+# Standalone entry point: reconstruct a row from a bounds log
+# --------------------------------------------------------------------------- #
+#=
+    julia --project=. bench/measure.jl --parse-bounds-log <log> --out <csv> \
+        --cells 32,32,32 --scale 1//32 --sep 1//2 --rank 4000 [--jobid <id>]
+
+Only reachable when this file is *run*, not when it is `include`d, so `point.jl`
+and `fit.jl` are unaffected. `--summary` prints what was parsed and writes nothing,
+which is the way to check a log before trusting a row built from it.
+=#
+
+function _measure_parse_cli(argv::Vector{String})
+    opts = Dict{String,String}()
+    i = 1
+    while i <= length(argv)
+        arg = argv[i]
+        startswith(arg, "--") || error("Expected an option starting with --, got '$arg'")
+        key = arg[3:end]
+        if i + 1 > length(argv) || startswith(argv[i + 1], "--")
+            opts[key] = "true"
+            i += 1
+        else
+            opts[key] = argv[i + 1]
+            i += 2
+        end
+    end
+    return opts
+end
+
+function _measure_rational(s::AbstractString)
+    occursin("//", s) || return Rational{Int}(parse(Int, strip(s)))
+    a, b = split(strip(s), "//"; limit=2)
+    return parse(Int, a) // parse(Int, b)
+end
+
+function _measure_cells(s::AbstractString)
+    parts = split(strip(s, ['(', ')', ' ']), ',')
+    length(parts) == 3 || error("--cells expects three comma-separated integers")
+    return (parse(Int, strip(parts[1])), parse(Int, strip(parts[2])), parse(Int, strip(parts[3])))
+end
+
+function measure_main(argv::Vector{String})
+    opts = _measure_parse_cli(argv)
+    log = get(opts, "parse-bounds-log", "")
+    isempty(log) && error("bench/measure.jl takes --parse-bounds-log <log>; nothing else is runnable here")
+    parsed = parse_bounds_log(log)
+
+    n_eval = length(parsed.outer_indices)
+    println("log:                 ", log)
+    println("reached the summary: ", parsed.complete ? "yes" : "no (walltime cut or crash)")
+    println("num_pos (kept):      ", something(parsed.num_pos, "unknown"))
+    println("positives stored:    ", something(parsed.gamma_stored, "not truncated / unknown"))
+    println("gamma_rtol:          ", something(parsed.gamma_rtol, "unknown"))
+    println("tau grid points:     ", something(parsed.tau_grid_points, "unknown"))
+    println("outer indices:       ", parsed.outer_started, " started, ", n_eval, " timed")
+    if n_eval > 0
+        println("per-index seconds:   mean ",
+                @sprintf("%.3f", sum(parsed.outer_seconds) / n_eval),
+                "  min ", @sprintf("%.3f", minimum(parsed.outer_seconds)),
+                "  max ", @sprintf("%.3f", maximum(parsed.outer_seconds)))
+    end
+    ge = [parsed.grid_evals[n] for n in parsed.outer_indices if haskey(parsed.grid_evals, n)]
+    isempty(ge) || println("grid evals/index:    ",
+                           @sprintf("%.3f", sum(ge) / length(ge)),
+                           "  (fallbacks: ", parsed.fallbacks, ")")
+    parsed.cache_misses === nothing ||
+        println("refine whitenings:   ", parsed.cache_misses, " miss(es) / ",
+                parsed.cache_hits, " hit(s)")
+    isempty(parsed.stage_times) ||
+        println("stage times:         ", parsed.stage_times)
+    println("wall time in log:    ",
+            parsed.killed_after_s === nothing ? "unknown" :
+            @sprintf("%.1f s", parsed.killed_after_s))
+
+    out = get(opts, "out", "")
+    (isempty(out) || haskey(opts, "summary")) && return parsed
+
+    jobid = get(opts, "jobid", "")
+    rss = haskey(opts, "peak-rss-bytes") ? parse(Int, opts["peak-rss-bytes"]) :
+          isempty(jobid) ? nothing : sacct_peak_rss_bytes(jobid)
+    row = bounds_log_row(parsed;
+        cluster=get(opts, "cluster", detect_cluster()),
+        cells=_measure_cells(get(opts, "cells", "32,32,32")),
+        scale=_measure_rational(get(opts, "scale", "1//32")),
+        separation=_measure_rational(get(opts, "sep", "1//32")),
+        rank=parse(Int, get(opts, "rank", "4000")),
+        oversamples=parse(Int, get(opts, "oversamples", "50")),
+        power_iters=parse(Int, get(opts, "power-iters", "14")),
+        threads=parse(Int, get(opts, "threads", "0")),
+        gpu_name=get(opts, "gpu-name", ""),
+        peak_rss_bytes=rss,
+        peak_vram_bytes=haskey(opts, "peak-vram-bytes") ?
+                        parse(Int, opts["peak-vram-bytes"]) : nothing,
+        device_total_bytes=haskey(opts, "device-total-bytes") ?
+                           parse(Int, opts["device-total-bytes"]) : nothing,
+        note=get(opts, "note", ""))
+    append_csv_row(out, row)
+    println("-> ", out)
+    return parsed
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    measure_main(ARGS)
+end

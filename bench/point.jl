@@ -85,6 +85,45 @@ Funicular-trial options (tier `funicular`; see bench/README.md):
                           `SLURM_MEM_PER_NODE` is what gets exercised.
   --funicular-benchmark   directory holding Funicular's benchmark scripts
                           (default `joinpath(pkgdir(Funicular), "benchmark")`)
+
+Backfill-trial options (tier `backfill`; every job under three hours so that it
+rides the backfill queue at low priority):
+
+  --gamma-rtol 1e-12      the bounds job's spectral cut, handed to
+                          `load_bounds_inputs`. The positive block shrinks to the
+                          directions with `Gamma[i] >= gamma_rtol * Gamma[1]`, which
+                          at a far separation is a few dozen columns of two
+                          thousand. `stage_bounds` reports both counts, so the
+                          truncation itself becomes a fitted quantity rather than
+                          an assumption (`bounds_m` in bench/cost_model.jl).
+  --outer-blocks 4        run only this many blocks of consecutive outer indices
+                          instead of all `m` of them, spread evenly over `1:m`.
+                          `0` runs the whole loop, as production does.
+  --outer-block-len 24    indices per block. Consecutive on purpose: the windowed
+                          tau sweep only narrows for an `n` that immediately
+                          follows the last one evaluated, so a block of
+                          consecutive indices is the smallest thing that measures
+                          the window, the plateau behaviour of the refinement
+                          pencil cache, and the full-grid fallback rate at once.
+                          The first index of each block pays a full-grid sweep,
+                          which is exactly the fallback the fit needs to see.
+  --design rs             which order the universe regions are named in, and so
+                          which `file_prefix` the point reads and writes. This is
+                          the ONE thing that has to match production byte for byte:
+                          `src/common.jl` sorts the letters of `--design`, so the
+                          production sweeps (`--design rs`) write
+                          `<cells>__<cells>__<n>ss<d>__RS.jld`, while this script's
+                          historical default builds the system as
+                          `[Sender, Receiver]` and looks for `__SR.jld`. Both orders
+                          describe the same geometry -- `design_regions` only feeds
+                          the filename and a bounding-box union that the SR path
+                          never reads -- but a point that wants to reuse a
+                          production RSVD output has to spell the name the same way.
+                          Default `sr`, which is what every existing tier used.
+  --tau-window / --pencil-cache-max / --tau-refine-tol
+                          overrides for `bounds_from_spectrum`'s own keywords.
+                          Left unset they inherit the production defaults, which is
+                          what a calibration point wants.
 """
 
 using PhotonicSystemChannels
@@ -193,6 +232,13 @@ struct PointSpec
     force_path::String
     host_budget_GB::Float64
     funicular_bench_dir::String
+    gamma_rtol::Float64
+    outer_blocks::Int
+    outer_block_len::Int
+    tau_window::Union{Nothing,Int}
+    pencil_cache_max::Union{Nothing,Int}
+    tau_refine_tol::Union{Nothing,Float64}
+    design::String
 end
 
 function PointSpec(opts::Dict{String,String})
@@ -231,7 +277,14 @@ function PointSpec(opts::Dict{String,String})
                      getopt(opts, "fresh", "false") in ("true", "1", "yes"),
                      getopt(opts, "force-path", "auto"),
                      getopt_float(opts, "host-budget-GB", 0.0),
-                     getopt(opts, "funicular-benchmark", _default_funicular_bench_dir()))
+                     getopt(opts, "funicular-benchmark", _default_funicular_bench_dir()),
+                     getopt_float(opts, "gamma-rtol", PhotonicSystemChannels.DEFAULT_GAMMA_RTOL),
+                     getopt_int(opts, "outer-blocks", 0),
+                     getopt_int(opts, "outer-block-len", 24),
+                     haskey(opts, "tau-window") ? parse(Int, opts["tau-window"]) : nothing,
+                     haskey(opts, "pencil-cache-max") ? parse(Int, opts["pencil-cache-max"]) : nothing,
+                     haskey(opts, "tau-refine-tol") ? parse(Float64, opts["tau-refine-tol"]) : nothing,
+                     lowercase(getopt(opts, "design", "sr")))
 end
 
 """
@@ -250,11 +303,29 @@ end
 uses_gpu(spec::PointSpec) = spec.gpu >= 0
 n_cells(spec::PointSpec) = prod(spec.receiver_cells)
 
+"""
+    design_regions_for(design) -> Vector{SMRVolumeSymbol}
+
+The `design_regions` a `--design` string names, by the same rule `src/common.jl`
+uses: uppercase the letters, sort them, map each to its region. So `rs` and `sr`
+both give `[Receiver, Sender]` there -- the sort is what makes production's
+`file_prefix` end in `RS`.
+
+`sr` here means something different on purpose: the literal `[Sender, Receiver]`
+this script has always passed, whose prefix ends in `SR`. Existing tiers wrote
+their scratch under that name and have to keep reading it, so it stays the default
+and `rs` is the opt-in that matches production.
+"""
+function design_regions_for(design::AbstractString)
+    design == "sr" && return SMRVolumeSymbol[Sender, Receiver]
+    return char2volume_symbol.(sort(collect(uppercase(design))))
+end
+
 function build_system(spec::PointSpec)
     return SMRSystem(spec.sender_cells,
                      (spec.separation, 0 // 1, 0 // 1),
                      spec.receiver_cells,
-                     [Sender, Receiver],
+                     design_regions_for(spec.design),
                      spec.scale,
                      spec.chi)
 end
@@ -1069,24 +1140,207 @@ function point_stage_rsvd(spec::PointSpec)
                        bytes_written=max(0, written), notes=notes)
 end
 
+"""
+    outer_index_blocks(m, nblocks, blocklen) -> Vector{Int}
+
+`nblocks` runs of `blocklen` consecutive outer indices, spread evenly over `1:m`,
+deduplicated and sorted.
+
+Consecutive within a block and spread between them, for two different reasons.
+Consecutive, because the windowed tau sweep in `bounds_from_spectrum` only narrows
+for an `n` that immediately follows the last index evaluated, and the refinement
+pencil cache only hits when neighbouring indices sit on the same tau* plateau: a
+scattered set of indices would measure neither, and would report the unwindowed
+cost as if it were the windowed one. Spread, because the per-index cost falls off
+across the loop -- index `n` probes `m - n + 1` vectors -- so a sample taken only
+at the top would put the per-index slope at twice its average, and the first index
+of each block is also the full-grid fallback the fit needs to count.
+
+Cost, against the whole loop's `m(m+1)/2` probes: `blocklen * m * nblocks(nblocks+1)/2
+/ nblocks`, that is, of order `blocklen * m`, so the sample is `2 * blocklen / m`
+of the full outer loop. At `m = 2400`, four blocks of 24 is about 5%.
+"""
+function outer_index_blocks(m::Int, nblocks::Int, blocklen::Int)
+    (nblocks <= 0 || blocklen <= 0 || m <= 0) && return Int[]
+    idxs = Int[]
+    for b in 0:(nblocks - 1)
+        start = clamp(round(Int, b * m / nblocks) + 1, 1, m)
+        append!(idxs, start:min(m, start + blocklen - 1))
+    end
+    return sort!(unique!(idxs))
+end
+
+"""
+    _stored_num_pos(env, smr) -> Union{Nothing,Int}
+
+The positive count the RSVD job wrote, before `--gamma-rtol` cut it down.
+`load_bounds_inputs` returns only the kept count, and the ratio of the two is the
+whole point of the truncation measurement, so it is read straight out of the JLD.
+"""
+function _stored_num_pos(env, smr)
+    path = joinpath(scratch_dir(env), "$(file_prefix(smr)).jld")
+    isfile(path) || return nothing
+    try
+        return jldopen(path, "r") do io
+            haskey(io, "UR_asym/num_pos") ? Int(io["UR_asym/num_pos"]) : nothing
+        end
+    catch
+        return nothing
+    end
+end
+
+"""
+    point_stage_bounds(spec)
+
+Two shapes, chosen by `--outer-blocks`.
+
+`--outer-blocks 0` (the default) runs `_compute_bounds_sr`, which is production
+exactly: the whole outer loop, and the output JLD written at the end.
+
+Anything else runs `load_bounds_inputs` followed by `bounds_from_spectrum` with
+`outer_indices` restricted to `outer_index_blocks`, and writes no output JLD. That
+is the shape the three-hour cap needs. The bounds job's cost is
+`front end + sum over n of per-index cost`, the front end is measured once either
+way, and the per-index costs come back individually in `outer_times`, so a sample
+of the loop identifies the same coefficients the whole loop would -- at a few
+percent of the wall time, and without the risk that a walltime kill takes the row
+with it. It also reads the *production* scratch directory without writing anything
+into the production project directory, which is what lets the backfill tier reuse
+RSVD outputs that are already on disk.
+
+`on_outer_error = :stop` throughout, so a numerical failure at one index still
+yields the front-end timings and the indices that did run.
+"""
 function point_stage_bounds(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
     params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters, spec.seed)
+    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    stored = _stored_num_pos(env, smr)
+    notes = ["N_u=$N_u", "gamma_rtol=$(@sprintf("%.6g", spec.gamma_rtol))"]
+    stored === nothing || push!(notes, "stored_num_pos=$stored")
+
+    if spec.outer_blocks <= 0
+        result = nothing
+        _, dt = timed(() -> (result = PhotonicSystemChannels._compute_bounds_sr(
+                                 env, smr, params; gamma_rtol=spec.gamma_rtol));
+                      device_sync=true)
+        times = Dict("stage" => dt)
+        push!(notes, "outer_mode=full")
+        if result !== nothing
+            append!(notes, _bounds_result_notes(result, dt))
+            st = result.stage_times
+            times["gram_schmidt"] = st.gram_schmidt
+            times["ss_basis"] = st.ss_basis
+            times["c_projection"] = st.c_projection
+            times["c_range"] = st.c_range
+            times["outer_total"] = st.outer_total
+        end
+        return Measurement(times=times, headline="stage", notes=notes)
+    end
+
+    # Sampled outer loop. The load is timed separately from the loop, because the
+    # front end is the term the panel-path coefficients are fitted against and it
+    # is the one part of the job a sampled run measures in full.
+    inputs = nothing
+    _, t_load = timed(() -> (inputs = load_bounds_inputs(env, smr;
+                                                        gamma_rtol=spec.gamma_rtol));
+                      device_sync=true)
+    m = inputs.num_pos
+    idxs = outer_index_blocks(m, spec.outer_blocks, spec.outer_block_len)
+    isempty(idxs) && (idxs = [1])
+    kwargs = Dict{Symbol,Any}(:num_pos => m, :outer_indices => idxs,
+                              :on_outer_error => :stop)
+    spec.tau_window === nothing || (kwargs[:tau_window] = spec.tau_window)
+    spec.pencil_cache_max === nothing || (kwargs[:pencil_cache_max] = spec.pencil_cache_max)
+    spec.tau_refine_tol === nothing || (kwargs[:tau_refine_tol] = spec.tau_refine_tol)
+
     result = nothing
-    _, dt = timed(() -> (result = PhotonicSystemChannels._compute_bounds_sr(env, smr, params));
+    _, dt = timed(() -> (result = bounds_from_spectrum(env, smr, inputs.Γ, inputs.Vur_asym,
+                                                      inputs.Γrs; kwargs...));
                   device_sync=true)
-    times = Dict("stage" => dt)
-    notes = String[]
+    times = Dict("stage" => dt + t_load, "load" => t_load, "bounds" => dt)
+    push!(notes, "outer_mode=sampled", "outer_blocks=$(spec.outer_blocks)",
+          "outer_block_len=$(spec.outer_block_len)",
+          "outer_indices_requested=$(length(idxs))",
+          "panel_front_end=$(inputs.plan === nothing ? 0 : 1)")
     if result !== nothing
-        push!(notes, "num_pos=$(result.num_pos)")
+        append!(notes, _bounds_result_notes(result, dt))
         st = result.stage_times
         times["gram_schmidt"] = st.gram_schmidt
         times["ss_basis"] = st.ss_basis
         times["c_projection"] = st.c_projection
+        times["c_range"] = st.c_range
         times["outer_total"] = st.outer_total
     end
     return Measurement(times=times, headline="stage", notes=notes)
+end
+
+"""
+    _bounds_result_notes(result, dt) -> Vector{String}
+
+Everything `bench/fit.jl` needs out of a `bounds_from_spectrum` return, as
+`key=value` notes.
+
+The tau-search counts are the reason this exists. `result.tau_search` gives the
+refinement pencil cache's hits and misses and the number of indices that fell back
+to a full grid sweep, and `bounds_dual_by_tau` keeps `NaN` at every grid point an
+index did not evaluate, so the number of finite entries per row *is* that index's
+grid evaluation count. Together they are the four numbers of `CostModel.TauShape`,
+measured rather than assumed:
+
+  * `tau_grid_evals_per_index`  -- mean finite entries per evaluated row. The
+    windowed sweep makes this about `min(2 * tau_window + 1, grid)`, and less when
+    the minimiser sits at a grid end, where it usually does. A row swept in full
+    after a window-edge fallback contributes the whole grid, so the fallback is
+    already folded in at its measured rate.
+  * `tau_refine_whitenings_per_index` -- cache misses per evaluated index. On a
+    plateau this is near zero while the refinement still runs its full complement
+    of probes, which is the over-charge the old `TAU_REFINE_EVALS` constant made.
+  * `tau_grid_fallbacks` / `tau_cache_hits` / `tau_cache_misses` -- the raw counts,
+    kept so the derived means above can be re-derived differently later.
+
+`outer_s_*` are the per-index wall times from `outer_times`. The mean is what a
+full loop of this shape would cost per index; the first and last are reported too
+because the per-index cost falls off across the loop (index `n` probes `m - n + 1`
+vectors) and a single mean over a sampled set hides that.
+"""
+function _bounds_result_notes(result, dt::Real)
+    notes = ["num_pos=$(result.num_pos)", "complete=$(result.complete ? 1 : 0)",
+             "basis_size=$(result.basis_size)"]
+    ts = result.tau_search
+    push!(notes, "tau_grid_points=$(length(result.tau_grid))",
+          "tau_cache_hits=$(ts.pencil_cache_hits)",
+          "tau_cache_misses=$(ts.pencil_cache_misses)",
+          "tau_grid_fallbacks=$(ts.grid_fallbacks)")
+
+    evaluated = [n for (n, _) in result.outer_times]
+    n_eval = length(evaluated)
+    push!(notes, "outer_indices_done=$n_eval")
+    if n_eval > 0
+        secs = sort([t for (_, t) in result.outer_times])
+        total = sum(secs)
+        push!(notes, "outer_s_total=$(@sprintf("%.6g", total))",
+              "outer_s_mean=$(@sprintf("%.6g", total / n_eval))",
+              "outer_s_median=$(@sprintf("%.6g", secs[(n_eval + 1) ÷ 2]))",
+              "outer_s_min=$(@sprintf("%.6g", first(secs)))",
+              "outer_s_max=$(@sprintf("%.6g", last(secs)))",
+              "outer_n_min=$(minimum(evaluated))", "outer_n_max=$(maximum(evaluated))",
+              "tau_refine_whitenings_per_index=$(@sprintf("%.6g", ts.pencil_cache_misses / n_eval))",
+              "tau_grid_fallback_fraction=$(@sprintf("%.6g", ts.grid_fallbacks / n_eval))")
+        # Finite entries per evaluated row of the grid table: the grid evaluations
+        # that index actually made.
+        table = result.bounds_dual_by_tau
+        finite = [count(isfinite, view(table, n, :)) for n in evaluated
+                  if 1 <= n <= size(table, 1)]
+        isempty(finite) ||
+            push!(notes,
+                  "tau_grid_evals_per_index=$(@sprintf("%.6g", sum(finite) / length(finite)))")
+    end
+    if result.outer_error !== nothing
+        push!(notes, "outer_error_n=$(result.outer_error.n)")
+    end
+    return notes
 end
 
 # --------------------------------------------------------------------------- #

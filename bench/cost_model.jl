@@ -80,6 +80,8 @@ export predict, predict_time_s, predict_host_bytes, predict_vram_bytes
 export greens_counts, rsvd_counts, bounds_counts
 export rsvd_panel_counts, rsvd_dense_counts, bounds_panel_counts
 export uses_panel_path, uses_dense_path, rsvd_mode, bounds_mode
+export TauShape, TAU_SHAPE_LEGACY, tau_shape, tau_evals_per_index, bounds_m
+export BOUNDS_M_REF_SEP, rsvd_time_parts
 export panel_width, panel_staging_bytes
 export n_cells, vector_length, universe_length, sketch_width, is_contact
 export self_fourier_bytes, ext_fourier_bytes, block_build_peak_bytes
@@ -160,6 +162,64 @@ which builds its own throwaway whitener. Update these if the `τs` /
 """
 const TAU_GRID_POINTS = 5
 const TAU_REFINE_EVALS = 6
+
+"""
+    TauShape
+
+How much τ work one outer index actually costs. Four numbers, because the
+windowed sweep and the refinement pencil cache in `bounds_from_spectrum`
+(`src/bounds.jl`) changed three of them independently and the old model folded
+them into two constants:
+
+- `grid_points`: τ grid points whose whiteners are eigendecomposed once, up
+  front, and shared by every index. Unchanged by the window: the whole grid is
+  still built before the loop.
+- `grid_evals`: **GEVP dual evaluations per index over the grid**. The full sweep
+  makes this `grid_points`; the windowed sweep makes it about
+  `min(2*tau_window + 1, grid_points)`, and less again when the minimiser sits at
+  a grid end, which is where it usually sits. No whitening is involved -- the
+  window reuses the shared grid pencils -- so this term is pure `diag_pencil_eigen`
+  plus probes.
+- `refine_evals`: extra dual evaluations per index from the golden-section
+  refinement.
+- `refine_whitenings`: **new** `m x m` whiteners per index, that is, refinement
+  probes that *miss* the pencil cache. Consecutive indices on a τ* plateau open
+  the identical bracket and probe the identical τ, so on a plateau this is ~0
+  while `refine_evals` stays at its full value. Charging one whitening per
+  refinement probe (what the old model did) over-charges the dominant term of the
+  whole job by the plateau length.
+- `cache_entries`: how many refinement whiteners the LRU cache holds. Each is an
+  `m x m` whitener plus its null space, so it is a device-memory term
+  (`pencil_cache_max` in `bounds_from_spectrum`). Zero in the legacy shape,
+  because the code the legacy rows were measured on had no cache.
+
+`TAU_SHAPE_LEGACY` reproduces the pre-window model exactly, and is the default
+everywhere, so a `Coefficients` that has not been refitted -- and every
+`coeffs_<cluster>.jl` written before this existed -- predicts precisely what it
+predicted before.
+"""
+struct TauShape
+    grid_points::Float64
+    grid_evals::Float64
+    refine_evals::Float64
+    refine_whitenings::Float64
+    cache_entries::Float64
+end
+
+const TAU_SHAPE_LEGACY = TauShape(TAU_GRID_POINTS, TAU_GRID_POINTS,
+                                  TAU_REFINE_EVALS, TAU_REFINE_EVALS, 0.0)
+
+"Total dual evaluations per index: grid sweep plus refinement probes."
+tau_evals_per_index(t::TauShape) = t.grid_evals + t.refine_evals
+
+"""
+    BOUNDS_M_REF_SEP
+
+Reference separation for the `--gamma-rtol` truncation model (see `bounds_m`), in
+wavelengths. The nearest gap in the production sweeps, hence the one where the
+kept count is largest and the model is anchored rather than extrapolated.
+"""
+const BOUNDS_M_REF_SEP = 1 // 32
 
 """
     RECOMPILE_OVERHEAD_S
@@ -489,6 +549,50 @@ Base.@kwdef struct Coefficients
     bounds_vram_base::Float64 = 3.0e9
 
     #=
+    The τ-search shape (see `TauShape`) and the `--gamma-rtol` truncation model
+    (see `bounds_m`). Both default to the pre-window, pre-truncation behaviour, so
+    every coefficient file written before they existed keeps predicting exactly
+    what it predicted before; `bench/fit.jl` flips the modes only when the
+    calibration rows carry the columns that identify them.
+
+    `bounds_tau_mode`:
+      "legacy"   -- `TAU_SHAPE_LEGACY`: the whole grid at every index, one throwaway
+                    whitening per refinement probe, no pencil cache.
+      "measured" -- the four numbers below, taken from `stage_bounds` rows that
+                    reported them.
+
+    `bounds_m_mode`:
+      "fraction"  -- `m = NUM_POS_FRACTION * rank`, capped at the rank and `N_u`.
+      "truncated" -- additionally capped by the power law
+                     `bounds_m_ref * (sep / BOUNDS_M_REF_SEP)^bounds_m_exponent`,
+                     which is the `--gamma-rtol` cut's kept count as a function of
+                     separation. `bounds_m_exponent` is negative: the further apart
+                     the bodies, the fewer directions of `Asym(G0_ur)` sit above
+                     the RSVD's noise floor, and at the far end of a sweep the
+                     positive block shrinks by more than an order of magnitude.
+    =#
+    bounds_tau_mode::String = "legacy"
+    bounds_tau_grid_points::Float64 = TAU_GRID_POINTS
+    bounds_tau_grid_evals::Float64 = TAU_GRID_POINTS
+    bounds_tau_refine_evals::Float64 = TAU_REFINE_EVALS
+    bounds_tau_refine_whitenings::Float64 = TAU_REFINE_EVALS
+    bounds_tau_cache_entries::Float64 = 0.0
+
+    bounds_m_mode::String = "fraction"
+    bounds_m_ref::Float64 = 0.0
+    bounds_m_exponent::Float64 = 0.0
+
+    #=
+    Multiplier on the part of the RSVD's predicted time that scales with the power
+    iteration count `q`, that is, on the `(2q + 2)`-ish operator passes and the
+    per-pass dense work. Identified by running the same geometry at two low `q`
+    (the `backfill` tier's B points): the slope in `q` is the per-pass cost and the
+    intercept is everything that happens once. 1.0 leaves the fitted matvec and
+    gemm rates as the only per-pass estimate, which is what they were before.
+    =#
+    rsvd_pass_scale::Float64 = 1.0
+
+    #=
     Panel-path coefficients. All four are uncalibrated defaults, replaced by
     workstream E's funicular tier: E1 for the bus pair, E2/E3 for the two memory
     numbers. They are `@kwdef` defaults rather than required fields so that every
@@ -515,6 +619,54 @@ end
 
 thread_efficiency(coeffs::Coefficients, threads::Int) =
     1 + coeffs.g0_thread_scaling * (max(1, threads) - 1)
+
+"""
+    tau_shape(c) -> TauShape
+
+The τ-search shape these coefficients describe. `TAU_SHAPE_LEGACY` unless the fit
+set `bounds_tau_mode = "measured"`.
+"""
+tau_shape(c::Coefficients) =
+    c.bounds_tau_mode == "measured" ?
+        TauShape(c.bounds_tau_grid_points, c.bounds_tau_grid_evals,
+                 c.bounds_tau_refine_evals, c.bounds_tau_refine_whitenings,
+                 c.bounds_tau_cache_entries) :
+        TAU_SHAPE_LEGACY
+
+"""
+    bounds_m(pt, c) -> Int
+
+The `m` the bounds job actually runs at: the number of positive `Asym(G0_ur)`
+eigenvalues that survive `--gamma-rtol`.
+
+`effective_num_pos` is the starting point (a measured `num_pos` when the point
+carries one, `NUM_POS_FRACTION * rank` otherwise). In
+`bounds_m_mode = "truncated"` a separation-dependent cap is then applied, because
+the spectral cut in `load_bounds_inputs` throws away every direction below
+`gamma_rtol * Γ[1]` and how many that leaves depends strongly on the gap: near
+contact almost the whole positive block survives, and at the far end of a sweep
+about fifty columns of eighteen hundred do. The bounds cost is superlinear in `m`
+in both time (the outer loop is `O(m^2)` evaluations of `m x m` problems) and
+memory, so charging the near-contact `m` at every separation over-requests the
+far end of a sweep by more than an order of magnitude. That is what an 18 h
+request for a job that runs in minutes looks like.
+
+A cap and not a replacement: whatever the RSVD produced is still the ceiling, and
+a measured `num_pos` on a row that was itself produced under the cut is already
+the post-truncation count.
+"""
+function bounds_m(pt::SRPoint, c::Coefficients)
+    m = min(effective_num_pos(pt), universe_length(pt))
+    c.bounds_m_mode == "truncated" || return m
+    c.bounds_m_ref > 0 || return m
+    # Contact has no gap to scale by, and is the near end of the family anyway.
+    iszero(pt.separation) && return m
+    ratio = Float64(pt.separation / BOUNDS_M_REF_SEP)
+    ratio > 0 || return m
+    cap = c.bounds_m_ref * ratio^c.bounds_m_exponent
+    isfinite(cap) || return m
+    return clamp(round(Int, cap), 1, m)
+end
 
 """
     DEFAULT_COEFFICIENTS
@@ -1111,7 +1263,11 @@ function rsvd_dense_counts(pt::SRPoint)
 end
 
 """
-    rsvd_time_s(pt, c; vram_capacity_bytes=nothing) -> (total, device_bound)
+    _rsvd_time_raw(pt, c, mode) -> (total, device_bound)
+
+The unscaled prediction for one storage path. `rsvd_time_s` is this plus
+`rsvd_pass_scale`; `rsvd_time_parts` is this evaluated twice to split the
+`q`-dependent work out.
 
 See `bounds_time_s` for why the device-bound part is reported separately.
 
@@ -1121,9 +1277,7 @@ the transfers by the slice fraction would invent time that does not exist, and i
 the wrong direction: a slower slice hides *more* of the transfer behind compute,
 not less.
 """
-function rsvd_time_s(pt::SRPoint, c::Coefficients;
-                     vram_capacity_bytes::Union{Nothing,Real}=nothing)
-    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+function _rsvd_time_raw(pt::SRPoint, c::Coefficients, mode::Symbol)
     if mode == :dense_exact
         n = rsvd_dense_counts(pt)
         device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
@@ -1148,6 +1302,50 @@ function rsvd_time_s(pt::SRPoint, c::Coefficients;
     device += n.solve_flops / c.eigh_rate
     host = n.bytes_written / c.disk_write_rate + c.gpu_startup_s
     return (host + device, device)
+end
+
+"Same point with the power iterations removed, for the per-pass split below."
+_at_zero_power_iters(pt::SRPoint) =
+    SRPoint(pt.sender_cells, pt.receiver_cells, pt.scale, pt.separation, pt.rank,
+            pt.oversamples, 0, pt.threads, pt.num_pos, pt.fresh_preload)
+
+"""
+    rsvd_time_parts(pt, c; vram_capacity_bytes=nothing) -> NamedTuple
+
+The RSVD's predicted time split into the part that scales with the power iteration
+count and the part that does not: `pass` and `fixed`, each with its device-bound
+share.
+
+Every count in `rsvd_counts` / `rsvd_panel_counts` is affine in `q` -- the sketch
+costs `(2q + 2)`-ish operator passes, `q + 1` orthonormalizations, `q` extra sweeps
+-- so evaluating the same expression at `q` and at `q = 0` separates the two
+exactly. That is also the shape the measurement has: two runs of one geometry at
+two low `q` give a slope (the per-pass cost, which extrapolates to any `q`) and an
+intercept (the once-only work), for a small fraction of what one production-`q` run
+would cost.
+
+The mode is resolved once, from the real point, and reused for the `q = 0`
+evaluation, so the split never straddles two storage paths.
+"""
+function rsvd_time_parts(pt::SRPoint, c::Coefficients;
+                         vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+    total, device = _rsvd_time_raw(pt, c, mode)
+    fixed, device_fixed = _rsvd_time_raw(_at_zero_power_iters(pt), c, mode)
+    return (total=total, device=device, fixed=fixed, device_fixed=device_fixed,
+            pass=max(0.0, total - fixed), device_pass=max(0.0, device - device_fixed),
+            passes_per_q=2.0)
+end
+
+function rsvd_time_s(pt::SRPoint, c::Coefficients;
+                     vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    mode = rsvd_mode(pt, vram_capacity_bytes, c)
+    # Exactly the pre-`rsvd_pass_scale` numbers when the scale is 1, bit for bit:
+    # no round trip through the difference at all.
+    c.rsvd_pass_scale == 1.0 && return _rsvd_time_raw(pt, c, mode)
+    p = rsvd_time_parts(pt, c; vram_capacity_bytes=vram_capacity_bytes)
+    return (p.fixed + c.rsvd_pass_scale * p.pass,
+            p.device_fixed + c.rsvd_pass_scale * p.device_pass)
 end
 
 """
@@ -1197,10 +1395,11 @@ end
 
 function bounds_vram_floor_bytes(pt::SRPoint, c::Coefficients;
                                  vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    tau, m = tau_shape(c), bounds_m(pt, c)
     bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
-        return bounds_panel_counts(pt).vram_bytes + c.panel_workspace_bytes +
+        return bounds_panel_counts(pt; tau=tau, m=m).vram_bytes + c.panel_workspace_bytes +
                c.bounds_vram_base
-    return c.vram_floor_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
+    return c.vram_floor_factor * bounds_counts(pt; tau=tau, m=m).vram_bytes + c.bounds_vram_base
 end
 
 """
@@ -1291,12 +1490,13 @@ dual evaluations per index:
     transfer of the projected b-vector, and a host-side Brent root find over
     length-`m` resolvent expansions.
 """
-function bounds_counts(pt::SRPoint)
+function bounds_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
+                      m::Union{Nothing,Integer}=nothing)
     N_u = universe_length(pt)
     k = pt.rank
-    m = min(effective_num_pos(pt), N_u)
+    m = m === nothing ? min(effective_num_pos(pt), N_u) : min(Int(m), N_u)
     pairs = m * (m - 1) / 2
-    evals_per_index = TAU_GRID_POINTS + TAU_REFINE_EVALS
+    evals_per_index = tau_evals_per_index(tau)
     probes = evals_per_index * m * (m + 1) / 2
 
     gs_bytes = pairs * 3 * N_u * BYTES_PER_COMPLEX   # read s_j, read/write w_i
@@ -1315,17 +1515,18 @@ function bounds_counts(pt::SRPoint)
                  2 * m * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
                  flops_gemm(m, N_u, m) +            # basis' * (C basis)
                  flops_gemm(m, N_u, m)              # D: Bs' Bs on the sender rows
-    whitenings = TAU_GRID_POINTS + m * TAU_REFINE_EVALS
+    whitenings = tau.grid_points + m * tau.refine_whitenings
     pencil_eigh_flops = (whitenings + m * evals_per_index) * flops_eigh(m)
     pencil_gemm_flops = 2 * m * evals_per_index * flops_gemm(m, m, m)
     probe_gemv_flops = probes * flops_gemm(m, m, 1)
     root_work = probes * m
 
     # The pencil arena lives on the device with the whitenings: C_basis, D, S,
-    # ss_basis, the working whitener + eigenvectors, and the cached grid
-    # whiteners (whitener + nullspace ~ m^2 each).
+    # ss_basis, the working whitener + eigenvectors, the cached grid whiteners
+    # (whitener + nullspace ~ m^2 each) and the refinement pencil cache's entries
+    # (the same two objects per entry).
     vram_bytes = (3 * k + 2 * m) * N_u * BYTES_PER_COMPLEX +
-                 (2 * TAU_GRID_POINTS + 8) * m^2 * BYTES_PER_COMPLEX +
+                 (2 * tau.grid_points + 2 * tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
                  2 * self_fourier_bytes(pt.receiver_cells) +
                  2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
     # One host-side copy of the eigenvector block; JLD2's own buffering and the
@@ -1405,10 +1606,11 @@ The `m` applications of `C` and their `4m` self plus `4m` external Green matvecs
 are unchanged: `panelmul!` applies the operator column by column, exactly as the
 resident path does.
 """
-function bounds_panel_counts(pt::SRPoint)
+function bounds_panel_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
+                            m::Union{Nothing,Integer}=nothing)
     N_u = universe_length(pt)
-    m = min(effective_num_pos(pt), N_u)
-    evals_per_index = TAU_GRID_POINTS + TAU_REFINE_EVALS
+    m = m === nothing ? min(effective_num_pos(pt), N_u) : min(Int(m), N_u)
+    evals_per_index = tau_evals_per_index(tau)
     probes = evals_per_index * m * (m + 1) / 2
 
     M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
@@ -1426,14 +1628,14 @@ function bounds_panel_counts(pt::SRPoint)
                  2 * m * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
                  flops_gemm(m, N_u, m) +            # basis' * (C basis)
                  flops_gemm(m, N_u, m)              # D: Bs' Bs on the sender rows
-    whitenings = TAU_GRID_POINTS + m * TAU_REFINE_EVALS
+    whitenings = tau.grid_points + m * tau.refine_whitenings
     pencil_eigh_flops = (whitenings + m * evals_per_index) * flops_eigh(m)
     pencil_gemm_flops = 2 * m * evals_per_index * flops_gemm(m, m, m)
     probe_gemv_flops = probes * flops_gemm(m, m, 1)
     root_work = probes * m
 
     vram_bytes = panel_staging_bytes(N_u, m) +
-                 (2 * TAU_GRID_POINTS + 8) * m^2 * BYTES_PER_COMPLEX +
+                 (2 * tau.grid_points + 2 * tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
                  2 * self_fourier_bytes(pt.receiver_cells) +
                  2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
     host_bytes = 3 * N_u * m * BYTES_PER_COMPLEX
@@ -1473,8 +1675,10 @@ workstream C2 does on the host between the two sweeps.
 """
 function bounds_time_s(pt::SRPoint, c::Coefficients;
                        vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    tau = tau_shape(c)
+    m = bounds_m(pt, c)
     if bounds_mode(pt, vram_capacity_bytes, c) == :panel
-        n = bounds_panel_counts(pt)
+        n = bounds_panel_counts(pt; tau=tau, m=m)
         device = n.gs_gemm_flops / c.gemm_rate
         device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
         device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
@@ -1487,7 +1691,7 @@ function bounds_time_s(pt::SRPoint, c::Coefficients;
         host += n.bytes_read / c.disk_read_rate + c.gpu_startup_s
         return (host + device, device)
     end
-    n = bounds_counts(pt)
+    n = bounds_counts(pt; tau=tau, m=m)
     device = n.gs_bytes / c.bandwidth + n.gs_launches * c.launch_latency
     device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
     device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
@@ -1520,18 +1724,21 @@ arithmetic unless it is declared.
 """
 function bounds_vram_bytes(pt::SRPoint, c::Coefficients;
                            vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    tau, m = tau_shape(c), bounds_m(pt, c)
     bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
-        return bounds_panel_counts(pt).vram_bytes + c.panel_workspace_bytes +
+        return bounds_panel_counts(pt; tau=tau, m=m).vram_bytes + c.panel_workspace_bytes +
                c.bounds_vram_base
-    return c.bounds_vram_factor * bounds_counts(pt).vram_bytes + c.bounds_vram_base
+    return c.bounds_vram_factor * bounds_counts(pt; tau=tau, m=m).vram_bytes + c.bounds_vram_base
 end
 
 function bounds_host_bytes(pt::SRPoint, c::Coefficients;
                            vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    tau, m = tau_shape(c), bounds_m(pt, c)
     bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
-        return c.panel_host_mem_factor * bounds_panel_counts(pt).host_bytes +
+        return c.panel_host_mem_factor * bounds_panel_counts(pt; tau=tau, m=m).host_bytes +
                c.bounds_host_mem_base
-    return c.bounds_host_mem_factor * bounds_counts(pt).host_bytes + c.bounds_host_mem_base
+    return c.bounds_host_mem_factor * bounds_counts(pt; tau=tau, m=m).host_bytes +
+           c.bounds_host_mem_base
 end
 
 # --------------------------------------------------------------------------- #

@@ -600,6 +600,195 @@ function fit_bounds(rows::Vector{Row}, gemm_rate::Union{Nothing,Float64})
 end
 
 """
+    fit_tau_shape(rows) -> Union{Nothing,NamedTuple}
+
+`CostModel.TauShape` from the `stage_bounds` rows that measured it: the `backfill`
+tier's A points, and any production bounds log run back through
+`bench/measure.jl --parse-bounds-log`.
+
+Three numbers, weighted by how many outer indices each row actually evaluated,
+because a row that timed twenty indices says twenty times as much about the mean as
+a row that timed one:
+
+  * `grid_evals` -- `tau_grid_evals_per_index`, the finite entries per row of
+    `bounds_dual_by_tau`. The windowed sweep makes this about
+    `min(2*tau_window + 1, grid)` and less when the minimiser sits at a grid end;
+    rows that fell back to a full sweep already contribute the whole grid at their
+    measured rate, so no separate fallback term is needed.
+  * `refine_whitenings` -- `tau_refine_whitenings_per_index`, that is, refinement
+    pencil cache *misses* per index. This is the number the old model got wrong by
+    the largest factor: it charged one `m x m` whitening per refinement probe, six
+    per index, where consecutive indices on a tau* plateau share a bracket and
+    almost all of them hit the cache.
+  * `refine_evals` -- probes per index. Not directly logged, so it is taken from
+    `(hits + misses) / indices` when both are present, and left at the analytic
+    default otherwise. Every probe still costs a `diag_pencil_eigen` whether or not
+    its whitener came from the cache, so under-counting here would swing the model
+    the other way.
+
+`grid_points` and `cache_entries` are the run's *settings* rather than measurements
+(`tau_grid_points` and `pencil_cache_max` in the log), and are carried through so
+the device-memory count matches the code that produced the rows.
+
+`nothing` when no row carries `tau_grid_evals_per_index`, which is every row
+measured before the windowed sweep existed. The caller then leaves
+`bounds_tau_mode = "legacy"` and the model predicts exactly what it did before.
+"""
+function fit_tau_shape(rows::Vector{Row})
+    grid_num = grid_den = 0.0
+    whiten_num = whiten_den = 0.0
+    eval_num = eval_den = 0.0
+    grid_points = Float64[]
+    cache_entries = Float64[]
+    n_rows = 0
+    for row in rows
+        row["kind"] == "stage_bounds" || continue
+        ex = extras(row)
+        haskey(ex, "tau_grid_evals_per_index") || continue
+        # Weight by evaluated indices; a row that reported no count still described
+        # one index's worth of behaviour.
+        w = max(1.0, get(ex, "outer_indices_done", 1.0))
+        n_rows += 1
+        grid_num += w * ex["tau_grid_evals_per_index"]
+        grid_den += w
+        if haskey(ex, "tau_refine_whitenings_per_index")
+            whiten_num += w * ex["tau_refine_whitenings_per_index"]
+            whiten_den += w
+        end
+        if haskey(ex, "tau_cache_hits") && haskey(ex, "tau_cache_misses") &&
+           haskey(ex, "outer_indices_done") && ex["outer_indices_done"] > 0
+            # Hits include the grid points the refinement re-used, which are not
+            # probes of their own; the grid sweep's own evaluations are counted in
+            # `grid_evals`, so subtract them off.
+            probes = ex["tau_cache_hits"] + ex["tau_cache_misses"]
+            eval_num += probes
+            eval_den += ex["outer_indices_done"]
+        end
+        haskey(ex, "tau_grid_points") && push!(grid_points, ex["tau_grid_points"])
+        haskey(ex, "pencil_cache_max") && push!(cache_entries, ex["pencil_cache_max"])
+    end
+    grid_den > 0 || return nothing
+
+    grid_evals = grid_num / grid_den
+    refine_whitenings = whiten_den > 0 ? whiten_num / whiten_den :
+                        Float64(CostModel.TAU_REFINE_EVALS)
+    refine_evals = eval_den > 0 ? max(eval_num / eval_den - grid_evals, 0.0) :
+                   Float64(CostModel.TAU_REFINE_EVALS)
+    gp = isempty(grid_points) ? Float64(CostModel.TAU_GRID_POINTS) : maximum(grid_points)
+    ce = isempty(cache_entries) ? 0.0 : maximum(cache_entries)
+    return (grid_points=gp, grid_evals=grid_evals, refine_evals=refine_evals,
+            refine_whitenings=refine_whitenings, cache_entries=ce, n=n_rows,
+            n_indices=round(Int, grid_den))
+end
+
+"""
+    fit_bounds_truncation(rows) -> Union{Nothing,NamedTuple}
+
+`bounds_m_ref` and `bounds_m_exponent`: how many of the positive `Asym(G0_ur)`
+eigenvalues survive `--gamma-rtol`, as a power law in separation.
+
+`log(kept) = log(m_ref) + exponent * log(sep / BOUNDS_M_REF_SEP)`, least squares
+over the `stage_bounds` rows that reported both a kept count (`num_pos`) and a
+stored count (`stored_num_pos`). Two free parameters, so two distinct separations
+are the minimum and more is better; with one separation only the intercept is
+identifiable and this returns `nothing` rather than inventing a slope, because a
+wrong slope at the far end of a sweep is worse than the pessimistic constant it
+would replace.
+
+Contact rows are excluded: there is no gap to take the logarithm of, and
+`bounds_m` handles contact by leaving `m` alone.
+
+The fitted `m_ref` is deliberately taken as the fitted intercept *inflated to cover
+the largest measured residual*, so the model sits above every point it was fitted
+to rather than through the middle of them. An under-predicted `m` costs a killed
+job; an over-predicted one costs queue time.
+"""
+function fit_bounds_truncation(rows::Vector{Row})
+    xs, ys, seps, kept, stored = Float64[], Float64[], Rational{Int}[], Int[], Int[]
+    for row in rows
+        row["kind"] == "stage_bounds" || continue
+        ex = extras(row)
+        (haskey(ex, "num_pos") && haskey(ex, "stored_num_pos")) || continue
+        sn, sd = int(row, "sep_num"), int(row, "sep_den")
+        (sn === nothing || sd === nothing || sn == 0) && continue
+        m = ex["num_pos"]
+        m > 0 || continue
+        sep = sn // sd
+        push!(seps, sep)
+        push!(kept, round(Int, m))
+        push!(stored, round(Int, ex["stored_num_pos"]))
+        push!(xs, log(Float64(sep / CostModel.BOUNDS_M_REF_SEP)))
+        push!(ys, log(m))
+    end
+    length(unique(seps)) >= 2 || return (insufficient=true, n=length(seps),
+                                         seps=seps, kept=kept, stored=stored)
+
+    A = hcat(ones(length(xs)), xs)
+    # Plain least squares: the exponent is negative, so a non-negative solver is
+    # the wrong tool here.
+    coef = A \ ys
+    intercept, exponent = coef[1], coef[2]
+    resid = ys .- A * coef
+    # Inflate to cover the worst under-prediction.
+    inflate = exp(max(0.0, maximum(resid)))
+    m_ref = exp(intercept) * inflate
+    return (insufficient=false, m_ref=m_ref, exponent=exponent, inflate=inflate,
+            n=length(xs), seps=seps, kept=kept, stored=stored,
+            rms=sqrt(sum(abs2, resid) / length(resid)))
+end
+
+"""
+    fit_rsvd_pass(rows, coeffs) -> Union{Nothing,NamedTuple}
+
+`rsvd_pass_scale`: the ratio of measured to predicted cost for the part of the RSVD
+that scales with the power iteration count.
+
+The measurement is the `backfill` tier's B points -- the same geometry and rank at
+two low `q` -- and the arithmetic is the only thing two points at one size can
+support: regress the measured wall times on the model's own split into
+`fixed + q-dependent` (`CostModel.rsvd_time_parts`), with the fixed part held at the
+model's value and one free multiplier on the per-pass part.
+
+    t_measured = fixed_predicted + scale * pass_predicted
+
+Least squares through that one unknown, over every `stage_rsvd` row. Runs at
+different `q` are what identify it; rows at a single `q` still constrain it, just
+less well. A single `q` across all rows is reported as such, because then the
+"per-pass" scale is absorbing whatever the fixed part gets wrong too.
+
+Why a scale on the per-pass part rather than a refit of `mv_*_fft` and `gemm_rate`:
+those are identified by the microbenchmark points at their own shapes, and a
+production-size sketch adds effects a single matvec cannot show -- the operator
+being applied to `c` columns back to back, the pool's steady state, the panel path's
+overlap. This is the one number that says how much.
+"""
+function fit_rsvd_pass(rows::Vector{Row}, coeffs::Coefficients)
+    num_sum = den_sum = 0.0
+    qs = Float64[]
+    samples = Tuple{Float64,Float64,Float64,Float64}[]  # (q, measured, fixed, pass)
+    for row in rows
+        row["kind"] == "stage_rsvd" || continue
+        t = num(row, "time_s")
+        (t === nothing || t <= 0) && continue
+        pt = row_to_srpoint(row)
+        pt === nothing && continue
+        capacity = device_capacity_bytes(row)
+        parts = CostModel.rsvd_time_parts(pt, coeffs;
+                                          vram_capacity_bytes=capacity)
+        parts.pass > 0 || continue
+        residual = t - parts.fixed
+        num_sum += parts.pass * residual
+        den_sum += parts.pass * parts.pass
+        push!(qs, Float64(pt.power_iters))
+        push!(samples, (Float64(pt.power_iters), t, parts.fixed, parts.pass))
+    end
+    den_sum > 0 || return nothing
+    scale = num_sum / den_sum
+    return (scale=max(scale, 0.0), n=length(samples),
+            distinct_q=length(unique(qs)), samples=samples)
+end
+
+"""
     fit_panel_bus(rows) -> Dict
 
 `pcie_rate` and `overlap_factor` from the `panel_bus` points, which is trial E1:
@@ -1094,6 +1283,84 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         else
             fields[field] = value
             push!(report, @sprintf("%-26s %.1f s  (from %d points)", label, value, n))
+        end
+    end
+
+    coeffs = Coefficients(; (k => v for (k, v) in fields)...)
+
+    # ---- the tau search, the gamma truncation, the RSVD per-pass rate -----
+    #=
+    Three fits that describe the *new* code paths, and all three default to
+    "leave it alone". A calibration CSV with no rows carrying the columns they read
+    -- which is every CSV written before the windowed tau sweep and the
+    `--gamma-rtol` truncation existed -- leaves `bounds_tau_mode = "legacy"`,
+    `bounds_m_mode = "fraction"` and `rsvd_pass_scale = 1.0`, and the model then
+    predicts exactly what it predicted before, coefficient for coefficient.
+    =#
+    tau = fit_tau_shape(rows)
+    if tau === nothing
+        push!(missing_fits, "bounds tau shape (no stage_bounds rows reporting " *
+                            "tau_grid_evals_per_index; run --tier backfill's A points, or " *
+                            "replay a production bounds log through " *
+                            "bench/measure.jl --parse-bounds-log)")
+    else
+        fields[:bounds_tau_mode] = "measured"
+        fields[:bounds_tau_grid_points] = tau.grid_points
+        fields[:bounds_tau_grid_evals] = tau.grid_evals
+        fields[:bounds_tau_refine_evals] = tau.refine_evals
+        fields[:bounds_tau_refine_whitenings] = tau.refine_whitenings
+        fields[:bounds_tau_cache_entries] = tau.cache_entries
+        push!(report, @sprintf("%-26s %.2f grid + %.2f refine eval/index, %.3f new whitening/index, %.0f cached  (from %d row(s), %d index/indices)",
+                               "bounds tau shape", tau.grid_evals, tau.refine_evals,
+                               tau.refine_whitenings, tau.cache_entries, tau.n, tau.n_indices))
+        push!(report, @sprintf("    was %d grid + %d refine eval/index and %d new whitening/index (the legacy constants)",
+                               CostModel.TAU_GRID_POINTS, CostModel.TAU_REFINE_EVALS,
+                               CostModel.TAU_REFINE_EVALS))
+    end
+
+    gcut = fit_bounds_truncation(rows)
+    if gcut === nothing || gcut.insufficient
+        n = gcut === nothing ? 0 : gcut.n
+        push!(missing_fits, "bounds gamma truncation (need stage_bounds rows at 2+ " *
+                            "distinct non-contact separations reporting num_pos and " *
+                            "stored_num_pos; have $n)")
+        if gcut !== nothing && !isempty(gcut.seps)
+            for (sep, k, st) in zip(gcut.seps, gcut.kept, gcut.stored)
+                push!(report, @sprintf("    gamma cut at sep %-10s keeps %5d of %5d (%.3f)",
+                                       string(sep), k, st, k / max(st, 1)))
+            end
+        end
+    else
+        fields[:bounds_m_mode] = "truncated"
+        fields[:bounds_m_ref] = gcut.m_ref
+        fields[:bounds_m_exponent] = gcut.exponent
+        push!(report, @sprintf("%-26s m = %.0f * (sep / %s)^%.3f  (from %d row(s), log-rms %.3f, x%.2f safety)",
+                               "bounds gamma truncation", gcut.m_ref,
+                               string(CostModel.BOUNDS_M_REF_SEP), gcut.exponent,
+                               gcut.n, gcut.rms, gcut.inflate))
+        for (sep, k, st) in zip(gcut.seps, gcut.kept, gcut.stored)
+            push!(report, @sprintf("    gamma cut at sep %-10s keeps %5d of %5d (%.3f)",
+                                   string(sep), k, st, k / max(st, 1)))
+        end
+    end
+
+    pass = fit_rsvd_pass(rows, coeffs)
+    if pass === nothing
+        push!(missing_fits, "rsvd_pass_scale (no stage_rsvd rows with a q-dependent " *
+                            "prediction; run --tier backfill's B points)")
+    elseif pass.distinct_q < 2
+        push!(report, @sprintf("%-26s %.3f  (from %d stage_rsvd row(s) at ONE q; the scale is absorbing the fixed part's error too, so it is reported and not applied)",
+                               "rsvd_pass_scale", pass.scale, pass.n))
+        push!(missing_fits, "rsvd_pass_scale (only one distinct power_iters across " *
+                            "$(pass.n) stage_rsvd row(s); needs two to separate the " *
+                            "per-pass slope from the fixed overhead)")
+    else
+        fields[:rsvd_pass_scale] = pass.scale
+        push!(report, @sprintf("%-26s %.3f x the model's per-pass time  (from %d stage_rsvd row(s) at %d distinct q)",
+                               "rsvd_pass_scale", pass.scale, pass.n, pass.distinct_q))
+        for (q, measured, fixed, ps) in pass.samples
+            push!(report, @sprintf("    q=%-3.0f measured %8.1f s   model %8.1f s fixed + %8.1f s per-pass",
+                                   q, measured, fixed, ps))
         end
     end
 
