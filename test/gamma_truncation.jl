@@ -161,6 +161,109 @@ for tag in ("inline", "h5")
     Funicular.free!(inputs.Vur_asym)
 end
 
+# --- 2b: what the read costs, which is the reason the readers slice at all
+#
+# The cut keeps a prefix of a block the RSVD saved at its full width, and the
+# request the cost model sizes covers the prefix. So the read has to allocate
+# `N_u × m` and not `N_u × stored_cols`: reading through a Funicular.load'd
+# PanelMatrix spanning the stored width, as this used to, cost ~13 GB at 1 λ to
+# keep 38 of 1,951 columns and was OOM-killed inside a request sized at 0.36 GB.
+#
+# `N_u` is large enough here (24,576) that the stored block is 39 MB and the kept
+# one 2 MB, so the two are not confusable with JLD2's own buffering.
+
+println("\n=== read-path allocation")
+
+const WIDE_SMR = SMRSystem((16, 16, 16), (1//32, 0//1, 0//1), (16, 16, 16),
+                           SMRVolumeSymbol[Sender, Receiver], 1//32, 13.6 + 0.05im)
+const WIDE_N_U = 3 * (prod(sender(WIDE_SMR).cel) + prod(receiver(WIDE_SMR).cel))
+const STORED = 100
+const KEPT = 5
+const WIDE_PANEL_W = 50
+# Five decades of real spectrum, then a noise tail the default rtol cuts, then the
+# negative half. num_pos on disk is the whole positive block, as _save_ur_asym
+# writes it.
+const WIDE_SPECTRUM = vcat([10.0^(-i) for i in 0:(KEPT-1)],
+                           [1e-13 * 0.99^i for i in 1:(STORED-KEPT)],
+                           -[1e-16, 1e-10, 1e-3, 1.0])
+const KEPT_BYTES = WIDE_N_U * KEPT * 16
+const STORED_BYTES = WIDE_N_U * STORED * 16
+@printf("N_u = %d, stored = %d columns (%.1f MiB), kept = %d (%.1f MiB)\n",
+        WIDE_N_U, STORED, STORED_BYTES / 2^20, KEPT, KEPT_BYTES / 2^20)
+
+Random.seed!(0x0A11C)
+const V_WIDE = randn(ComplexF64, WIDE_N_U, STORED)
+
+const WIDE_ENV = ComputeEnvironment(joinpath(ROOT, "preload"),
+                                    joinpath(ROOT, "wide", "project"),
+                                    joinpath(ROOT, "wide", "scratch"), GPUChoice(false, -1))
+const WIDE_H5 = PSC.ur_asym_vectors_path(WIDE_ENV, WIDE_SMR)
+mkpath(joinpath(ROOT, "wide", "scratch"))
+mkpath(joinpath(ROOT, "wide", "project"))
+let plan = ResidencyPlan(; backend=Funicular.CPUBackend(), device_budget=128 * 2^20,
+                         host_budget=128 * 2^20, panel_width=WIDE_PANEL_W)
+    pm = PanelMatrix(V_WIDE; plan=plan)
+    try
+        Funicular.save(pm, WIDE_H5)
+    finally
+        Funicular.free!(pm)
+    end
+end
+PSC._save_ur_asym_components(joinpath(ROOT, "wide", "scratch", "$(file_prefix(WIDE_SMR)).jld"),
+                             "UR_asym/", WIDE_SPECTRUM, STORED, 1, false;
+                             vectors_file=basename(WIDE_H5))
+jldopen(joinpath(ROOT, "wide", "scratch", "$(file_prefix(WIDE_SMR)).jld"), "a+") do jld
+    jld["RS/D"] = collect(range(1.0, 0.1; length=STORED))
+end
+check("the fabricated h5 really is the full stored width on disk",
+      filesize(WIDE_H5) >= STORED_BYTES,
+      @sprintf("%.1f MiB on disk", filesize(WIDE_H5) / 2^20))
+
+wide_load(; kwargs...) = load_bounds_inputs(WIDE_ENV, WIDE_SMR; kwargs...)
+
+# Compiled by the load above this line, but not for these argument values, so the
+# first call is warm-up and the second is the measurement.
+let warm = wide_load(panel_mode=false, to_device=false)
+    check("wide h5: the cut keeps the leading $(KEPT) columns",
+          warm.num_pos == KEPT && size(warm.Vur_asym) == (WIDE_N_U, KEPT) &&
+              warm.Vur_asym == V_WIDE[:, 1:KEPT],
+          "num_pos = $(warm.num_pos), size = $(size(warm.Vur_asym))")
+end
+GC.gc()
+basis = nothing
+dense_alloc = @allocated (basis = wide_load(panel_mode=false, to_device=false).Vur_asym)
+check("wide h5: the dense read still returns the right columns",
+      basis == V_WIDE[:, 1:KEPT])
+# Four times the kept block, which leaves room for JLD2's buffering and the
+# spectrum while staying far below a single copy of the stored width.
+check("wide h5: the dense read allocates O(N_u m), not O(N_u stored)",
+      dense_alloc < 4 * KEPT_BYTES,
+      @sprintf("%.1f MiB allocated, kept block %.1f MiB, stored block %.1f MiB",
+               dense_alloc / 2^20, KEPT_BYTES / 2^20, STORED_BYTES / 2^20))
+
+# The same on the panel path, under a plan that could not hold one panel of the
+# *file's* width (19.7 MiB) even if it wanted to. Staging the kept prefix through
+# a Funicular.load'ed source, as this used to, cannot run inside this plan at all.
+const TIGHT_PLAN = ResidencyPlan(; backend=Funicular.CPUBackend(),
+                                 device_budget=32 * 2^20, host_budget=8 * 2^20)
+let warm = wide_load(plan_override=TIGHT_PLAN)
+    check("wide h5: the panel read fits a plan too small for one stored-width panel",
+          warm.Vur_asym isa PanelMatrix && size(warm.Vur_asym) == (WIDE_N_U, KEPT),
+          @sprintf("file panel %.1f MiB vs %.1f MiB of host budget",
+                   WIDE_N_U * WIDE_PANEL_W * 16 / 2^20, TIGHT_PLAN.host_budget / 2^20))
+    check("wide h5: the panel basis holds the kept columns",
+          Matrix(warm.Vur_asym) == V_WIDE[:, 1:KEPT])
+    Funicular.free!(warm.Vur_asym)
+end
+GC.gc()
+panel_basis = nothing
+panel_alloc = @allocated (panel_basis = wide_load(plan_override=TIGHT_PLAN).Vur_asym)
+check("wide h5: the panel read allocates O(N_u m), not O(N_u stored)",
+      panel_alloc < 4 * KEPT_BYTES,
+      @sprintf("%.1f MiB allocated, kept block %.1f MiB, stored block %.1f MiB",
+               panel_alloc / 2^20, KEPT_BYTES / 2^20, STORED_BYTES / 2^20))
+Funicular.free!(panel_basis)
+
 # --- 3: the num_pos contract bounds_from_spectrum is held to
 
 println("\n=== bounds_from_spectrum's num_pos")

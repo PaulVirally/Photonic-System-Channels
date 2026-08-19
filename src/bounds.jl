@@ -440,16 +440,57 @@ function use_panel_bounds(N_u::Integer, m::Integer, compute_env::ComputeEnvironm
     return RSVD_PEAK_FUDGE * bounds_footprint_bytes(N_u, m) > device_budget_bytes()
 end
 
-# A plan that only exists to read an h5 panel matrix back into one host array.
-# Nothing is swept through it, so the "device" budget is only there for
-# `resolve_panel_width`'s arithmetic (2 staging buffers of one panel each) and
-# never allocates. The host budget has to cover the panels themselves, which
-# `Matrix` then copies into the array it returns.
-function _dense_read_plan(N_u::Integer, m::Integer)
-    bytes = Int(N_u) * Int(m) * 16
-    return Funicular.ResidencyPlan(backend=Funicular.CPUBackend(),
-                                   device_budget=max(4 * bytes, 2^20),
-                                   host_budget=max(bytes + (bytes >> 2), 2^20))
+# Reading the basis h5 without ever holding the width it was saved at.
+#
+# `Funicular.save` writes one chunked HDF5 dataset, `N_u × stored_cols`, chunked
+# `(N_u, panel width)`, and the columns the spectral cut keeps are its leading `m`
+# (`_assert_positive_prefix`). Any leading run of columns is one contiguous
+# hyperslab of that dataset, so the file's own reader can fill a destination *we*
+# size and the stored width never has to be materialized.
+#
+# Both readers below used to go through `Funicular.load`, which builds a
+# `PanelMatrix` spanning the whole stored width. Its panels are as wide as the
+# RSVD's device budget made them, and a `Matrix(pm)` on top of that is a second
+# copy of the stored width. At 1 λ (`N_u = 196,608`, 1,951 stored columns, panels
+# of ~650) that is up to 7.7 GB of staged panel slabs plus a 6.1 GB dense block to
+# keep 38 columns, i.e. ~14 GB against a request the cost model sized at
+# `3·N_u·m·16 = 0.36 GB`. That is what OOM-killed the first bounds rerun of the 1 λ
+# sweep, and it is what the calibration's own `stage_bounds` peaks are: 15.0-16.2
+# GB of RSS at every m from 9 to 1,987, which this accounts for to within 0.7 GB
+# at all four separations.
+#
+# `open_store`, `read_panel!` and `close_store!` are Funicular's disk-tier entry
+# points (documented in its `src/io.jl`). Going through them rather than through
+# HDF5 directly keeps the knowledge of the file's layout, panel width and storage
+# eltype in the one package that writes it.
+function _open_ur_asym_store(path::String, N_u::Integer, stored_cols::Integer)
+    store = Funicular.open_store(path, "r")
+    try
+        store.N == N_u || error("$(path) holds $(store.N)-row vectors but the universe " *
+            "is $(N_u) cells' worth of currents; this basis was not saved for this system")
+        store.k == stored_cols || error("$(path) holds $(store.k) columns but " *
+            "UR_asym/num_pos says $(stored_cols); the values and the vectors in this " *
+            "file do not line up")
+    catch
+        Funicular.close_store!(store)
+        rethrow()
+    end
+    return store
+end
+
+# Columns `cols` of an opened store, into `dst`. `read_panel!` fills a host array
+# of the file's own eltype, so a narrowed cold tier (`ComplexF32` storage under a
+# `ComplexF64` compute eltype) is read as it was written and converted on the way
+# into `dst`, still one `length(cols)`-wide block at a time.
+function _read_store_cols!(dst::AbstractMatrix, store, cols::UnitRange{Int})
+    if eltype(dst) === store.stored
+        Funicular.read_panel!(Funicular.DiskHome(store, cols), dst)
+        return dst
+    end
+    staged = Matrix{store.stored}(undef, size(dst, 1), length(cols))
+    Funicular.read_panel!(Funicular.DiskHome(store, cols), staged)
+    copyto!(dst, staged)
+    return dst
 end
 
 # Which of the three save formats the RSVD job left behind, in priority order:
@@ -478,13 +519,35 @@ end
 # The positives-only formats hold the whole saved block, `stored_cols` wide, and
 # `m` of its columns are wanted. `m < stored_cols` only happens under the
 # `gamma_rtol` cut, which drops a tail of a descending spectrum, so the wanted
-# columns are the leading `m`.
+# columns are the leading `m`. A view, so that the copy the caller makes is the
+# only one and it is `N_u × m`.
 function _leading_cols(V::AbstractMatrix, m::Int, stored_cols::Integer,
                        key::AbstractString)
     size(V, 2) == stored_cols || error("$key holds $(size(V, 2)) columns but " *
         "UR_asym/num_pos says $(stored_cols); the values and the vectors in this " *
         "file do not line up")
-    return m == stored_cols ? V : V[:, 1:m]
+    return m == stored_cols ? V : view(V, :, 1:m)
+end
+
+# The block as a host `Matrix{ComplexF64}`, without copying one that already is
+# one: JLD2 hands back an array of its own, so there is nothing to alias.
+_as_host_complex(V::Matrix{ComplexF64}) = V
+_as_host_complex(V::AbstractMatrix) = Matrix{ComplexF64}(V)
+
+# JLD2 hands back whole datasets -- there is no hyperslab read -- so a cut on
+# either in-JLD format materializes the *full* stored block before its prefix is
+# taken. Both are small-run or legacy paths: `V_pos` is written by the dense-exact
+# and in-memory RSVD branches, whose `N_u` is small by construction (the panel
+# branch, which is the one that runs at the sizes where this would matter, writes
+# the h5 instead), and nothing writes the legacy `V` any more. So this is logged
+# rather than worked around -- the cost model bills the `N_u × m` block, and a job
+# that lands here under a cut needs the difference on top of its request.
+function _warn_full_width_read(key::AbstractString, N_u::Integer, m::Int,
+                               width::Integer)
+    m == width && return nothing
+    gib = round(Int(N_u) * Int(width) * 16 / 2^30; digits=2)
+    @warn string(now()) * " [bounds_bargaining::_read_ur_asym_dense] $(key) is a JLD2 dataset and JLD2 has no partial read, so all $(width) stored columns come through host memory ($(gib) GiB for the $(N_u) × $(width) block) before the leading $(m) are taken. The cost model bills the N_u × m block only, so this job needs that much host memory on top of its request"
+    return nothing
 end
 
 # The positive-Γ block as a host `Matrix{ComplexF64}`. `cols` are the columns of
@@ -498,51 +561,84 @@ function _read_ur_asym_dense(jld, source::Symbol, path::String,
     m = length(cols)
     if source === :h5
         _assert_positive_prefix(cols, "UR_asym/vectors_file")
-        @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the $(N_u) × $(m) positive block from $(path)"
-        # Sized by what is on disk rather than by `m`: on this path the whole
-        # saved block comes through host memory before its prefix is taken.
-        plan = _dense_read_plan(N_u, stored_cols)
-        pm = Funicular.load(Funicular.PanelMatrix, path; plan=plan, readonly=true)
+        @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the $(N_u) × $(m) positive block from $(path) as one hyperslab of its $(stored_cols) stored columns"
+        # One contiguous read into one N_u × m array. Nothing the stored width
+        # sizes is allocated: see `_open_ur_asym_store` for what this replaced.
+        store = _open_ur_asym_store(path, N_u, stored_cols)
         try
-            return _leading_cols(Matrix(pm; max_bytes=plan.host_budget), m,
-                                 stored_cols, "UR_asym/vectors_file")
+            V = Matrix{ComplexF64}(undef, Int(store.N), m)
+            return _read_store_cols!(V, store, 1:m)
         finally
-            Funicular.free!(pm)
+            Funicular.close_store!(store)
         end
     elseif source === :v_pos
         _assert_positive_prefix(cols, "UR_asym/V_pos")
         @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the $(N_u) × $(m) positive block from UR_asym/V_pos"
-        return _leading_cols(Matrix{ComplexF64}(jld["UR_asym/V_pos"]), m, stored_cols,
-                             "UR_asym/V_pos")
+        _warn_full_width_read("UR_asym/V_pos", N_u, m, stored_cols)
+        return _as_host_complex(_leading_cols(jld["UR_asym/V_pos"], m, stored_cols,
+                                              "UR_asym/V_pos"))
     end
     @info string(now()) * " [bounds_bargaining::_read_ur_asym_dense] Reading the legacy full UR_asym/V and taking its leading $(m) sorted columns"
-    return Matrix{ComplexF64}(view(jld["UR_asym/V"], :, cols))
+    V = jld["UR_asym/V"]
+    _warn_full_width_read("UR_asym/V", N_u, m, size(V, 2))
+    return Matrix{ComplexF64}(view(V, :, cols))
 end
 
-# The same block as an `N_u × m` `PanelMatrix` on the run's plan. The h5 is opened
-# as the matrix's cold tier and its panels stream up as they are swept, so nothing
-# dense of that size is ever built. The other two formats have to come through
-# host memory once, since that is how they are stored.
+# The same block as an `N_u × m` `PanelMatrix` on the run's plan. With no cut the
+# h5 is opened as the matrix's cold tier and its panels stream up as they are
+# swept, so nothing dense of that size is ever built; under a cut the kept prefix
+# is staged into a matrix of this run's own, one destination panel at a time. The
+# other two formats have to come through host memory once, since that is how they
+# are stored.
 function _read_ur_asym_panel(jld, source::Symbol, path::String,
                              cols::AbstractVector{Int}, N_u::Integer, plan,
                              stored_cols::Integer)
     m = length(cols)
     if source === :h5
         _assert_positive_prefix(cols, "UR_asym/vectors_file")
-        @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] Opening $(path) as a $(N_u) × $(stored_cols) panel matrix"
-        pm = Funicular.load(Funicular.PanelMatrix, path; plan=plan, readonly=true)
-        size(pm, 2) == stored_cols || error("$(path) holds $(size(pm, 2)) columns but " *
-            "UR_asym/num_pos says $(stored_cols); the values and the vectors in this " *
-            "file do not line up")
-        m == stored_cols && return pm
-        # The h5 is opened readonly, so the cut cannot narrow it in place. Only
-        # the kept panels are staged, into a matrix this run owns.
-        @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] Copying the leading $(m) of $(stored_cols) columns into a panel matrix this run owns"
-        kept = Funicular.PanelMatrix{eltype(pm)}(undef, size(pm, 1), m; plan=plan,
-                                                 w=min(Funicular.panelwidth(pm), m))
-        Funicular.copycols!(kept, 1:m, pm, 1:m)
-        Funicular.free!(pm)
-        return kept
+        if m == stored_cols
+            # Nothing to cut: the file is the matrix's cold tier and its panels
+            # stream up as the sweeps reach them, so this allocates nothing at all.
+            @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] Opening $(path) as a $(N_u) × $(stored_cols) panel matrix"
+            pm = Funicular.load(Funicular.PanelMatrix, path; plan=plan, readonly=true)
+            size(pm, 2) == stored_cols || error("$(path) holds $(size(pm, 2)) columns " *
+                "but UR_asym/num_pos says $(stored_cols); the values and the vectors " *
+                "in this file do not line up")
+            return pm
+        end
+        # The h5 is opened readonly, so the cut cannot narrow it in place, and the
+        # kept prefix has to go into a matrix this run owns. Reading it through a
+        # `Funicular.load`ed source would stage panels as wide as the *file's*,
+        # which the RSVD's device budget chose and which have nothing to do with
+        # `m`: 2 GB of host memory per panel at 1 λ, pinned for the length of the
+        # copy and so not even spillable, to keep 38 columns. The store is read
+        # directly instead, one destination panel at a time, so the peak is one
+        # `N_u × panelwidth(kept)` staging block plus the panel it lands in, and
+        # `panelwidth(kept) <= m`.
+        @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] Staging the leading $(m) of $(stored_cols) columns of $(path) into a panel matrix this run owns"
+        store = _open_ur_asym_store(path, N_u, stored_cols)
+        try
+            # `store.computed` is the compute eltype the file records, which is what
+            # `Funicular.load` would have given the matrix.
+            T = store.computed
+            kept = Funicular.PanelMatrix{T}(undef, Int(store.N), m; plan=plan,
+                                            w=min(store.w, m))
+            try
+                block = Matrix{T}(undef, Int(store.N), Funicular.panelwidth(kept))
+                for j in 1:Funicular.npanels(kept)
+                    into = Funicular.panelrange(kept, j)
+                    staged = view(block, :, 1:length(into))
+                    _read_store_cols!(staged, store, into)
+                    Funicular.copycols!(kept, into, staged)
+                end
+            catch
+                Funicular.free!(kept)
+                rethrow()
+            end
+            return kept
+        finally
+            Funicular.close_store!(store)
+        end
     end
     @info string(now()) * " [bounds_bargaining::_read_ur_asym_panel] The JLD holds the basis densely; cutting it into panels"
     dense = _read_ur_asym_dense(jld, source, path, cols, N_u, stored_cols)

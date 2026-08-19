@@ -10,8 +10,17 @@ because the bounds are what gets reported.
 run_study.sh        the launcher: greens once, then rsvd + bounds per (separation, q)
 run_study_gpu0.sh   GPU 0 half
 run_study_gpu1.sh   GPU 1 half
-analyze.jl          reads the per-q outputs, prints the tables, writes the CSV
+analyze.jl          reads the per-q outputs, prints the tables, writes the CSVs
 ```
+
+`analyze.jl` has two modes and picks between them per file, from the keys the file
+holds rather than from a flag: **bounds mode** on the `compute_bounds` output in the
+project tree (`bounds_dual_basis`), which is the study's answer, and **spectrum
+mode** on the `generate_rsvd` output in scratch (`UR_asym/D`), which is what there
+is to read after `STAGES=rsvd` and whose verdict is provisional. A root may hold
+either or both. Bounds mode writes `power_iter_summary.csv`, spectrum mode
+`power_iter_rsvd_summary.csv`, and neither file is created if there was nothing to
+put in it.
 
 ## One hour per run, so the reference is q = 8
 
@@ -109,6 +118,76 @@ starts. To stop after them, `STAGES=rsvd`; to come back for the bounds later,
 and the loop carries on, and rerunning skips whatever already landed, since both
 `_save_ur_asym` and `compute_bounds` check for their own output first.
 
+## After `STAGES=rsvd`, before committing to the bounds half
+
+`STAGES=rsvd` leaves nothing in the project tree but the timings CSVs and a set of
+empty `q*/` directories: the RSVD output is in **scratch**, and step 3 above
+pointed at the project root will say `no q*/*.jld`. Pass both trees:
+
+```bash
+julia --project=. bench/power_iter_study/analyze.jl \
+    --root      /home/paulv/Projects/Photonic-System-Channels/projects/power_iter_study/k4000 \
+    --rsvd-root /home/molering/fatmole/paulv/Photonic-System-Channels/power_iter_study/k4000
+```
+
+`analyze.jl` picks its mode per file from the keys the file holds, so nothing else
+changes: the spectra come out of the scratch tree, the wall times out of
+`timings_gpu*.csv` in the project tree, and once the bounds half has run the same
+command prints both halves. `--rsvd-root` on its own works too, without a project
+root, and costs the wall-time columns.
+
+What comes out per separation is a table over `q` of
+
+- `npos`, the saved `UR_asym/num_pos`, and `kept`, how many survive `GAMMA_RTOL`.
+  `kept` is recomputed by the rule `load_bounds_inputs` applies, so it is the `m`
+  the bounds job would run at and the thing that sets its cost;
+- `dev_max` and `dev_med`, the largest and median relative eigenvalue deviation
+  from the reference over the mutually kept set;
+- the same two numbers between the reference and its replicate — the sketch-noise
+  floor — and the convergence gate run against them, exactly as in bounds mode;
+- a **bounds-cost forecast** at the measured `kept`, from `bench/cost_model.jl` on
+  narval's coefficients, per run and totalled over the separation. That total is
+  the number to decide the bounds half on. It is labelled *narval-equivalent* for
+  the reason in [What this costs](#what-this-costs): molering's own bounds
+  coefficients are off by a factor of tens in the conservative direction.
+
+The forecast reads `bench/coeffs_narval.jl` as it stands, so it moves when the fit
+is rerun and the table in [What this costs](#what-this-costs) does not. Where the
+two disagree, the script is the current one — and it is also at the *measured*
+`kept` rather than at the table's assumed `m = 0.6k`, which at `1/16 lambda` is a
+real difference (about 2000 against 2400).
+
+### What the provisional verdict does and does not tell you
+
+It says: the smallest `q` whose kept eigenvalues sit within
+`max(10x the sketch-noise floor, 1e-6)` of the reference's. Which is a real
+result — a `q` that fails it has visibly changed the spectrum and cannot be right —
+and it is not the study's answer.
+
+It does not say what `q` the bounds need. `q` reaches the bounds through the RSVD
+**basis**, and two runs can agree on `Gamma` to ten digits while their
+eigenvectors span slightly different subspaces; `bounds_dual_basis` is the only
+one of the three reported bounds that reads the basis rather than just the
+eigenvalues, and so the only place that difference can show up. A spectrum-level
+pass is necessary, not sufficient. Read it as "no `q` below this one is worth
+running the bounds at", not as "this `q` is fine".
+
+Two further cautions:
+
+- **Index-matching only means something above the noise floor.** The deviations
+  compare the `i`th eigenvalue of one run with the `i`th of the other, and at the
+  bottom of the kept block the two runs are ordering their own sketch noise rather
+  than a shared spectrum, so the `i`th entries are not the same direction. A
+  `dev_max` far above `dev_med` is that, not a spectrum that moved.
+- A `q` whose `kept` differs from the reference's is doing something structural.
+  It is flagged, and it resizes every downstream bounds object, so it is not
+  comparable to the reference in the way a deviation number suggests.
+
+The gate on the reference itself applies here too: if `q = 6` against `q = 8` is
+more than `--conv-factor` above the `q8`-vs-`q8r` floor, no provisional verdict is
+issued either. A *missing* replicate does not suppress it, but drops the threshold
+to the bare `1e-6` and says so.
+
 Knobs, all environment variables: `RANK` (4000), `OVERSAMPLES` (50), `QS`
 (`"1 2 3 4 6 8"`), `SEED` (20260814), `GAMMA_RTOL` (1.0e-12), `TIER`
 (`half`/`full`), `STAGES` (`greens`/`rsvd`/`bounds`/`study`/`all`), `CHI`
@@ -205,7 +284,8 @@ note saying what to run to fix it.
 
 ## Reading the output
 
-Two tables per separation.
+Two tables per separation, in bounds mode. (For spectrum mode, see
+[After `STAGES=rsvd`](#after-stagesrsvd-before-committing-to-the-bounds-half).)
 
 **cost.** `rsvd_s`, `bounds_s`, and `cost/pass`: the measured wall time per
 operator pass, relative to the reference's. `1.00` means the RSVD scaled exactly
