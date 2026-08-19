@@ -111,9 +111,50 @@ and the loop carries on, and rerunning skips whatever already landed, since both
 
 Knobs, all environment variables: `RANK` (4000), `OVERSAMPLES` (50), `QS`
 (`"1 2 3 4 6 8"`), `SEED` (20260814), `GAMMA_RTOL` (1.0e-12), `TIER`
-(`half`/`full`), `STAGES` (`greens`/`rsvd`/`bounds`/`study`/`all`),
-`QS_REPLICATE` (8, and the launcher refuses to start if it is not the largest `q`
-in `QS`, since the convergence check needs the replicate at the reference).
+(`half`/`full`), `STAGES` (`greens`/`rsvd`/`bounds`/`study`/`all`), `CHI`
+(the corrected Ge `zeta = 1000` value; see below), `QS_REPLICATE` (8, and the
+launcher refuses to start if it is not the largest `q` in `QS`, since the
+convergence check needs the replicate at the reference).
+
+## The chi correction, and why it does not cost this study anything
+
+`run_study.sh` used to hardcode `CHI="4.25+0.0342557im"`. That is germanium's
+refractive **index**, not its susceptibility: it gives
+`zeta = |chi|^2/Im(chi) = 527.3` where the intended material is `zeta = 1000`.
+The default is now the corrected value,
+
+```
+CHI=17.06132654701751+0.29117345im     # zeta = 1000 exactly
+```
+
+**RSVD outputs made with the old default remain valid.** `_generate_rsvd_sr` in
+`src/rsvd.jl` writes two groups and `chi` appears in neither:
+
+- `UR_asym/` is the eigendecomposition of `Asym(G0_ur)`, a vacuum Green operator.
+- `RS/D` is the singular values of the vacuum `G0` from sender to receiver
+  (`_run_rsvdvals`, not the `imag(inv(chi))I - Asym(G0_rr)` expression, which
+  belongs to `_save_constraint_asym` and is commented out of the pipeline).
+
+`zeta` is applied later, at bounds time (`src/bounds.jl`), which is the only
+stage whose answer moves. So do not rerun any spectrum: **finish the RSVD half as
+it is, then pick up this file before running `STAGES=bounds`.**
+
+```bash
+# on molering, after the RSVD half has finished
+cd /home/paulv/Projects/Photonic-System-Channels/ && git pull   # or rsync this dir
+STAGES=bounds bash bench/power_iter_study/run_study_gpu0.sh
+STAGES=bounds bash bench/power_iter_study/run_study_gpu1.sh
+```
+
+Nothing about the directory layout depends on `chi`, so a run already in flight
+keeps writing where it was writing and no path in [Directory layout](#directory-layout)
+changes. Each run now echoes its `chi` at startup, so a log says which value
+produced it.
+
+Note also that `m` — the count of directions surviving `GAMMA_RTOL` — is
+`chi`-independent: the cut in `load_bounds_inputs` is applied to `Gamma`, a
+vacuum-Green quantity. The bounds *cost* table further down is therefore
+unaffected by the correction; only the reported `trace` values move.
 
 ## The seed does not do what it looks like it does
 

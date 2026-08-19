@@ -164,6 +164,18 @@ const TAU_GRID_POINTS = 5
 const TAU_REFINE_EVALS = 6
 
 """
+    PENCIL_CACHE_MAX
+
+Entries the refinement pencil cache holds, from `pencil_cache_max = 16` in
+`bounds_from_spectrum` (`src/bounds.jl`). Each entry is one whitener plus its null
+space, `m^2` complex between them, so this is a device-memory term and nothing
+else. It is here for the same reason `TAU_GRID_POINTS` is: a measurement that did
+not record the cache size still ran with it, and the code's declared default is a
+better stand-in than zero. Update it if `bounds_from_spectrum`'s default changes.
+"""
+const PENCIL_CACHE_MAX = 16
+
+"""
     TauShape
 
 How much τ work one outer index actually costs. Four numbers, because the
@@ -570,6 +582,18 @@ Base.@kwdef struct Coefficients
                      the bodies, the fewer directions of `Asym(G0_ur)` sit above
                      the RSVD's noise floor, and at the far end of a sweep the
                      positive block shrinks by more than an order of magnitude.
+
+    `bounds_m_floor`: a lower bound on the truncated `m`, in the same units. The
+    decay is not monotone all the way out: the kept count bottoms out around 30
+    wavelengths and then climbs slowly again, because once the coupling is pure
+    far field the surviving directions stop being killed by the `gamma_rtol` cut
+    and the spectrum flattens against its own top eigenvalue. Measured on the
+    1 lambda sweep the minimum is 9 directions near 28 lambda and the count is
+    back to ~79 by 10000 lambda, so a pure power law extrapolates to `m = 1`
+    where the truth is two orders of magnitude larger. The floor is the largest
+    kept count observed beyond the decay minimum; it costs almost nothing,
+    because a bounds job at `m = 79` and one at `m = 9` are both dominated by
+    load and startup. Default 1.0, which is the old unfloored behaviour.
     =#
     bounds_tau_mode::String = "legacy"
     bounds_tau_grid_points::Float64 = TAU_GRID_POINTS
@@ -581,6 +605,7 @@ Base.@kwdef struct Coefficients
     bounds_m_mode::String = "fraction"
     bounds_m_ref::Float64 = 0.0
     bounds_m_exponent::Float64 = 0.0
+    bounds_m_floor::Float64 = 1.0
 
     #=
     Multiplier on the part of the RSVD's predicted time that scales with the power
@@ -654,6 +679,11 @@ request for a job that runs in minutes looks like.
 A cap and not a replacement: whatever the RSVD produced is still the ceiling, and
 a measured `num_pos` on a row that was itself produced under the cut is already
 the post-truncation count.
+
+`bounds_m_floor` holds the cap up at the far end, where the power law is the wrong
+shape: the measured kept count stops falling around thirty wavelengths and climbs
+back, so an unfloored law reaches `m = 1` against a measured 68. See the
+`Coefficients` docstring.
 """
 function bounds_m(pt::SRPoint, c::Coefficients)
     m = min(effective_num_pos(pt), universe_length(pt))
@@ -665,6 +695,7 @@ function bounds_m(pt::SRPoint, c::Coefficients)
     ratio > 0 || return m
     cap = c.bounds_m_ref * ratio^c.bounds_m_exponent
     isfinite(cap) || return m
+    cap = max(cap, c.bounds_m_floor)
     return clamp(round(Int, cap), 1, m)
 end
 
@@ -1521,12 +1552,35 @@ function bounds_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
     probe_gemv_flops = probes * flops_gemm(m, m, 1)
     root_work = probes * m
 
-    # The pencil arena lives on the device with the whitenings: C_basis, D, S,
-    # ss_basis, the working whitener + eigenvectors, the cached grid whiteners
-    # (whitener + nullspace ~ m^2 each) and the refinement pencil cache's entries
-    # (the same two objects per entry).
-    vram_bytes = (3 * k + 2 * m) * N_u * BYTES_PER_COMPLEX +
-                 (2 * tau.grid_points + 2 * tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
+    #=
+    Three `N_u x m` device matrices, which is `bounds_footprint_bytes` in
+    `src/bounds.jl` exactly: the basis, the orthonormalized `ss = similar(basis)`,
+    and the `out = similar(B, N_u, m)` that `opmat` allocates for `C * basis`. That
+    is the front end's live peak and the same count the job's own
+    `use_panel_bounds` predicate tests, so the two cannot disagree about whether a
+    card is big enough.
+
+    Nothing on the device is a function of `k`. `load_bounds_inputs` applies the
+    gamma truncation on the host as a count *before* it reads anything
+    (`num_pos = _gamma_kept_count(...)`, then `cols = sorted_idxs[1:num_pos]`), and
+    the single host-to-device conversion is `CuArray(Vpos)` on an `N_u x m` host
+    matrix. The rank-`k` block is a host-side read and a host-side spectrum; it is
+    never resident. The `3 * k * N_u` term this replaces was the RSVD sketch's
+    footprint (`Omega`, `Q`, `A*Q`) copied onto a job that has no sketch, and the
+    calibration refutes it directly: at `k = 4000`, `N_u = 196608` it claims 37.7 GB
+    of resident device memory for three bounds jobs that ran to completion inside a
+    19.6 GiB MIG slice.
+
+    The pencil arena lives on the device with the whitenings: C_basis, D_basis,
+    S_basis, ss_basis, the working whitener + eigenvectors and the per-evaluation
+    temporaries (the `8`), plus one `m^2` for each shared grid pencil and each
+    refinement pencil the LRU cache holds. One, not two, per pencil: the whitener is
+    `m x rank` and the null space `m x num_null` with `rank + num_null == m`, so the
+    pair is `m^2` complex between them, which is what this line's own comment always
+    said and what the code does.
+    =#
+    vram_bytes = 3 * m * N_u * BYTES_PER_COMPLEX +
+                 (tau.grid_points + tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
                  2 * self_fourier_bytes(pt.receiver_cells) +
                  2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
     # One host-side copy of the eigenvector block; JLD2's own buffering and the
@@ -1594,12 +1648,13 @@ changes.
     `readonly=true` as the matrix's cold tier. Read page cache is clean and the
     kernel can drop it under cgroup pressure, unlike the dirty pages an h5 stream
     writes, so it needs no reserve of its own.
-  * Device memory is staging buffers plus the pencil arena. The `(3k + 2m) * N_u`
-    tall term of the in-memory count is gone, leaving the cached grid whiteners,
+  * Device memory is staging buffers plus the pencil arena. The `3 * m * N_u` tall
+    term of the in-memory count is gone, leaving the cached grid whiteners,
     the working whitener and eigenvectors, and the projected `m x m` blocks, that
-    is, the `(2 * TAU_GRID_POINTS + 8) * m^2` term, unchanged. The operator's own
-    device workspace is charged on top of this count by `bounds_vram_bytes`, since
-    it is a coefficient rather than something countable from the code.
+    is, the `(TAU_GRID_POINTS + cache_entries + 8) * m^2` term, unchanged. The
+    operator's own device workspace is charged on top of this count by
+    `bounds_vram_bytes`, since it is a coefficient rather than something countable
+    from the code.
   * The read shrinks to the `m` positive vectors, which is all that was saved.
 
 The `m` applications of `C` and their `4m` self plus `4m` external Green matvecs
@@ -1634,8 +1689,9 @@ function bounds_panel_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
     probe_gemv_flops = probes * flops_gemm(m, m, 1)
     root_work = probes * m
 
+    # One `m^2` per pencil, as in `bounds_counts`: whitener plus null space.
     vram_bytes = panel_staging_bytes(N_u, m) +
-                 (2 * tau.grid_points + 2 * tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
+                 (tau.grid_points + tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
                  2 * self_fourier_bytes(pt.receiver_cells) +
                  2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
     host_bytes = 3 * N_u * m * BYTES_PER_COMPLEX

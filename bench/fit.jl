@@ -311,26 +311,45 @@ function fit_greens_joint(rows::Vector{Row})
 end
 
 """
-    fit_linear_memory(pairs) -> (factor, base, n)
+    fit_linear_memory(pairs) -> (factor, base, n, reason)
 
 Two-parameter non-negative fit of `peak = factor * analytic + base` over
-`(analytic, measured)` pairs.
+`(analytic, measured)` pairs. `reason` is `nothing` on success and a phrase
+explaining the refusal otherwise, so the caller's report line says which guard
+fired.
 
 Requires at least `MIN_MEMORY_POINTS` distinct analytic values. With one or two
 points, or with several points at the same size, the slope and the intercept are
 not separable, and the fit will happily return an absurd multiplier attached to a
 zero base -- which would then be extrapolated to every job. Returning `nothing`
 keeps the default and says so in the report instead.
+
+A *zero multiplier* is refused for the mirror reason. `nnls_relative` puts all the
+mass on the intercept when the analytic count cannot explain the measurements at
+all -- when it barely varies across points whose measurements vary by an order of
+magnitude, say. The arithmetic is fine and the residuals may even look
+respectable, but what comes back is not a memory model: it predicts the same
+number of bytes for every job of that kind, at which point the size dependence
+lands in `vram_pad` instead, where it is a single scalar applied to every job of
+every kind. That is how a 1.30 VRAM pad became 6.97. Refusing leaves the
+coefficient visibly uncalibrated, which is recoverable; shipping a constant
+disguised as a fit is not.
 """
 const MIN_MEMORY_POINTS = 3
 
 function fit_linear_memory(pairs::Vector{Tuple{Float64,Float64}})
+    n = length(pairs)
     length(unique(p -> round(p[1]; sigdigits=6), pairs)) >= MIN_MEMORY_POINTS ||
-        return (nothing, nothing, length(pairs))
-    A = hcat([p[1] for p in pairs], ones(length(pairs)))
+        return (nothing, nothing, n,
+                "only $n point(s) at fewer than $MIN_MEMORY_POINTS distinct sizes")
+    A = hcat([p[1] for p in pairs], ones(n))
     b = [p[2] for p in pairs]
     x = nnls_relative(A, b)
-    return (x[1], x[2], length(pairs))
+    x[1] > 0 || return (nothing, nothing, n,
+                        "the fitted slope came out at zero over $n point(s): the " *
+                        "analytic count does not explain the spread, so this would " *
+                        "be a constant, not a size model")
+    return (x[1], x[2], n, nothing)
 end
 
 """
@@ -511,6 +530,45 @@ function fit_device_overhead(rows::Vector{Row})
 end
 
 """
+    bounds_vram_diagnostics(rows) -> Vector{String}
+
+What the `stage_bounds` rows measured on the device, next to the analytic count, as
+report lines. Nothing here is fitted -- see the comment above the VRAM loop for why
+the bounds job's high-water cannot size a request -- but it is the evidence for that
+decision, and printing it is what keeps the decision reviewable. Two things to look
+for: an implied factor that falls as `m` grows (churn, not demand), and a peak
+sitting within `CENSORED_FRACTION` of the card (a ceiling, not a measurement).
+"""
+function bounds_vram_diagnostics(rows::Vector{Row})
+    lines = String[]
+    entries = Tuple{Int,Float64,Float64,Float64,Bool}[]
+    for row in rows
+        row["kind"] == "stage_bounds" || continue
+        pt = row_to_srpoint(row)
+        pt === nothing && continue
+        analytic = Float64(bounds_counts(pt).vram_bytes)
+        live = num(row, "peak_vram_live_bytes")
+        peak = num(row, "peak_vram_bytes")
+        (analytic <= 0 || live === nothing || live <= 0) && continue
+        capacity = device_capacity_bytes(row)
+        pinned = capacity !== nothing && peak !== nothing &&
+                 peak > CENSORED_FRACTION * capacity
+        push!(entries, (Int(bounds_counts(pt).num_pos), analytic, live,
+                        peak === nothing ? NaN : peak, pinned))
+    end
+    isempty(entries) && return lines
+    sort!(entries; by=first)
+    push!(lines, @sprintf("%-26s %d row(s), reported not fitted:", "bounds VRAM measured", length(entries)))
+    for (m, analytic, live, peak, pinned) in entries
+        push!(lines, @sprintf("    m=%-5d analytic %8s  live %8s (%5.1fx)  peak %8s%s",
+                              m, human_bytes(analytic), human_bytes(live),
+                              live / analytic, isnan(peak) ? "-" : human_bytes(peak),
+                              pinned ? "  <- within $(round(Int, 100 * CENSORED_FRACTION))% of the card, a ceiling" : ""))
+    end
+    return lines
+end
+
+"""
     fit_bounds(rows, gemm_rate) -> NamedTuple
 
 Split the bounds measurements into the coefficients the model needs.
@@ -554,6 +612,40 @@ function fit_bounds(rows::Vector{Row}, gemm_rate::Union{Nothing,Float64})
         result["launch_latency"] = (rate=x[2], n=length(b))
         result["gs_predicted"] = A * x
         result["gs_measured"] = b
+        #=
+        Diagnostic only, and the explanation for a `measured/predicted` spread that
+        looks alarming and is not.
+
+        The model charges Gram-Schmidt as `bytes/BW + launches*L`, both of which are
+        proportional to `pairs = m(m-1)/2`, so the whole prediction vanishes as `m`
+        does. The measurements do not: refitting with a constant column gives a
+        per-stage cost of order ten seconds that no `m` appears in, and once it is
+        allowed for, the `pairs` slope reproduces every row to within a few percent.
+        So a row at `m = 9` shows a four-digit ratio not because the model's slope is
+        wrong but because it is predicting milliseconds of streaming for a stage that
+        cannot cost less than its own setup.
+
+        It is not fitted into a coefficient. Every row that shows it is at one `N_u`,
+        so a constant, a term in `N_u` and a term in `m*N_u` are indistinguishable
+        here, and inventing the wrong one of the three would misprice the production
+        sizes in a way this data cannot catch. Ten seconds on a bounds job that runs
+        for hours is inside `time_pad` several times over; a second `N_u` in the
+        calibration is what would earn a coefficient.
+        =#
+        if length(b) >= 3 && length(unique(A[:, 1])) >= 2
+            A2 = hcat(A[:, 1], ones(length(b)))
+            x2 = nnls(A2, b)
+            residual = maximum(abs.((A2 * x2 .- b) ./ b))
+            # Only when it actually explains something the two-term fit does not.
+            # On a calibration whose Gram-Schmidt rows already land within a factor
+            # of two, an intercept is one more way to overfit five points, and
+            # `nnls` will happily take it.
+            if x2[2] > 0 && residual < maximum(abs.((A * x .- b) ./ b))
+                result["gs_fixed"] = (seconds=x2[2],
+                                      bandwidth=x2[1] > 0 ? 1 / x2[1] : NaN,
+                                      residual=residual, n=length(b))
+            end
+        end
     end
 
     # ---- Outer loop: geigh rate, sync latency, host root find --------------
@@ -675,10 +767,61 @@ function fit_tau_shape(rows::Vector{Row})
     refine_evals = eval_den > 0 ? max(eval_num / eval_den - grid_evals, 0.0) :
                    Float64(CostModel.TAU_REFINE_EVALS)
     gp = isempty(grid_points) ? Float64(CostModel.TAU_GRID_POINTS) : maximum(grid_points)
-    ce = isempty(cache_entries) ? 0.0 : maximum(cache_entries)
+    # Same fallback as the grid: a row that did not record `pencil_cache_max` still
+    # ran with the cache, and the code's declared default is a better stand-in than
+    # zero. Zero belongs to the *legacy* shape, whose rows predate the cache; a
+    # measured shape that reports cache hits and misses (these do: 12 to 67 misses
+    # per run, against a 16-entry LRU) has a full cache holding `m^2` per entry.
+    ce = isempty(cache_entries) ? Float64(CostModel.PENCIL_CACHE_MAX) : maximum(cache_entries)
     return (grid_points=gp, grid_evals=grid_evals, refine_evals=refine_evals,
             refine_whitenings=refine_whitenings, cache_entries=ce, n=n_rows,
             n_indices=round(Int, grid_den))
+end
+
+"""
+    is_kept_table(path) -> Bool
+    read_kept_table(path) -> Vector{NamedTuple}
+
+The `kept_by_sep` tables, which are not calibration CSVs and must not be read as
+though they were. `bench/pick_bounds_points.jl` writes one while it chooses the
+`backfill` tier's bounds points: it reads every spectrum a sweep left on scratch,
+applies the same `--gamma-rtol` cut `load_bounds_inputs` applies, and records the
+kept and stored count per separation. That is a direct measurement of the
+truncation curve at a few hundred separations, where the calibration tier can only
+afford four.
+
+The schema is its own -- `sep_num,sep_den,sep,kept,stored,total,gamma_rtol,...` --
+with no `cluster` and no `kind` column, so `read_csv_rows` produces rows that the
+cluster grouping in `main` drops as torn fragments. Detected by header rather than
+by filename so a renamed table still works.
+"""
+function is_kept_table(path::AbstractString)
+    isfile(path) || return false
+    header = open(readline, path)
+    fields = strip.(split(header, ','))
+    return "kept" in fields && "stored" in fields && "sep_num" in fields &&
+           !("cluster" in fields)
+end
+
+function read_kept_table(path::AbstractString)
+    out = NamedTuple[]
+    open(path) do io
+        header = strip.(split(readline(io), ','))
+        idx = Dict(name => i for (i, name) in enumerate(header))
+        for line in eachline(io)
+            isempty(strip(line)) && continue
+            f = split(line, ',')
+            length(f) >= length(header) || continue
+            sn = tryparse(Int, strip(f[idx["sep_num"]]))
+            sd = tryparse(Int, strip(f[idx["sep_den"]]))
+            k = tryparse(Int, strip(f[idx["kept"]]))
+            st = tryparse(Int, strip(f[idx["stored"]]))
+            (sn === nothing || sd === nothing || k === nothing) && continue
+            (sn == 0 || sd == 0 || k <= 0) && continue
+            push!(out, (sep=sn // sd, kept=k, stored=st === nothing ? k : st))
+        end
+    end
+    return out
 end
 
 """
@@ -702,8 +845,44 @@ The fitted `m_ref` is deliberately taken as the fitted intercept *inflated to co
 the largest measured residual*, so the model sits above every point it was fitted
 to rather than through the middle of them. An under-predicted `m` costs a killed
 job; an over-predicted one costs queue time.
+
+# The curve is not a power law, and four points cannot tell
+
+A `kept_by_sep` table -- what `bench/pick_bounds_points.jl` writes alongside the
+picks, one row per separation of a whole sweep -- is passed in as `table` when one
+exists, and it changes the fit qualitatively. The four calibration points all sit
+on the decaying middle of the curve, and a two-parameter fit through them
+extrapolates badly at *both* ends:
+
+  * **Near contact the curve plateaus.** Almost the entire positive block survives
+    the cut out to about 0.22 lambda (1987 of 1987 at 1/32 lambda, still 1960 at
+    1/8), then falls off a shoulder. A line drawn from the plateau point straight
+    through the decay points undershoots the shoulder: it predicted 811 where
+    1960 survive, and a bounds job sized for `m = 811` that has to run 1960 is
+    killed some hours in. This is the dangerous end.
+  * **Far away the curve turns back up.** The kept count bottoms out at 9 near 28
+    lambda and climbs to 79 by 10000 lambda -- once the coupling is pure far field
+    the surviving directions stop being cut. The power law keeps falling and
+    reaches `m = 1`.
+
+So the fit is done as an *envelope* rather than a regression through the middle:
+
+  1. Locate the decay minimum over every observation available.
+  2. Least squares on the decaying branch only, which is the part the power law
+     actually describes.
+  3. Inflate the intercept to cover the worst residual **over every observation on
+     that branch**, table included -- this is what catches the shoulder.
+  4. `bounds_m_floor` = the largest kept count seen beyond the minimum, which
+     covers the whole rising branch for the price of one number.
+  5. Widen the inflation further if any observation is still under-predicted, so
+     the returned law is an envelope of the measured curve by construction.
+
+The cluster's own `stage_bounds` rows still gate the fit: a table alone does not
+enable `bounds_m_mode = "truncated"`, because the table says nothing about which
+machine ran it.
 """
-function fit_bounds_truncation(rows::Vector{Row})
+function fit_bounds_truncation(rows::Vector{Row},
+                               table::Vector{<:NamedTuple}=NamedTuple[])
     xs, ys, seps, kept, stored = Float64[], Float64[], Rational{Int}[], Int[], Int[]
     for row in rows
         row["kind"] == "stage_bounds" || continue
@@ -723,17 +902,53 @@ function fit_bounds_truncation(rows::Vector{Row})
     length(unique(seps)) >= 2 || return (insufficient=true, n=length(seps),
                                          seps=seps, kept=kept, stored=stored)
 
-    A = hcat(ones(length(xs)), xs)
+    # Every observation of the same quantity: the cluster's own rows plus the table.
+    obs_sep = vcat(Float64.(seps), [Float64(t.sep) for t in table])
+    obs_kept = vcat(Float64.(kept), [Float64(t.kept) for t in table])
+
+    # 1. the decay minimum, and the two branches around it
+    imin = argmin(obs_kept)
+    sep_min = obs_sep[imin]
+    decay = findall(<=(sep_min), obs_sep)
+    far = findall(>=(sep_min), obs_sep)
+
+    # 2. least squares on the decaying branch (fall back to everything if the
+    #    branch is too thin to identify a slope, which is the four-point case)
+    fit_idx = length(unique(obs_sep[decay])) >= 2 ? decay : eachindex(obs_sep)
+    fx = [log(s / Float64(CostModel.BOUNDS_M_REF_SEP)) for s in obs_sep[fit_idx]]
+    fy = log.(obs_kept[fit_idx])
+    A = hcat(ones(length(fx)), fx)
     # Plain least squares: the exponent is negative, so a non-negative solver is
     # the wrong tool here.
-    coef = A \ ys
+    coef = A \ fy
     intercept, exponent = coef[1], coef[2]
-    resid = ys .- A * coef
-    # Inflate to cover the worst under-prediction.
+    resid = fy .- A * coef
+
+    # 3. inflate to cover the worst residual on the fitted branch
     inflate = exp(max(0.0, maximum(resid)))
+
+    # 4. the far-field floor
+    m_floor = isempty(far) ? 1.0 : maximum(obs_kept[far])
+
+    # 5. widen until nothing is under-predicted anywhere
+    law(m_ref, s) = max(m_ref * (s / Float64(CostModel.BOUNDS_M_REF_SEP))^exponent,
+                        m_floor)
+    worst = 0.0
+    for i in eachindex(obs_sep)
+        need = obs_kept[i] / law(exp(intercept), obs_sep[i])
+        need > worst && (worst = need)
+    end
+    inflate = max(inflate, worst)
     m_ref = exp(intercept) * inflate
+
+    # what the caller reports: how much slack the envelope leaves, and where
+    ratios = [law(m_ref, obs_sep[i]) / obs_kept[i] for i in eachindex(obs_sep)]
     return (insufficient=false, m_ref=m_ref, exponent=exponent, inflate=inflate,
-            n=length(xs), seps=seps, kept=kept, stored=stored,
+            m_floor=m_floor, n=length(xs), n_obs=length(obs_sep),
+            n_table=length(table), sep_min=sep_min,
+            seps=seps, kept=kept, stored=stored,
+            over_median=median(ratios), over_max=maximum(ratios),
+            n_under=count(<(1.0), ratios),
             rms=sqrt(sum(abs2, resid) / length(resid)))
 end
 
@@ -893,7 +1108,8 @@ Fit everything for one cluster. Any coefficient with no supporting points keeps
 its default and is listed in the report as uncalibrated, so a thin data set is
 visible rather than quietly baked in.
 """
-function fit_cluster(cluster::AbstractString, rows::Vector{Row})
+function fit_cluster(cluster::AbstractString, rows::Vector{Row};
+                     kept_table::Vector{<:NamedTuple}=NamedTuple[])
     report = String[]
     missing_fits = String[]
     fields = Dict{Symbol,Any}(:name => cluster, :calibrated => true)
@@ -945,11 +1161,11 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         pt === nothing && continue
         push!(mem_pairs, (Float64(greens_counts(pt).peak_bytes), peak))
     end
-    factor, base, n_mem = fit_linear_memory(mem_pairs)
+    factor, base, n_mem, why_mem = fit_linear_memory(mem_pairs)
     if factor === nothing
         push!(missing_fits, n_mem == 0 ?
               "greens memory (no g0_multiregion/stage_greens points)" :
-              "greens memory (only $n_mem point(s); need $MIN_MEMORY_POINTS distinct sizes)")
+              "greens memory ($why_mem)")
     else
         fields[:greens_mem_factor] = factor
         fields[:greens_mem_base] = base
@@ -1012,6 +1228,11 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
     if haskey(bounds, "gs_predicted")
         push!(report, "  " * summarize("bounds gram-schmidt", bounds["gs_predicted"],
                                        bounds["gs_measured"]))
+        if haskey(bounds, "gs_fixed")
+            g = bounds["gs_fixed"]
+            push!(report, @sprintf("    the spread is one fixed cost, not a slope error: %.1f s per stage + %.3g B/s fits all %d row(s) to %.0f%% (not fitted into a coefficient: one N_u cannot tell a constant from an N_u term)",
+                                   g.seconds, g.bandwidth, g.n, 100 * g.residual))
+        end
     end
 
     # ---- Funicular panel path ---------------------------------------------
@@ -1080,9 +1301,9 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             push!(vram_pairs, (analytic, vram))
         end
 
-        f, bs, n = fit_linear_memory(host_pairs)
+        f, bs, n, why = fit_linear_memory(host_pairs)
         if f === nothing
-            push!(missing_fits, "rsvd host memory (only $n mem_rsvd point(s))")
+            push!(missing_fits, "rsvd host memory ($why)")
         else
             fields[:rsvd_host_mem_factor] = f
             fields[:rsvd_host_mem_base] = bs
@@ -1093,9 +1314,9 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
                                    "rsvd host memory", f, human_bytes(bs), n))
         end
 
-        fv, bv, nv = fit_linear_memory(vram_pairs)
+        fv, bv, nv, whyv = fit_linear_memory(vram_pairs)
         if fv === nothing
-            push!(missing_fits, "rsvd VRAM slope (only $nv uncensored mem_rsvd point(s) of $(length(mem_rows)); the rest hit the card)")
+            push!(missing_fits, "rsvd VRAM slope ($whyv; $nv of $(length(mem_rows)) mem_rsvd point(s) were uncensored, the rest hit the card)")
         else
             fields[:rsvd_vram_factor] = fv
             fields[:rsvd_vram_base] = bv
@@ -1134,10 +1355,9 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             push!(pairs, (analytic(pt), peak))
         end
         haskey(fields, factor_field) && continue  # already fitted from mem_rsvd
-        f, bs, n = fit_linear_memory(pairs)
+        f, bs, n, why = fit_linear_memory(pairs)
         if f === nothing
-            push!(missing_fits, n == 0 ? "$label (no points)" :
-                  "$label (only $n point(s); need $MIN_MEMORY_POINTS distinct sizes)")
+            push!(missing_fits, n == 0 ? "$label (no points)" : "$label ($why)")
         else
             fields[factor_field] = f
             fields[base_field] = bs
@@ -1145,17 +1365,27 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
                                    label, f, human_bytes(bs), n))
         end
     end
+    #=
+    Only the RSVD. `bounds_core` was already excluded because its live-pool
+    high-water saturates at device capacity regardless of problem size (measured on
+    narval: 29 GB for a 1.2 GB problem and for a 9.5 GB one alike). The real
+    `stage_bounds` rows behave the same way, so they are excluded on the same
+    ground -- see `bounds_vram_diagnostics`, which prints the numbers rather than
+    hiding them, and the fallback below, which gives the bounds job the RSVD's
+    fitted shape the way the host fit already does.
+
+    Julia does not collect dead CuArrays until CUDA.jl hits allocation pressure,
+    and the bounds front end allocates two `N_u` device temporaries per
+    Gram-Schmidt column and about ten per column of the `C` projection. The
+    high-water is therefore the sum of that garbage up to whatever the card allowed,
+    and the implied factor falls as the problem grows (22-25x the analytic count at
+    m = 9 and 54, 3.2x at m = 1987) -- the signature of a churn measurement, not a
+    demand measurement. Fitting a slope to it is what produced the 280 GB bounds
+    estimates on the first run.
+    =#
     for (kinds, analytic, factor_field, base_field, label) in (
         (("stage_rsvd",), pt -> Float64(rsvd_counts(pt).vram_bytes),
-         :rsvd_vram_factor, :rsvd_vram_base, "rsvd VRAM"),
-        # `bounds_core` excluded for the same reason as the host fit, plus a worse
-        # one: its live-pool high-water saturates at device capacity regardless of
-        # problem size (measured on narval: 29 GB for a 1.2 GB problem and for a
-        # 9.5 GB one alike). Julia does not collect dead CuArrays until CUDA.jl
-        # hits allocation pressure, so the number measures accumulated garbage,
-        # not demand, and any slope fitted to it is meaningless.
-        (("stage_bounds",), pt -> Float64(bounds_counts(pt).vram_bytes),
-         :bounds_vram_factor, :bounds_vram_base, "bounds VRAM"))
+         :rsvd_vram_factor, :rsvd_vram_base, "rsvd VRAM"),)
         pairs = Tuple{Float64,Float64}[]
         for row in rows
             row["kind"] in kinds || continue
@@ -1174,11 +1404,11 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
             push!(pairs, (analytic(pt), peak))
         end
         haskey(fields, factor_field) && continue  # already fitted from mem_rsvd
-        f, bs, n = fit_linear_memory(pairs)
+        f, bs, n, why = fit_linear_memory(pairs)
         if f === nothing
             push!(missing_fits, n == 0 ?
                   "$label (no points with a live-pool measurement; rerun with the current bench/point.jl)" :
-                  "$label (only $n point(s); need $MIN_MEMORY_POINTS distinct sizes)")
+                  "$label ($why)")
         else
             fields[factor_field] = f
             fields[base_field] = bs
@@ -1186,6 +1416,23 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
                                    label, f, human_bytes(bs), n))
         end
     end
+    #=
+    The bounds job's device shape, from the RSVD's, for the same reason the host
+    side does it (`rsvd host memory` above sets both): the two jobs hold the same
+    kind of thing -- a few `N_u`-tall complex blocks plus one operator -- so the
+    measured relationship between an analytic count of those blocks and what the
+    pool actually takes carries across, while the bounds job's own high-water does
+    not carry anything (above). Its analytic count is its own, and is what makes the
+    request scale with the gamma-truncated `m`.
+    =#
+    if !haskey(fields, :bounds_vram_factor) && haskey(fields, :rsvd_vram_factor)
+        fields[:bounds_vram_factor] = fields[:rsvd_vram_factor]
+        fields[:bounds_vram_base] = fields[:rsvd_vram_base]
+        push!(report, @sprintf("%-26s %.2f x analytic + %s  (the rsvd shape; the bounds rows' own high-water is churn, see below)",
+                               "bounds VRAM", fields[:bounds_vram_factor],
+                               human_bytes(fields[:bounds_vram_base])))
+    end
+    append!(report, bounds_vram_diagnostics(rows))
 
     # ---- device memory overhead, from the dense points --------------------
     #=
@@ -1318,7 +1565,7 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
                                CostModel.TAU_REFINE_EVALS))
     end
 
-    gcut = fit_bounds_truncation(rows)
+    gcut = fit_bounds_truncation(rows, kept_table)
     if gcut === nothing || gcut.insufficient
         n = gcut === nothing ? 0 : gcut.n
         push!(missing_fits, "bounds gamma truncation (need stage_bounds rows at 2+ " *
@@ -1334,10 +1581,21 @@ function fit_cluster(cluster::AbstractString, rows::Vector{Row})
         fields[:bounds_m_mode] = "truncated"
         fields[:bounds_m_ref] = gcut.m_ref
         fields[:bounds_m_exponent] = gcut.exponent
-        push!(report, @sprintf("%-26s m = %.0f * (sep / %s)^%.3f  (from %d row(s), log-rms %.3f, x%.2f safety)",
+        fields[:bounds_m_floor] = gcut.m_floor
+        push!(report, @sprintf("%-26s m = max(%.0f * (sep / %s)^%.3f, %.0f)  (from %d row(s), log-rms %.3f, x%.2f safety)",
                                "bounds gamma truncation", gcut.m_ref,
                                string(CostModel.BOUNDS_M_REF_SEP), gcut.exponent,
-                               gcut.n, gcut.rms, gcut.inflate))
+                               gcut.m_floor, gcut.n, gcut.rms, gcut.inflate))
+        if gcut.n_table > 0
+            push!(report, @sprintf("    envelope over %d observation(s) (%d from a kept_by_sep table): decay minimum at sep %g lambda, floor %.0f beyond it",
+                                   gcut.n_obs, gcut.n_table, gcut.sep_min, gcut.m_floor))
+            push!(report, @sprintf("    over-provisions m by median %.2fx, max %.2fx; %d observation(s) under-predicted",
+                                   gcut.over_median, gcut.over_max, gcut.n_under))
+        else
+            push!(report, "    no kept_by_sep table found: the law rests on the rows below " *
+                          "alone, which all sit on the decaying middle of the curve. It " *
+                          "will undershoot the near-contact plateau and fall to m = 1 far out.")
+        end
         for (sep, k, st) in zip(gcut.seps, gcut.kept, gcut.stored)
             push!(report, @sprintf("    gamma cut at sep %-10s keeps %5d of %5d (%.3f)",
                                    string(sep), k, st, k / max(st, 1)))
@@ -1465,6 +1723,7 @@ function fit_padding(coeffs::Coefficients, rows::Vector{Row})
     stage_kinds = Dict("stage_greens" => GenerateGreens, "stage_rsvd" => GenerateRSVD,
                        "stage_bounds" => ComputeBounds)
     time_ratios, host_ratios, vram_ratios = Float64[], Float64[], Float64[]
+    vram_dropped = 0
     for row in rows
         haskey(stage_kinds, row["kind"]) || continue
         job = stage_kinds[row["kind"]]
@@ -1476,7 +1735,33 @@ function fit_padding(coeffs::Coefficients, rows::Vector{Row})
         host = num(row, "peak_rss_bytes")
         (host === nothing || p.host_bytes <= 0) || push!(host_ratios, host / p.host_bytes)
         vram = num(row, "peak_vram_bytes")
-        (vram === nothing || vram <= 0 || p.vram_bytes <= 0) || push!(vram_ratios, vram / p.vram_bytes)
+        (vram === nothing || vram <= 0 || p.vram_bytes <= 0) && continue
+        #=
+        Two exclusions, both of them the same rules the memory fits above already
+        apply, and both of them for the reason a *ratio* needs a number on top of it
+        rather than a bound.
+
+        A peak within `CENSORED_FRACTION` of the card says "at least this much": the
+        pool grew until something stopped it. Five rows here sit at exactly
+        31992119296 bytes across three different problem sizes and two different job
+        kinds, which is a limit, not a measurement. `fit_device_overhead` and the
+        `mem_rsvd` slope both drop such rows already; a padding factor is if
+        anything more sensitive to them, because it multiplies every request the
+        model makes.
+
+        And `stage_bounds` device peaks are churn (see the VRAM loop above), so they
+        cannot set a pad either. Left in, they are what took this factor to 6.97: a
+        6.97x margin on every VRAM request in the model, derived from bounds rows
+        whose high-water was uncollected Gram-Schmidt garbage measured against a
+        prediction that a zero slope had flattened to a constant.
+        =#
+        capacity = device_capacity_bytes(row)
+        if (capacity !== nothing && vram > CENSORED_FRACTION * capacity) ||
+           row["kind"] == "stage_bounds"
+            vram_dropped += 1
+            continue
+        end
+        push!(vram_ratios, vram / p.vram_bytes)
     end
 
     q95(v) = isempty(v) ? nothing : quantile(v, 0.95)
@@ -1498,8 +1783,10 @@ function fit_padding(coeffs::Coefficients, rows::Vector{Row})
         if q !== nothing
             pad = max(floor_pad, q)
             fields[field] = pad
-            push!(report, @sprintf("  %-14s padding %.2f  (p95 over %d end-to-end runs, median %.2f)",
-                                   label, pad, length(ratios), median(ratios)))
+            push!(report, @sprintf("  %-14s padding %.2f  (p95 over %d end-to-end runs, median %.2f%s)",
+                                   label, pad, length(ratios), median(ratios),
+                                   field === :vram_pad && vram_dropped > 0 ?
+                                   @sprintf("; %d censored or bounds row(s) excluded", vram_dropped) : ""))
         elseif use_fallback && fallback !== nothing
             # No end-to-end runs: pad by the worst primitive-level miss, with
             # margin, so the number is at least anchored to a measurement.
@@ -1601,6 +1888,12 @@ function main(argv::Vector{String})
         isempty(paths) && error("No CSV files in $data_dir")
     end
 
+    # `kept_by_sep` tables are a different schema and a different measurement (see
+    # `read_kept_table`); reading them as calibration rows only produces a few
+    # hundred "torn fragment" warnings and throws the truncation curve away.
+    table_paths = filter(is_kept_table, paths)
+    paths = filter(p -> !(p in table_paths), paths)
+
     all_rows = Row[]
     for path in paths
         rows = read_csv_rows(path)
@@ -1608,6 +1901,13 @@ function main(argv::Vector{String})
         append!(all_rows, rows)
     end
     isempty(all_rows) && error("No rows to fit")
+
+    kept_table = NamedTuple[]
+    for path in table_paths
+        t = read_kept_table(path)
+        println("Read $(length(t)) kept-count row(s) from $path (truncation table)")
+        append!(kept_table, t)
+    end
 
     by_cluster = Dict{String,Vector{Row}}()
     dropped = 0
@@ -1645,7 +1945,7 @@ function main(argv::Vector{String})
         println("  points: ", join(["$k=$v" for (k, v) in sort(collect(kinds))], "  "))
         println("-"^78)
 
-        coeffs, report, missing_fits = fit_cluster(cluster, rows)
+        coeffs, report, missing_fits = fit_cluster(cluster, rows; kept_table=kept_table)
         has_mem = any(r -> r["kind"] in ("mem_rsvd", "stage_rsvd"), rows)
         fitted[cluster] = (coeffs=coeffs, report=report, missing_fits=missing_fits,
                            has_mem=has_mem, nrows=length(rows))
@@ -1686,7 +1986,8 @@ function main(argv::Vector{String})
 
         if !report_only
             path = joinpath(@__DIR__, "coeffs_$(cluster).jl")
-            write_coefficients(path, coeffs, report, missing_fits, paths)
+            write_coefficients(path, coeffs, report, missing_fits,
+                               vcat(paths, table_paths))
             println("\n  Wrote $path")
         end
     end

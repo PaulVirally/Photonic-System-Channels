@@ -12,6 +12,7 @@
 #                                         1 lambda stretch tier, RSVD only
 #   RANK=4000  OVERSAMPLES=50  QS="1 2 3 4 6 8"  SEED=20260814
 #   GAMMA_RTOL=1.0e-12
+#   CHI=<a+bim>                           default the corrected Ge zeta=1000 value
 #
 # Every q gets its own scratch and project subdirectory. The RSVD and bounds
 # filenames come from file_prefix(smr), which encodes geometry and separation and
@@ -42,7 +43,24 @@
 GPU=${1:?usage: run_study.sh <gpu-index>}
 
 # --- fixed by the production sweep --------------------------------------------
-CHI="4.25+0.0342557im"
+# Germanium with zeta = |chi|^2/Im(chi) = 1000. This used to read
+# 4.25+0.0342557im, which is germanium's refractive INDEX, not its
+# susceptibility, and gave zeta = 527.3 instead of 1000.
+#
+# Overridable, because it changes nothing about the RSVD half of the study and
+# everything about the bounds half. The RSVD operates on Asym(G0_ur), a vacuum
+# Green quantity: chi does not appear anywhere in `_generate_rsvd_sr`
+# (src/rsvd.jl), so every spectrum already computed under the old value is
+# still correct and does not need rerunning. zeta enters only at bounds time
+# (src/bounds.jl, where the reported trace is scaled by it), so a bounds run
+# must use the corrected value or its verdict is about the wrong material.
+#
+# Consequence for a study already in flight: finish the RSVD half as it is, then
+# `git pull` (or otherwise pick up this file) BEFORE running STAGES=bounds. The
+# directory layout does not depend on chi, so nothing already on disk moves.
+CHI=${CHI:-"17.06132654701751+0.29117345im"}
+# Germanium with zeta = 500, for reference:
+# CHI=${CHI:-"17.057801847623292+0.5826160907639955im"}
 DESIGN="rs"
 SCALE="1//32"
 THREADS=16
@@ -109,6 +127,7 @@ cd "$CODE_DIR" || exit 1
 echo "Power-iteration study on molering, GPU ${GPU}"
 echo "  tier ${TIER} (${TAG}), cells (${CELLS}), scale ${SCALE}"
 echo "  rank ${RANK}, oversamples ${OVERSAMPLES}, seed ${SEED}, gamma-rtol ${GAMMA_RTOL}"
+echo "  chi ${CHI}  (the RSVD half is chi-free; only the bounds half depends on it)"
 echo "  q values: ${QS} (reference q=${REF_Q}, replicate q=${QS_REPLICATE:-none})"
 echo "  stages: ${STAGES}"
 echo "  scratch ${SCRATCH_ROOT}"
