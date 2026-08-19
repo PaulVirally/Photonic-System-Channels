@@ -981,6 +981,23 @@ panel matrices, `Vur_asym` included, are freed before the pencil stage.
   precision only in τ, and the bound is flat near its minimum (relative error
   in σₙ² of roughly `4(Δτ)²` on the semi-analytic model), so `0.05` gives up
   under about one percent of tightness relative to the exact minimiser.
+- `tau_window`: how many grid points either side of the previous index's best `τ`
+  to sweep. The minimiser is piecewise constant in `n`, so the neighbour's best
+  grid point is nearly always this index's as well. A windowed minimum sitting on
+  a window edge that is not also an end of the grid may be hiding a lower point
+  just outside, so that index is swept in full instead and the reported bound is
+  the same one an unwindowed sweep gives. The skipped grid points stay `NaN` in
+  `bounds_dual_by_tau`. `0` sweeps the whole grid at every index. The window only
+  applies to an `n` immediately following the last one evaluated, so a sparse
+  `outer_indices` sweeps in full throughout.
+- `pencil_cache_max`: how many refinement whitenings to keep, evicting the least
+  recently used. The grid pencils are already shared across indices, but each
+  index's golden-section probes are off-grid. Consecutive indices on a plateau
+  open the same bracket and probe the same `τ`, so a handful of entries is enough
+  to serve almost all of the refinement's `m × m` eigendecompositions from the
+  cache. Each entry is an `m × m` whitener plus null space in the compute device's
+  array space, so the memory is `pencil_cache_max` times that; `0` disables the
+  cache.
 
 # Returns
 A named tuple with the bounds, the bookkeeping needed to save them, and
@@ -988,7 +1005,9 @@ A named tuple with the bounds, the bookkeeping needed to save them, and
 per-index minimum over all evaluated `τ`, `opt_taus` the `τ` that achieved it
 (off-grid when refinement improved on the grid), and `bounds_dual_by_tau` the
 grid-only `num_pos × length(τs)` table (`NaN` where an index/grid point was
-skipped or failed), with the grid echoed in `tau_grid`.
+skipped or failed), with the grid echoed in `tau_grid`. `tau_search` counts what
+the search did over the run: refinement pencil cache hits and misses, and how many
+indices fell back to a full grid sweep.
 
 The basis-side objects `ss` (full-space probe vectors, `N × num_pos`),
 `ss_basis`, `C_basis` (the `τ = 1` projected constraint) and `D_basis` are also
@@ -1004,7 +1023,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               outer_indices::Union{Nothing,AbstractVector{Int}}=nothing,
                               on_outer_error::Symbol=:throw,
                               τs::AbstractVector{<:Real}=range(0.0, 1.0, length=5),
-                              τ_refine_tol::Union{Nothing,Real}=0.05)
+                              τ_refine_tol::Union{Nothing,Real}=0.05,
+                              tau_window::Int=2,
+                              pencil_cache_max::Int=16)
     on_outer_error in (:throw, :stop) ||
         throw(ArgumentError("on_outer_error must be :throw or :stop, got :$on_outer_error"))
     isempty(τs) && throw(ArgumentError("τs must contain at least one grid point"))
@@ -1018,6 +1039,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     isnothing(τ_refine_tol) || τ_refine_tol > 0 || throw(ArgumentError(
         "τ_refine_tol must be positive, or `nothing` to disable refinement, " *
         "got $τ_refine_tol"))
+    pencil_cache_max >= 0 || throw(ArgumentError(
+        "pencil_cache_max must be non-negative (0 disables the refinement pencil " *
+        "cache), got $pencil_cache_max"))
     # `num_pos` = m, the numerical rank of (−G⁰ᵤᵣ)ᵃ₊ this run works with. It has to
     # match the columns actually staged, which is why it comes in rather than being
     # counted off Γ.
@@ -1097,8 +1121,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     t_c_projection = front.t_c_projection
 
     # None of the C(τ) depend on n, so the grid pencils are eigendecomposed once
-    # here; the golden-section refinement builds throwaway pencils on demand
-    # (those whitenings land in outer_times rather than c_range). 
+    # here; the golden-section refinement builds its off-grid pencils on demand
+    # through the cache below (those whitenings land in outer_times, not c_range).
     build_pencil(τ::Real) = begin
         C_τ = isone(τ) ? C_basis : C_basis .- (1 - τ) .* D_basis
         try
@@ -1117,6 +1141,49 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] C(τ) numerical ranks: " *
         join(("τ=$(τs[i]) → $(pencils[i].rank)/$(size(C_basis, 1))" for i in usable_τ), ", ")
 
+    # Refinement pencils, memoized on the exact Float64 τ. C(τ) does not depend on
+    # n, and consecutive indices sitting on the same τ* plateau open the identical
+    # golden-section bracket, so they probe the same τ and only the first index of
+    # the plateau pays for the whitening. The keys are compared exactly rather than
+    # to a tolerance because the probe points are arithmetic on the same bracket
+    # endpoints, so they reproduce bit for bit.
+    #
+    # Each entry holds an m × m whitener plus null space in the compute device's
+    # array space: at m = 4000 complex that is ~256 MiB, so the 16-entry default is
+    # ~4 GiB, which fits alongside the rest of the working set on an A100-40.
+    pencil_cache = Pair{Float64,Any}[] # LRU order, least recently used first
+    pencil_cache_hits = 0
+    pencil_cache_misses = 0
+    cached_pencil(τ_raw::Real) = begin
+        τ = Float64(τ_raw)
+        if pencil_cache_max > 0
+            # Golden section brackets the best grid point between its neighbours,
+            # so its interior grid point is a τ the sweep already eigendecomposed.
+            grid_hit = findfirst(i -> Float64(τs[i]) == τ, usable_τ)
+            if !isnothing(grid_hit)
+                pencil_cache_hits += 1
+                return pencils[usable_τ[grid_hit]]
+            end
+            hit = findfirst(entry -> first(entry) == τ, pencil_cache)
+            if !isnothing(hit)
+                entry = popat!(pencil_cache, hit)
+                push!(pencil_cache, entry) # touch: move to the MRU end
+                pencil_cache_hits += 1
+                return last(entry)
+            end
+        end
+        pencil_cache_misses += 1
+        pencil = build_pencil(τ)
+        # A `nothing` is a failed whitening. It stays out of the cache so that a
+        # transient device failure is not remembered as a property of that τ; the
+        # cost is a rebuild if the same τ comes back.
+        if pencil_cache_max > 0 && !isnothing(pencil)
+            length(pencil_cache) >= pencil_cache_max && popfirst!(pencil_cache)
+            push!(pencil_cache, τ => pencil)
+        end
+        return pencil
+    end
+
     # The probes stay in the pencil's array space. Only the small projected
     # b-vectors cross to the host, where the scalar root finds live.
     B_basis_diagonal = zeros(real(eltype(C_basis)), RSVD_BASIS_SIZE)
@@ -1129,6 +1196,11 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     complete = length(ns) == num_pos
     outer_times = Tuple{Int,Float64}[]
     outer_error = nothing
+    # The windowed sweep below needs the last index evaluated and where its minimum
+    # landed.
+    prev_n = 0
+    prev_best_grid_idx = 0
+    grid_fallbacks = 0
     for n in ns # Compute bounds on σₙ(Pᵣₛ)
      try
         t_outer = time_ns()
@@ -1162,14 +1234,47 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             end
         end
 
-        @info string(now()) * " [$n/$(num_pos)] Solving λⱼ(Bₙ, C(τ)) over $(length(usable_τ)) τ grid point(s)"
-        for i in usable_τ
-            dual_τ = eval_dual(pencils[i], τs[i])
-            isfinite(dual_τ) || continue
-            bounds_dual_by_tau[n, i] = sqrt(dual_τ)
-            if dual_τ < best_dual
-                best_dual, best_τ, best_grid_idx = dual_τ, Float64(τs[i]), i
+        sweep_grid!(idxs) = begin
+            for i in idxs
+                dual_τ = eval_dual(pencils[i], τs[i])
+                isfinite(dual_τ) || continue
+                bounds_dual_by_tau[n, i] = sqrt(dual_τ)
+                if dual_τ < best_dual
+                    best_dual, best_τ, best_grid_idx = dual_τ, Float64(τs[i]), i
+                end
             end
+        end
+
+        # The minimising τ is piecewise constant in n, endpoint plateaus with one
+        # abrupt transition between them, so the previous index's best grid point is
+        # almost always this one's too and a ±tau_window sweep around it does the
+        # work of the whole grid. Every τ bounds σₙ on its own, so narrowing the
+        # sweep can only cost tightness. A minimum on a window edge that is not also
+        # a grid end may be hiding a lower point just outside the window, so the
+        # whole grid gets swept instead. `bounds_dual_by_tau` keeps its NaN at the
+        # skipped points.
+        #
+        # Only an immediate predecessor says anything about this Bₙ: verify_bounds
+        # passes a handful of spot indices as `outer_indices`, and those n are
+        # decades apart.
+        windowed = tau_window > 0 && prev_best_grid_idx > 0 && n == prev_n + 1
+        if windowed
+            window_lo = max(firstindex(τs), prev_best_grid_idx - tau_window)
+            window_hi = min(lastindex(τs), prev_best_grid_idx + tau_window)
+            @info string(now()) * " [$n/$(num_pos)] Solving λⱼ(Bₙ, C(τ)) over the τ grid window $(window_lo):$(window_hi) of $(firstindex(τs)):$(lastindex(τs))"
+            sweep_grid!(i for i in usable_τ if window_lo <= i <= window_hi)
+            windowed = isfinite(best_dual) &&
+                       !(best_grid_idx == window_lo && window_lo > firstindex(τs)) &&
+                       !(best_grid_idx == window_hi && window_hi < lastindex(τs))
+            windowed || (grid_fallbacks += 1)
+        end
+        if !windowed
+            # Reset the running minimum so the full sweep resolves ties exactly as
+            # an unwindowed run does. The points the window already covered are
+            # evaluated again: a few GEVPs, and no new whitening.
+            best_dual, best_τ, best_grid_idx = Inf, NaN, 0
+            @info string(now()) * " [$n/$(num_pos)] Solving λⱼ(Bₙ, C(τ)) over $(length(usable_τ)) τ grid point(s)"
+            sweep_grid!(usable_τ)
         end
         isfinite(best_dual) || error("every τ in the grid failed at n=$n" *
             (last_τ_error === nothing ? "" : "; last error: $(sprint(showerror, last_τ_error))"))
@@ -1185,8 +1290,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             invφ = (sqrt(5.0) - 1) / 2
             τ₁ = hi - invφ * (hi - lo)
             τ₂ = lo + invφ * (hi - lo)
-            g₁ = eval_dual(build_pencil(τ₁), τ₁)
-            g₂ = eval_dual(build_pencil(τ₂), τ₂)
+            g₁ = eval_dual(cached_pencil(τ₁), τ₁)
+            g₂ = eval_dual(cached_pencil(τ₂), τ₂)
             g₁ < best_dual && ((best_dual, best_τ) = (g₁, τ₁))
             g₂ < best_dual && ((best_dual, best_τ) = (g₂, τ₂))
             refine_iters = 0
@@ -1195,12 +1300,12 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                 if g₁ <= g₂
                     hi, τ₂, g₂ = τ₂, τ₁, g₁
                     τ₁ = hi - invφ * (hi - lo)
-                    g₁ = eval_dual(build_pencil(τ₁), τ₁)
+                    g₁ = eval_dual(cached_pencil(τ₁), τ₁)
                     g₁ < best_dual && ((best_dual, best_τ) = (g₁, τ₁))
                 else
                     lo, τ₁, g₁ = τ₁, τ₂, g₂
                     τ₂ = lo + invφ * (hi - lo)
-                    g₂ = eval_dual(build_pencil(τ₂), τ₂)
+                    g₂ = eval_dual(cached_pencil(τ₂), τ₂)
                     g₂ < best_dual && ((best_dual, best_τ) = (g₂, τ₂))
                 end
             end
@@ -1208,6 +1313,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         @info string(now()) * " [$n/$(num_pos)] Dual is $best_dual at τ = $best_τ, which gives a bound of $(sqrt(best_dual)) on σₙ(Pᵣₛ)"
         bounds_dual_basis[n] = sqrt(best_dual)
         opt_taus[n] = best_τ
+        prev_n, prev_best_grid_idx = n, best_grid_idx
         push!(outer_times, (n, (time_ns() - t_outer) / 1e9))
      catch err
         on_outer_error === :throw && rethrow(err)
@@ -1222,6 +1328,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         break
      end
     end
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] τ search over $(length(ns)) index/indices: refinement pencil cache $(pencil_cache_hits) hit(s) / $(pencil_cache_misses) miss(es) (pencil_cache_max = $(pencil_cache_max)), $(grid_fallbacks) full-grid fallback(s) (tau_window = $(tau_window))"
 
     analytical_bounds_old_form(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
     analytical_bounds_new_form(κ̃) = ifelse(2κ̃ >= one(eltype(κ̃)), one(eltype(κ̃)), sqrt(4κ̃*abs(1-κ̃)))
@@ -1269,6 +1376,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             new_analytical_bounds=new_analytical_bounds,
             true_bounds=true_bounds, which_bounds=which_bounds, ks=ks,
             basis_size=RSVD_BASIS_SIZE,
+            tau_search=(pencil_cache_hits=pencil_cache_hits,
+                        pencil_cache_misses=pencil_cache_misses,
+                        grid_fallbacks=grid_fallbacks),
             stage_times=stage_times, outer_times=outer_times)
 end
 
