@@ -11,8 +11,10 @@ low `--power-iterations` can go before the bounds move.
 Options:
 
   --root <dir>        the study's project root, holding `q01/`, `q02/`, ...,
-                      `q14/`, `q14r/` and `timings_gpu*.csv` (required)
-  --ref 14            the reference q
+                      `q08/`, `q08r/` and `timings_gpu*.csv` (required)
+  --ref 8             the reference q
+  --conv-factor 2.0   how far above the sketch-noise floor the second-largest q
+                      may sit before the reference is called unconverged
   --out <path>        CSV to write (default `power_iter_summary.csv` next to this
                       script)
   --trace-floor 1e-4  traces below this are not reported at all, so a separation
@@ -66,17 +68,46 @@ the trace difference; the channel gate cannot see it, which is why it is printed
 (`MatrixFreeRandomizedLinearAlgebra` throws on a seed without a plan), and at
 1/2 lambda with k=4000 the sketch fits an A6000, so the runs take the in-memory
 path and each draws its own Gaussian. Two runs at the same q therefore differ.
-`run_study.sh` runs the reference twice, into `q14/` and `q14r/`, and the `14r`
+`run_study.sh` runs the reference twice, into `q08/` and `q08r/`, and the `8r`
 row of each table is that difference: the noise floor a low-q row has to be read
-against. A q whose deviation sits at the `14r` level is not distinguishable from
+against. A q whose deviation sits at the `8r` level is not distinguishable from
 the reference, whatever the absolute number looks like.
+
+# Why the reference is checked before it is used
+
+The reference is q=8, not the production q=14, because no run in this study is
+allowed to pass about an hour on molering and q=14 at 1/2 lambda is ~72 min. That
+makes it a reference of convenience rather than a ground truth, so it has to earn
+the role: if q=8 has not itself converged, every deviation measured against it is
+measuring the reference's error and the whole table is worthless.
+
+The stand-in for a q=14 ground truth is successive-q convergence. The
+second-largest q in the study (q=6 by default) is compared against the reference,
+and its deviation is required to sit within `--conv-factor` of the `q8` vs `q8r`
+sketch-noise floor on both gated quantities, the trace and the worst gated
+channel. If it does, then going from 6 to 8 power iterations changed nothing
+distinguishable from redrawing the sketch, and there is no reason to believe 8 to
+14 would either. If it does not, the separation gets
+
+    not converged at q=8 -- reference unreliable, raise QS
+
+instead of a verdict. The per-q rows are still printed, because they are the
+evidence, but no smallest-acceptable-q is issued off an unconverged reference.
+
+Two cases sidestep the check rather than fail it. A separation whose reference
+trace is under `--trace-floor` has nothing reportable to be wrong about, so
+convergence is moot and every q passes. And where the noise floor is exactly zero
+or undefined -- no replicate, or no gated channel to measure -- the ratio cannot
+be formed, and the separation is reported as unassessable rather than either
+converged or not.
 """
 
 using JLD2
 using Printf
 using Statistics
 
-const DEFAULT_REF = 14
+const DEFAULT_REF = 8
+const DEFAULT_CONV_FACTOR = 2.0
 const DEFAULT_TRACE_FLOOR = 1e-4
 const DEFAULT_TRACE_ABS = 1e-5
 const DEFAULT_TRACE_RTOL = 0.01
@@ -108,7 +139,7 @@ end
     find_runs(root) -> Vector{NamedTuple}
 
 One entry per (q directory, JLD) pair found under `root`. `q` is the power
-iteration count, `replicate` marks the `q14r`-style second run of the reference,
+iteration count, `replicate` marks the `q08r`-style second run of the reference,
 and `sep` is the `<num>ss<den>` token out of the filename, which is how the
 separations are told apart without rebuilding `file_prefix`.
 """
@@ -291,6 +322,66 @@ function verdict(c, th)
                           slack, c.n_gated, c.chan_max)
 end
 
+"""
+    convergence(prev, noise, ref_trace, th) -> (status, message)
+
+Has the reference itself converged? `prev` is the second-largest q compared
+against the reference, `noise` is the reference's replicate compared against it.
+Both are `compare` results.
+
+`status` is one of:
+
+- `:moot` -- the reference trace is under the reporting floor, so nothing here
+  would be reported and there is nothing for the reference to be wrong about.
+- `:ok` -- on every quantity that can be measured, `prev`'s deviation is within
+  `th.conv_factor` of the noise floor. Going from `prev.q` to the reference
+  changed nothing distinguishable from redrawing the sketch.
+- `:not_converged` -- it is not, so deviations measured against this reference
+  are measuring the reference's own error.
+- `:unassessable` -- there is no `prev` run, no replicate, or no quantity whose
+  noise floor is a usable positive number.
+
+The trace and the worst gated channel are checked independently and both have to
+pass. A zero noise floor cannot be scaled, so that quantity is skipped unless
+`prev` is zero there too, in which case it agrees exactly and counts as passing.
+"""
+function convergence(prev, noise, ref_trace, th)
+    ref_trace < th.trace_floor &&
+        return :moot, @sprintf("reference trace %.3e is under the %.1e reporting floor",
+                               ref_trace, th.trace_floor)
+    (prev === nothing || noise === nothing) &&
+        return :unassessable, "no second-largest q, or no replicate, to compare"
+
+    checks = (("trace", prev.trace_abs, noise.trace_abs),
+              ("chan_max", prev.chan_max, noise.chan_max))
+    verdicts = String[]
+    assessed = 0
+    converged = true
+    for (name, dev, nz) in checks
+        if !isfinite(dev) || !isfinite(nz)
+            push!(verdicts, "$(name) n/a")
+            continue
+        end
+        if nz == 0
+            if dev == 0
+                assessed += 1
+                push!(verdicts, "$(name) exact")
+            else
+                push!(verdicts, @sprintf("%s noise floor is 0, ratio undefined (dev %.2e)", name, dev))
+            end
+            continue
+        end
+        assessed += 1
+        ratio = dev / nz
+        ratio <= th.conv_factor || (converged = false)
+        push!(verdicts, @sprintf("%s %.2e vs noise %.2e (%.1fx)", name, dev, nz, ratio))
+    end
+
+    msg = join(verdicts, ", ")
+    assessed == 0 && return :unassessable, msg
+    return (converged ? :ok : :not_converged), msg
+end
+
 # --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
@@ -387,17 +478,45 @@ function report_separation(io_csv, sep, runs, timings, th)
     ref_c.trace < th.trace_floor &&
         @printf("  the reference trace is under the %.1e reporting floor, so nothing here would be reported and every q passes\n",
                 th.trace_floor)
+    noise_c = nothing
     rep_idx = findfirst(r -> r.q == th.ref && r.replicate, runs)
     if rep_idx === nothing
         println("  no q=$(th.ref) replicate: there is no sketch-noise floor to read the low-q rows against")
     else
         rep = read_bounds(runs[rep_idx].path)
         if rep !== nothing
-            rc = compare(rep, ref_data; chan_floor=th.chan_floor)
+            noise_c = compare(rep, ref_data; chan_floor=th.chan_floor)
             @printf("  sketch-noise floor (q=%d replicate): |dtrace| %.2e, chan_max %.2e, drop %.2e, dtau_max %.2e\n",
-                    th.ref, rc.trace_abs, rc.chan_max, rc.dropped_abs, rc.tau_max)
+                    th.ref, noise_c.trace_abs, noise_c.chan_max, noise_c.dropped_abs, noise_c.tau_max)
             println("  a row at or under those numbers is not distinguishable from the reference")
         end
+    end
+
+    # Has the reference converged? The second-largest q stands in for the q=14
+    # ground truth this study cannot afford.
+    prev_q = maximum([r.q for r in runs if !r.replicate && r.q < th.ref]; init=0)
+    prev_c = nothing
+    if prev_q > 0
+        prev_run = runs[findfirst(r -> r.q == prev_q && !r.replicate, runs)]
+        prev_data = read_bounds(prev_run.path)
+        prev_data === nothing || (prev_c = compare(prev_data, ref_data; chan_floor=th.chan_floor))
+    end
+    status, why = convergence(prev_c, noise_c, ref_c.trace, th)
+    @printf("\n  convergence of the q=%d reference (q=%d against it, limit %.1fx the noise floor): %s\n",
+            th.ref, prev_q, th.conv_factor, why)
+
+    if status === :not_converged
+        println("  not converged at q=$(th.ref) -- reference unreliable, raise QS")
+        println("  the rows above are printed as evidence; no verdict is issued off an unconverged reference")
+        return nothing
+    elseif status === :unassessable
+        println("  convergence of the reference could not be assessed, so no verdict is issued")
+        println("  run the q=$(th.ref) replicate and at least one q below it, then re-analyse")
+        return nothing
+    elseif status === :moot
+        println("  convergence is moot here: nothing at this separation is reportable")
+    else
+        println("  q=$(prev_q) to q=$(th.ref) is indistinguishable from redrawing the sketch, so the reference stands")
     end
 
     # The verdict. Smallest q that passes, ignoring the replicate.
@@ -423,6 +542,7 @@ function main(argv::Vector{String})
     root = get(opts, "root", "")
     isempty(root) && error("--root is required")
     th = (ref=parse(Int, get(opts, "ref", string(DEFAULT_REF))),
+          conv_factor=parse(Float64, get(opts, "conv-factor", string(DEFAULT_CONV_FACTOR))),
           trace_floor=parse(Float64, get(opts, "trace-floor", string(DEFAULT_TRACE_FLOOR))),
           trace_abs=parse(Float64, get(opts, "trace-abs", string(DEFAULT_TRACE_ABS))),
           trace_rtol=parse(Float64, get(opts, "trace-rtol", string(DEFAULT_TRACE_RTOL))),
@@ -437,7 +557,9 @@ function main(argv::Vector{String})
     println("="^104)
     println("Power-iteration quality study")
     println("  root      $root")
-    println("  reference q = $(th.ref)")
+    println("  reference q = $(th.ref) (checked for convergence against the next q down, ")
+    @printf("                limit %.1fx the q=%d replicate's sketch-noise floor)\n",
+            th.conv_factor, th.ref)
     @printf("  trace: reported only above %.1e; agreement to %.1f%% or %.1e absolute\n",
             th.trace_floor, 100 * th.trace_rtol, th.trace_abs)
     @printf("  channels: gated at >= %.1e absolute, to %.1f%% relative\n",

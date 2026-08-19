@@ -10,7 +10,7 @@
 #   STAGES=greens|rsvd|bounds|study|all   default all (study = rsvd + bounds)
 #   TIER=half|full                        default half (1/2 lambda); full is the
 #                                         1 lambda stretch tier, RSVD only
-#   RANK=4000  OVERSAMPLES=50  QS="1 2 3 4 6 14"  SEED=20260814
+#   RANK=4000  OVERSAMPLES=50  QS="1 2 3 4 6 8"  SEED=20260814
 #   GAMMA_RTOL=1.0e-12
 #
 # Every q gets its own scratch and project subdirectory. The RSVD and bounds
@@ -26,12 +26,18 @@
 #
 # then start run_study_gpu0.sh and run_study_gpu1.sh together.
 #
+# The reference is q=8, not the production q=14: no single run on molering is
+# allowed to pass about an hour, and q=14 at 1/2 lambda is ~72 min. q=8 is ~50
+# min. That makes the reference something to be checked rather than trusted, so
+# the analysis gates on the q=6 vs q=8 deviation sitting at the sketch-noise
+# floor before it will issue a verdict at all. See the README.
+#
 # NOTE on --seed: the seed only reaches the sketch on the panel RSVD path. At
 # 1/2 lambda with k=4000 the sketch fits an A6000, so src/rsvd.jl takes the
-# in-memory path, which draws from the RNG and rejects a seed. QS therefore
-# carries q=14 twice (14 and the replicate 15 -> see QS_REPLICATE below) so the
-# analysis has a sketch-noise floor to compare the low-q deviations against.
-# Read the README before changing that.
+# in-memory path, which draws from the RNG and rejects a seed. The reference is
+# therefore run twice (q08/ and q08r/, see QS_REPLICATE below) so the analysis
+# has a sketch-noise floor to compare the low-q deviations against. Read the
+# README before changing that.
 
 GPU=${1:?usage: run_study.sh <gpu-index>}
 
@@ -44,15 +50,28 @@ THREADS=16
 # --- knobs -------------------------------------------------------------------
 RANK=${RANK:-4000}
 OVERSAMPLES=${OVERSAMPLES:-50}
-QS=${QS:-"1 2 3 4 6 14"}
+# Top out at 8. At 1/2 lambda that is ~50 min; q=14 is ~72 min and over the
+# one-hour-per-run ceiling this study is held to.
+QS=${QS:-"1 2 3 4 6 8"}
 SEED=${SEED:-20260814}
 GAMMA_RTOL=${GAMMA_RTOL:-1.0e-12}
 STAGES=${STAGES:-all}
 TIER=${TIER:-half}
 # Second run of the reference q. Same q, its own directory, so the analysis can
-# separate sketch noise from the effect of dropping power iterations. Set to an
-# empty string to skip it.
-QS_REPLICATE=${QS_REPLICATE:-14}
+# separate sketch noise from the effect of dropping power iterations, and can
+# check that the reference itself has converged. Must stay equal to the largest
+# entry in QS. Set to an empty string to skip it, and lose both checks.
+QS_REPLICATE=${QS_REPLICATE:-8}
+
+# The reference is the largest q in QS, which is what analyze.jl defaults --ref
+# to. Derived rather than written twice so an overridden QS cannot disagree with
+# it.
+REF_Q=$(for q in $QS; do echo "$q"; done | sort -n | tail -1)
+if [ -n "$QS_REPLICATE" ] && [ "$QS_REPLICATE" != "$REF_Q" ]; then
+    echo "QS_REPLICATE=${QS_REPLICATE} is not the largest q in QS (${REF_Q}); the" >&2
+    echo "convergence check needs the replicate to be at the reference." >&2
+    exit 2
+fi
 
 # --- molering paths ----------------------------------------------------------
 CODE_DIR=/home/paulv/Projects/Photonic-System-Channels
@@ -90,7 +109,7 @@ cd "$CODE_DIR" || exit 1
 echo "Power-iteration study on molering, GPU ${GPU}"
 echo "  tier ${TIER} (${TAG}), cells (${CELLS}), scale ${SCALE}"
 echo "  rank ${RANK}, oversamples ${OVERSAMPLES}, seed ${SEED}, gamma-rtol ${GAMMA_RTOL}"
-echo "  q values: ${QS} (reference q=14, replicate q=${QS_REPLICATE:-none})"
+echo "  q values: ${QS} (reference q=${REF_Q}, replicate q=${QS_REPLICATE:-none})"
 echo "  stages: ${STAGES}"
 echo "  scratch ${SCRATCH_ROOT}"
 echo "  project ${PROJECT_ROOT}"
@@ -140,7 +159,7 @@ if want_stage greens && [ "$GPU" = "0" ]; then
             --sender "($CELLS)" --receiver "($CELLS)" \
             --rs-sep "($sep,0//1,0//1)" --scale "$SCALE" --chi "$CHI" \
             --design "$DESIGN" --components "$RANK" --oversamples "$OVERSAMPLES" \
-            --power-iterations 14 --seed "$SEED" \
+            --power-iterations "$REF_Q" --seed "$SEED" \
             --name "$name" --gpu false \
             --preload "$PRELOAD" \
             --project "${PROJECT_ROOT}/greens" --scratch "${SCRATCH_ROOT}/greens"
