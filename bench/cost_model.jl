@@ -1196,6 +1196,33 @@ What changes:
     back to the plan's pinned slab pool instead of to the OS. Nothing the RSVD
     frees before the save shrinks the process's RSS, so the cgroup sees
     `2c + m` columns even though only `m` of them are live at that instant.
+
+# The `RS/` singular values are a second panel decomposition, and it is counted
+
+`_generate_rsvd_sr` does not stop at `_save_ur_asym`. It then runs
+`_run_rsvdvals(..., "RS/")`, which at these sizes takes the panel path too and
+builds a residency plan of its own. `rsvdvals_panel` holds two tall matrices at
+its peak: the range basis `Q`, `N_r x c_svd`, and the reduction's `Bdag`,
+`N_s x c_svd`. They have *different row counts*, so their pool blocks have
+different byte sizes and Funicular's size-keyed free list cannot recycle one into
+the other; the pool has to hold both. That is `(N_r + N_s) * c_svd * 16`, i.e.
+`N_u * c_svd * 16` -- 51 GB at 4 λ, `c = 4050`.
+
+`host_panel_bytes` is the **maximum** of the two phases and not their sum, and
+that is a statement about `src/rsvd.jl`, not about Funicular. Funicular has no
+API to hand a slab back to the OS, so two coexisting plans really do add; what
+`_generate_rsvd_sr` now does is call `reclaim_host_pools!` between the phases so
+that the first plan is collected before the second is built, and
+`common.jl`'s `residency_plan` subtracts any pool that survived from the next
+plan's budget. With that, the process's high-water is one pool at a time and the
+honest request is the larger one. Without it -- the state the 4 λ probe RSVD ran
+in -- the two pools coexist, 116 GiB is budgeted twice out of a 124 GiB
+allocation, and the job is OOM-killed the moment the second pool starts growing.
+
+On every symmetric sender/receiver point the UR term wins (`2c + m` against
+`c_svd`, on twice the rows), so this `max` does not move the production requests;
+it binds only where the sender and receiver are very different sizes, when
+`max(N_r, N_s)` approaches `N_u` and `3 c_svd` can exceed `2 c_herm + m`.
 """
 function rsvd_panel_counts(pt::SRPoint)
     N_s = vector_length(pt.sender_cells)
@@ -1235,7 +1262,15 @@ function rsvd_panel_counts(pt::SRPoint)
     and does not replace them. See the host-memory bullet in the docstring, and
     the narval OOM it was written for.
     =#
-    host_panel_bytes = (2 * c_herm + m) * N_u * BYTES_PER_COMPLEX
+    host_ur_panel_bytes = (2 * c_herm + m) * N_u * BYTES_PER_COMPLEX
+    #=
+    `_run_rsvdvals("RS/")`'s own plan: `Q` is `N_r x c_svd` and `Bdag` is
+    `N_s x c_svd`, and their blocks are different sizes so neither recycles into
+    the other. See the docstring for why the two phases are `max`ed rather than
+    summed, and what in `src/rsvd.jl` has to hold for that to be true.
+    =#
+    host_rs_panel_bytes = (N_r + N_s) * c_svd * BYTES_PER_COMPLEX
+    host_panel_bytes = max(host_ur_panel_bytes, host_rs_panel_bytes)
     bytes_written = N_u * m * BYTES_PER_COMPLEX +
                     c_herm * BYTES_PER_COMPLEX + c_svd * BYTES_PER_COMPLEX
 
@@ -1248,6 +1283,8 @@ function rsvd_panel_counts(pt::SRPoint)
             panel_width=panel_width(N_u, c_herm), sweeps=sweeps,
             sweep_bytes=sweep_bytes,
             vram_bytes=vram_bytes, host_panel_bytes=host_panel_bytes,
+            host_ur_panel_bytes=host_ur_panel_bytes,
+            host_rs_panel_bytes=host_rs_panel_bytes,
             num_saved=m, bytes_written=bytes_written)
 end
 

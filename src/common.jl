@@ -353,6 +353,78 @@ free:
 LinearMaps composition, which has nowhere to carry one. See
 `gila_workspace_bytes` in `rsvd.jl` for the estimate.
 """
+#=
+Every `ResidencyPlan` this process has handed out and has not yet let go of, held
+weakly so that a plan whose last strong reference is gone can still be collected.
+
+This exists because a Funicular host pool is *per plan* and *never shrinks*.
+`Funicular.free!` pushes a block onto `HostPool.free`, a size-keyed free list;
+`HostPool.reserved`, `HostPool.slabs` and `HostPool.cursors` are only ever grown
+(`grow_host_pool!` in Funicular's `src/plan.jl` is the sole writer of `reserved`,
+and it only adds). There is no `release!`/`destroy!`/`close` on the pool, the plan
+or the slab, and no finalizer: the page-locked `Vector{UInt8}` slabs go back to the
+OS only when the whole plan becomes unreachable and Julia's GC collects them.
+
+A plan therefore keeps its high-water mark charged to the cgroup for as long as it
+is alive, and two plans built from the same Slurm allocation each believe they own
+`allocation - reserve`. That is what killed the 4 λ probe RSVD: `_save_ur_asym`
+finished a 786432 × 4050 panel decomposition inside a 116 GiB budget, and
+`_run_rsvdvals("RS/")` then built a *second* plan with the same 116 GiB budget
+while the first pool was still resident.
+=#
+const LIVE_RESIDENCY_PLANS = WeakRef[]
+
+"""
+    live_pool_host_bytes() -> Int
+
+Host bytes already reserved by residency plans this process still holds. Sums
+`Funicular.host_bytes_reserved` over the live entries of `LIVE_RESIDENCY_PLANS`
+and drops the dead ones on the way through, so it is also the cheap way to see
+whether a previous decomposition's pool has actually gone away.
+"""
+function live_pool_host_bytes()
+    total = 0
+    keep = WeakRef[]
+    for ref in LIVE_RESIDENCY_PLANS
+        plan = ref.value
+        plan === nothing && continue
+        push!(keep, ref)
+        total += Funicular.host_bytes_reserved(plan.hostpool)
+    end
+    empty!(LIVE_RESIDENCY_PLANS)
+    append!(LIVE_RESIDENCY_PLANS, keep)
+    return total
+end
+
+"""
+    reclaim_host_pools!() -> Int
+
+Collect any residency plan the process has finished with and report the pinned
+host bytes still held afterwards.
+
+Call this *between* panel decompositions, from the frame above the one that built
+the plan. It cannot work from inside that frame: the plan, the `PanelEigen` and the
+`PanelFactored` are still live locals there, and a `PanelMatrix` holds its plan as a
+field, so nothing is collectable until the frame is gone. `_generate_rsvd_sr` is the
+right place, and `_save_ur_asym` / `_run_rsvdvals` help by dropping their own
+references before they return.
+
+There is no way to force the pool back to the OS (see `LIVE_RESIDENCY_PLANS`), so
+this is GC and nothing more. The number it returns is the honest one: whatever is
+left is charged against the next plan's budget by `residency_plan`, which is the
+part that does not depend on the GC cooperating.
+"""
+function reclaim_host_pools!()
+    before = live_pool_host_bytes()
+    run_gc()
+    after = live_pool_host_bytes()
+    if before > 0 || after > 0
+        @info string(now()) * " [common::reclaim_host_pools!] Residency-plan host pools" reserved_before=before reserved_after=after released=(before - after)
+    end
+    after > 0 && @warn string(now()) * " [common::reclaim_host_pools!] $(after) bytes of page-locked host pool are still reachable, so the next residency plan is budgeted around them. If a later decomposition spills heavily to scratch, this is why: a plan or a panel matrix from the previous decomposition is still referenced."
+    return after
+end
+
 function residency_plan(compute_env::ComputeEnvironment; workspace_bytes::Int=0)
     if !use_gpu(compute_env)
         @info string(now()) * " [common::residency_plan] CPU run: no residency plan, the in-memory path is cheaper here"
@@ -360,7 +432,18 @@ function residency_plan(compute_env::ComputeEnvironment; workspace_bytes::Int=0)
     end
 
     device_budget = device_budget_bytes()
-    host_budget = max(_slurm_host_bytes() - HOST_OVERHEAD_RESERVE_BYTES, HOST_BUDGET_FLOOR_BYTES)
+    #=
+    Host budget for *this* plan: the allocation, less the overhead reserve, less
+    whatever earlier plans have already pinned and not given back. Subtracting the
+    live pools is what makes a second panel decomposition in one process safe
+    without depending on the GC having run: if the previous plan was collected the
+    term is zero and this plan gets the whole budget, and if it was not, this plan
+    gets what is genuinely left and spills the rest to `scratch_dir` instead of
+    being OOM-killed. See `LIVE_RESIDENCY_PLANS`.
+    =#
+    already_pinned = live_pool_host_bytes()
+    host_budget = max(_slurm_host_bytes() - HOST_OVERHEAD_RESERVE_BYTES - already_pinned,
+                      HOST_BUDGET_FLOOR_BYTES)
 
     scratch = nothing
     if haskey(ENV, "SLURM_TMPDIR")
@@ -368,14 +451,21 @@ function residency_plan(compute_env::ComputeEnvironment; workspace_bytes::Int=0)
         mkpath(scratch)
     end
 
-    @info string(now()) * " [common::residency_plan] Building a residency plan" device_budget host_budget workspace_bytes scratch
-    return Funicular.ResidencyPlan(
+    if already_pinned > 0
+        @warn string(now()) * " [common::residency_plan] An earlier residency plan still holds $(already_pinned) bytes of page-locked host memory, which this plan's budget is reduced by. Expect more spilling to scratch than the cost model's request assumes." already_pinned host_budget scratch
+        scratch === nothing && @error string(now()) * " [common::residency_plan] ...and there is no SLURM_TMPDIR to spill to, so this decomposition may run out of host tier. Run the decompositions in separate jobs, or raise --mem."
+    end
+
+    @info string(now()) * " [common::residency_plan] Building a residency plan" device_budget host_budget workspace_bytes scratch already_pinned
+    plan = Funicular.ResidencyPlan(
         backend=Funicular.cuda_backend(),
         device_budget=device_budget,
         host_budget=host_budget,
         workspace_bytes=workspace_bytes,
         scratch_dir=scratch
     )
+    push!(LIVE_RESIDENCY_PLANS, WeakRef(plan))
+    return plan
 end
 
 function run_gc()

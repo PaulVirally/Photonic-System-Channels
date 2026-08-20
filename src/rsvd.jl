@@ -406,6 +406,19 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
         Funicular.free!(out.vectors.Q)
     end
 
+    #=
+    Drop everything that roots the plan before returning. `free!` only hands the
+    blocks back to the plan's own pinned slab pool -- Funicular has no way to give
+    a slab back to the OS -- so the pool stays charged to the cgroup for as long as
+    anything can still reach the plan. `V_pos` and `out.vectors.Q` are
+    `PanelMatrix`es and each holds `plan` as a field, so the plan outlives this
+    frame unless they go too. The caller runs `reclaim_host_pools!` once the frame
+    is gone; nulling here is what makes that collection possible.
+    =#
+    V_pos = nothing
+    out = nothing
+    plan = nothing
+
     @info string(now()) * " [rsvd::_save_ur_asym] Saving reigen to $(jld_path)"
     _save_ur_asym_components(jld_path, jld_key, evals, m, seed_value, false; vectors_file=basename(vectors_path))
     run_gc()
@@ -487,6 +500,18 @@ function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing UR asym RSVD"
     _save_ur_asym(compute_env, smr, rsvd_params)
+
+    #=
+    Two panel decompositions run in this one process, and each of them builds its
+    own `ResidencyPlan`. A Funicular host pool never returns a slab to the OS, so
+    the UR_asym pool is still page-locked and still charged to the cgroup when the
+    RS plan is built, and a second plan sized for the whole allocation is a
+    guaranteed OOM (the 4 λ probe, `--mem=124G`, died here). `_save_ur_asym` has
+    dropped its references by now, so this frame is the first place the plan is
+    actually collectable; `residency_plan` budgets around whatever survives.
+    =#
+    @info string(now()) * " [rsvd::generate_rsvd] Reclaiming the UR_asym residency plan before the next decomposition"
+    reclaim_host_pools!()
 
     @info string(now()) * " [rsvd::generate_rsvd] Computing RSVD for RS"
     _run_rsvdvals(compute_env, smr, rsvd_params, "RS/")
@@ -612,6 +637,10 @@ function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
         @info string(now()) * " [rsvd::_run_rsvdvals] Path: panel RSVD for $(jld_key)" plan
         @info string(now()) * " [rsvd::_run_rsvdvals] Computing $(c) components of a randomized SVD for a $(dims) operator using $(oversamples(rsvd_params)) oversamples and $(power_iter(rsvd_params)) power iterations, seed $(seed(rsvd_params))"
         out = rsvdvals(G₀_ab, c; num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params), plan=plan, seed=seed(rsvd_params))
+        # `rsvdvals_panel` frees both bases itself and returns a plain host vector,
+        # so nothing but this local still roots the plan. Drop it so the pinned
+        # slabs can be collected once this frame is gone; see `reclaim_host_pools!`.
+        plan = nothing
     end
 
     @info string(now()) * " [rsvd::_run_rsvdvals] Saving RSVD to $(jld_path)"
@@ -626,6 +655,7 @@ function _generate_rsvd_smr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     for jld_key in jld_keys
         @info string(now()) * " [rsvd::_generate_rsvd_smr] Processing $(jld_key)"
         _run_rsvd(compute_env, smr, rsvd_params, jld_key)
+        reclaim_host_pools!()
     end
     _run_rsvdvals(compute_env, smr, rsvd_params, "MM/")
 end
