@@ -302,8 +302,16 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem;
 
     # Reproduce the production basis computation at the selected indices
     # This also returns the probes and projected constraint
+    # `k_uu = 0`: this function's whole job is to certify the *pure g basis* dual
+    # against the full space, and everything below -- `gs_pos`, `full_space_family`,
+    # the reuse of `result.ss` and `result.C_basis` -- assumes the basis is `gs_pos`
+    # and that `Bₙ` is diagonal in it. An augmented `bounds_from_spectrum` would hand
+    # back `m_aug`-sized objects that none of that machinery can read. Verifying the
+    # augmented bound is a separate job (`test/augmented_basis.jl`'s anchor (b) is
+    # the miniature of it), not a flag on this one.
     result = bounds_from_spectrum(compute_env, smr, Γ, Vur_asym, Γrs;
-                                  num_pos=num_pos, G₀_uu=G₀_uu, outer_indices=ns)
+                                  num_pos=num_pos, G₀_uu=G₀_uu, outer_indices=ns,
+                                  k_uu=0)
     result.basis_size == num_pos || error(
         "verify_bounds assumes the production default basis_size = num_pos, got " *
         "$(result.basis_size) ≠ $num_pos")

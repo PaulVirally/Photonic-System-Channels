@@ -238,6 +238,270 @@ function pencil_probe_duals(pencil, B_diag::AbstractVector{<:Real},
     return (ks=ks, alphas=alphas, duals=duals)
 end
 
+# ---------------------------------------------------------------------------
+# The augmented projection basis
+#
+# Production projects every operator into the span of the kept positive-Γ
+# eigenvectors of Asym(G⁰ᵤᵣ) (the "g basis", `m` columns). That span collapses
+# with separation -- at the 1 λ cube sweep, s = 357/32 λ keeps m = 15 of
+# N_u = 196,608 -- and the projected dual then loses validity: it under-reports,
+# and the exact λ/4 sweep, whose domain is strictly *contained* in the 1 λ one,
+# comes out above it at the same gap (0.042178 against 0.017831). A bound that
+# shrinks when the design space grows is not a bound.
+#
+# The diagnosis is that the *constraint* operators cannot be represented in a
+# 15-dimensional span -- above all Asym(G⁰ᵤᵤ), the universe's radiative
+# self-interaction, whose rank does not collapse with separation. Once PᵀCP stops
+# implying full-space feasibility, the "dual" relaxes nothing in particular.
+#
+# The repair, proven on production data by bench/augmented_basis_experiment.jl, is
+# to augment the projection basis with the top `k_uu` eigenvectors of Asym(G⁰ᵤᵤ):
+#
+#     basis = orthonormalize([g_kept, U_uu[:, 1:k_uu]])
+#
+# At the 1 λ, s = 357//32 point (m = 15) that took channel 1 from 0.0178 to 0.2019
+# -- crossing the exact λ/4 reference 0.0422 at k_uu = 128 -- and the trace over
+# the 15 channels from 0.050 to 0.740, monotonically and saturating. `k_uu = 0`
+# reproduces the pure-g production numbers to more than four digits, and this code
+# reproduces them bit for bit (the branch is not taken at all).
+#
+# Monotonicity is arithmetic, not physics: the projected primal is a sup over
+# t ∈ range(P), so a larger subspace gives a larger value, and the k_uu sweep uses
+# leading subsets of one U_uu, so the subspaces are nested.
+#
+# Two things production exploits hold *only* in the pure g basis: Bₙ and
+# basisᴴ(−G⁰ᵤᵣ)ᵃ₊basis are diagonal there. In the augmented basis they are not, but
+# both are built out of the gₗ alone, so everything still reduces to one extra
+# small matrix, W = basisᴴ gs_pos (m_aug × m):
+#
+#     basisᴴ (−G⁰ᵤᵣ)ᵃ₊ basis = W diag(Γ) Wᴴ
+#     basisᴴ Bₙ basis        = W[:, n:m] diag(4Γ[n:m]/ζ) W[:, n:m]ᴴ
+#
+# which is `FactoredB` below, and `factored_pencil_eigen` is `diag_pencil_eigen`
+# with the diagonal assumption lifted.
+#
+# The probes stay the production probes. `ss` is built by `reverse_gram_schmidt!`
+# on Πₛ·gs_pos -- the g columns alone, never the augmentation. Column i of `ss`
+# spans Πₛ·span(gᵢ, …, g_m) together with the later columns, and the outer loop's
+# shrinking probe set k ≥ n is what makes index n mean "the n-th channel". Adding
+# the U_uu columns to that construction would change the nested spans, so index n
+# would name a different quantity. The augmentation is about representing the
+# *constraint* faithfully -- enlarging the feasible set the dual is solved over --
+# not about redefining the objective.
+# ---------------------------------------------------------------------------
+
+#=
+Rank guard on the augmentation, relative to the largest |R_ii| of the
+augmentation's own QR. The `U_uu` columns are eigenvectors of a Hermitian
+operator, so they are mutually orthonormal to machine precision; the only way one
+of them can be numerically dependent after `span(g)` is projected out is if it lay
+in `span(g)` to begin with, which can happen for at most `m` of them. So this is
+expected to drop nothing, and 1e-10 is far enough above the ~`k·eps` a Householder
+QR of 512 near-orthonormal columns loses that a drop means a real dependence
+rather than roundoff. Whatever it drops is reported and saved.
+=#
+const AUG_QR_RTOL = 1e-10
+
+# Matches `diag_pencil_eigen`'s own default, so the null-space admissibility test
+# is as strict on the augmented path as it is on the plain one.
+const AUG_BTOL = 1e-8
+
+"""
+    qr_thin_rdiag!(A) -> (Q, d)
+
+The thin `Q` of a tall `A`, computed in place, together with `d = abs.(diag(R))`
+read out of the factored form *before* `orgqr!` overwrites it.
+
+[`qthin!`](@ref) throws `R` away, and `R`'s diagonal is the only cheap handle on
+column dependence an unpivoted QR offers: a column that is numerically in the span
+of the earlier ones has `|R_ii| ≈ 0`, and the `Q` column generated in its place is
+an arbitrary direction orthogonal to the earlier ones rather than anything inside
+`span(A)`. [`augmented_basis`](@ref) drops those.
+"""
+function qr_thin_rdiag!(A::Matrix{T}) where {T<:LinearAlgebra.BlasFloat}
+    size(A, 1) >= size(A, 2) || throw(ArgumentError(
+        "qr_thin_rdiag! wants a tall matrix, got $(size(A))"))
+    A, τ = LinearAlgebra.LAPACK.geqrf!(A)
+    d = abs.(diag(A))
+    LinearAlgebra.LAPACK.orgqr!(A, τ)
+    return A, d
+end
+
+function qr_thin_rdiag!(A::CuMatrix)
+    size(A, 1) >= size(A, 2) || throw(ArgumentError(
+        "qr_thin_rdiag! wants a tall matrix, got $(size(A))"))
+    n = size(A, 2)
+    τ = similar(A, n)
+    CUDA.CUSOLVER.geqrf!(A, τ)
+    # The leading n × n block back on the host (a few MB at n = 512) rather than a
+    # device gather along `diagind`: R lives there, and this is a strided copy of a
+    # contiguous-column view, which needs nothing clever from CUDA.jl.
+    d = abs.(diag(Array(view(A, 1:n, 1:n))))
+    CUDA.CUSOLVER.orgqr!(A, τ)
+    return A, d
+end
+
+"""
+    augmented_basis(gs, U; rtol=AUG_QR_RTOL) -> NamedTuple
+
+`[gs, U]` orthonormalized, with the leading `size(gs, 2)` columns left *exactly*
+as `gs`.
+
+The `g` block is not touched: it is RSVD output and already orthonormal to about
+`1e-14`, which is the level production's own `basisᴴbasis = 1` assumption runs at,
+and leaving it alone makes `k_uu = 0` literally the production basis rather than a
+rotation of it. `span(g)` is projected out of `U` (classical Gram-Schmidt run
+twice, which is as stable as modified Gram-Schmidt and is two GEMMs instead of `m`
+passes over `N_u`-vectors), and what is left is orthonormalized by a Householder QR
+whose `|diag(R)|` is used to drop numerically dependent columns (see
+[`AUG_QR_RTOL`](@ref)).
+
+Returns `(basis, num_uu_kept, num_uu_dropped, dropped_cols, rdiag_min_ratio)`.
+`basis` aliases `gs` when `U` is empty.
+"""
+function augmented_basis(gs::AbstractMatrix, U::AbstractMatrix; rtol::Real=AUG_QR_RTOL)
+    N, m = size(gs)
+    size(U, 1) == N || throw(DimensionMismatch(
+        "the augmentation has $(size(U, 1)) rows but the g basis has $(N)"))
+    k = size(U, 2)
+    k == 0 && return (basis=gs, num_uu_kept=0, num_uu_dropped=0,
+                      dropped_cols=Int[], rdiag_min_ratio=NaN)
+
+    T = eltype(gs)
+    U1 = copy(U) # the QR below is in place, and `U` may be a shared block
+    # Two classical Gram-Schmidt passes against the g block.
+    for _ in 1:2
+        coeffs = gs' * U1              # m × k, small
+        mul!(U1, gs, coeffs, -one(T), one(T))
+    end
+    U1, d = qr_thin_rdiag!(U1)
+
+    dmax = maximum(d)
+    keep = findall(>=(rtol * dmax), d)
+    dropped = setdiff(1:k, keep)
+    basis = isempty(dropped) ? hcat(gs, U1) : hcat(gs, U1[:, keep])
+    return (basis=basis, num_uu_kept=length(keep), num_uu_dropped=length(dropped),
+            dropped_cols=dropped, rdiag_min_ratio=minimum(d) / dmax)
+end
+
+"""
+    FactoredB(V, c)
+
+`B = V diag(c²) Vᴴ`, held in factored form so that the pencil never builds `B`.
+
+Production's `Bₙ` is diagonal in the `g` basis and [`diag_pencil_eigen`](@ref)
+exploits that all the way through. In the augmented basis it is not diagonal, but
+it is still a *low-rank congruence of a diagonal*:
+
+    basisᴴ Bₙ basis = W[:, n:m] diag(4Γ[n:m]/ζ) W[:, n:m]ᴴ,   W = basisᴴ gs,
+
+which is this object with `V = W[:, n:m]` and `c = sqrt.(4Γ[n:m]/ζ)`. Everything
+[`factored_pencil_eigen`](@ref) needs is a product against the factor
+`K = diag(c) Vᴴ`, and `Vᴴ X` is a plain CUBLAS gemm with `transa = 'C'`, so nothing
+is ever transposed into a temporary.
+
+With `V = 1` and `c = sqrt.(d)` this reduces to `diag_pencil_eigen`'s
+`B = diag(d)` term for term, which `test/augmented_basis.jl` checks.
+"""
+struct FactoredB{M<:AbstractMatrix,V<:AbstractVector}
+    V::M   # m_aug × p
+    c::V   # length p, real and non-negative
+end
+
+# K * X for K = diag(c) Vᴴ, so that Xᴴ Kᴴ K X = Xᴴ B X. `F.V' * X` is a plain gemm
+# with transa = 'C'; nothing is materialized transposed.
+apply_factor(F::FactoredB, X::AbstractMatrix) = F.c .* (F.V' * X)
+
+# The diagonal of B = V diag(c²) Vᴴ: Bⱼⱼ = Σᵢ cᵢ² |Vⱼᵢ|². `reshape` rather than `'`
+# so the row vector is a plain array on whichever device `c` lives on.
+factored_diag(F::FactoredB) =
+    vec(sum(abs2.(F.V) .* reshape(F.c .^ 2, 1, :); dims=2))
+
+"""
+    factored_pencil_eigen(F, W, N; btol=AUG_BTOL) -> (values, vectors)
+
+Solve `B v = λ C v` for `B = F.V diag(F.c²) F.Vᴴ`, given the `whitener` `W` and
+`nullspace` `N` of [`psd_pencil_whitener`](@ref). Returns `(values, vectors)` with
+`vectorsᴴ C vectors = 1`, exactly the normalization the dual's
+`∑ⱼ |bⱼ|²/(α − λⱼ)` resolvent expansion assumes.
+
+This is [`diag_pencil_eigen`](@ref) with the diagonal assumption lifted, and it is
+the same computation term for term:
+
+  * `Wd = K W` here, `sqrt_d .* W` there — identical when `K = diag(sqrt(d))`;
+  * `eigen(Hermitian(Wdᴴ Wd))` in both, which is what keeps `B`'s compression
+    positive semi-definite by construction rather than by luck;
+  * the null-space admissibility test is the same `max_j Nⱼᴴ B Nⱼ ≤ btol · dmax`.
+    `dmax` is the largest *diagonal entry* of `B`, which equals `max(d)` in the
+    diagonal case and otherwise sits within a factor of `size(B, 1)` of `λmax(B)`;
+    using the diagonal makes the test stricter, so it fails loudly rather than
+    passing quietly.
+
+Errors unless `B` is negligible on the numerical null space of `C`. The reasoning
+is `diag_pencil_eigen`'s: for positive semi-definite `B` and `C`, a null direction
+`v` of `C` with `vᴴBv ≈ 0` also has `Bv ≈ 0` and can be dropped, while one with
+`vᴴBv > 0` is a direction the constraint fails to bound, i.e. a bound of `+∞` that
+no projection may quietly report as finite.
+"""
+function factored_pencil_eigen(F::FactoredB, W::AbstractMatrix, N::AbstractMatrix;
+                               btol::Real=AUG_BTOL)
+    all(>=(0), F.c) || throw(ArgumentError(
+        "FactoredB's weights must be non-negative (they are square roots), got " *
+        "minimum(c) = $(minimum(F.c))"))
+    d = Array(factored_diag(F))
+    dmax = isempty(d) ? zero(eltype(d)) : maximum(d)
+    if size(N, 2) > 0 && dmax > zero(dmax)
+        worst = maximum(sum(abs2, apply_factor(F, N); dims=1))
+        worst <= btol * dmax || error("factored_pencil_eigen: B is not negligible on " *
+            "the numerical null space of C: max_j N[:,j]'B N[:,j] = $worst vs " *
+            "btol * max(diag(B)) = $(btol * dmax) over $(size(N, 2)) null direction(s). " *
+            "The constraint does not bound those directions, so the true bound for this " *
+            "index is +∞ rather than anything this program can report")
+    end
+    Wd = apply_factor(F, W) # Wdᴴ Wd == Wᴴ B W, positive semi-definite by construction
+    E = eigen(Hermitian(Wd' * Wd))
+    Λ = Array(E.values)
+    num_bad = count(!isfinite, Λ)
+    num_bad == 0 || error("factored_pencil_eigen: eigendecomposition returned " *
+        "$num_bad/$(length(Λ)) non-finite eigenvalues; CUSOLVER's heevd reports " *
+        "failure this way instead of throwing, so the factorization did not converge")
+    return Λ, W * E.vectors
+end
+
+"""
+    factored_probe_duals(pencil, F, ss_basis, n, num_pos; τ=NaN)
+
+[`pencil_probe_duals`](@ref) with [`diag_pencil_eigen`](@ref) swapped for
+[`factored_pencil_eigen`](@ref). Same probes, same bracketing, same stationarity
+condition, same `αₖ²/4 ∑ⱼ |bⱼ|²/(αₖ − λⱼ)`; only the `B` representation differs.
+The root find itself is [`bracket_root`](@ref) plus `Roots.Brent`, reused verbatim.
+"""
+function factored_probe_duals(pencil, F::FactoredB, ss_basis::AbstractMatrix,
+                              n::Int, num_pos::Int; τ::Real=NaN)
+    Λ_basis, V_basis = factored_pencil_eigen(F, pencil.whitener, pencil.nullspace)
+
+    ks = collect(n:num_pos)
+    alphas = zeros(Float64, length(ks))
+    duals = zeros(Float64, length(ks))
+    for (i, k) in enumerate(ks)
+        sₖ = view(ss_basis, :, k)
+        if size(pencil.nullspace, 2) > 0
+            sₖ_null = norm(pencil.nullspace' * sₖ)
+            sₖ_null <= 1e-8 * norm(sₖ) || error("probe k=$k at n=$n, τ=$τ has " *
+                "‖N'sₖ‖ = $sₖ_null of ‖sₖ‖ = $(norm(sₖ)) in the numerical null space " *
+                "of C(τ), so the bound is +∞")
+        end
+        b = Array(V_basis' * sₖ)
+
+        f(α) = sum(abs2(bⱼ) * (α - 2λⱼ) / (α - λⱼ)^2 for (bⱼ, λⱼ) in zip(b, Λ_basis))
+        ((left, _), (right, _)) = bracket_root(f, Λ_basis, b)
+        αₖ = find_zero(f, (left, right), Roots.Brent())
+        alphas[i] = αₖ
+        duals[i] = αₖ^2 / 4 * sum(abs2(bⱼ) / (αₖ - λⱼ) for (bⱼ, λⱼ) in zip(b, Λ_basis))
+    end
+    return (ks=ks, alphas=alphas, duals=duals)
+end
+
 similar_fill(v::AbstractArray{T}, fill_val::T) where T = fill!(similar(v), fill_val)
 similar_fill(v::AbstractArray{T}, dims::NTuple{N, Int}, fill_val::T) where {N, T} = fill!(similar(v, dims), fill_val)
 Base.:\(::Nothing, x::AbstractArray) = (x, 0)
@@ -438,6 +702,372 @@ as [`use_panel_path`](@ref), so the two stages of a job agree on the regime.
 function use_panel_bounds(N_u::Integer, m::Integer, compute_env::ComputeEnvironment)
     use_gpu(compute_env) || return false
     return RSVD_PEAK_FUDGE * bounds_footprint_bytes(N_u, m) > device_budget_bytes()
+end
+
+# --- Sizing the augmented front end -----------------------------------------
+
+"""
+    DEFAULT_K_UU, DEFAULT_AUGMENT_THRESHOLD
+
+The production defaults for the `Asym(G⁰ᵤᵤ)` augmentation, exposed as `--k-uu` and
+`--augment-threshold`.
+
+`k_uu = 512` is where the 1 λ sweep's `k_uu` scan saturated (0.1988 at 256 →
+0.2019 at 512, a 1.6% last step, against a 11× rise from `k_uu = 0`).
+
+`augment_threshold = 1000` is where the sweep is cut into an augmented far half and
+an untouched near half. The boundary is a policy, not a physical edge: augmenting
+only ever moves a bound *towards* validity, so the question is not "where does the
+pathology start?" but "where is the step in the reported trace small enough that
+the two halves can be plotted together?". The q-validation answered it. At the
+m = 500 boundary the same point reported a trace 2.5% apart augmented versus not,
+and the kept count itself jitters by about ±30 between reruns of the RSVD, which
+flips points across the boundary and puts that 2.5% into the sweep as noise. At
+m = 1000 the same comparison is well inside the line width, because a basis that
+keeps a thousand directions of `Asym(G⁰ᵤᵣ)` already represents the constraint.
+
+It is still bounded well away from the near field. `m_aug² ` pencils at the
+near-contact `m = 4000` would grow by 25% for nothing, which is what the threshold
+exists to prevent, and 1000 is a quarter of the way there.
+
+Raising the threshold does raise the ceiling on the dense augmented front end,
+from `m_aug < 1012` to `m_aug < 1512`, and at the larger universes that ceiling is
+not free: see [`max_k_uu_for_budget`](@ref) and [`clip_k_uu`](@ref), which reduce
+the effective `k_uu` on a point whose augmented front end would not fit the card.
+
+`--k-uu 0` disables the augmentation entirely and reproduces the pre-augmentation
+output bit for bit: the branch below is simply not taken.
+"""
+const DEFAULT_K_UU = 512
+const DEFAULT_AUGMENT_THRESHOLD = 1000
+
+"""
+    UU_OVERSAMPLES, UU_POWER_ITERS, UU_MIN_OVERSAMPLES
+
+`reigen_hermitian` parameters for the `Asym(G⁰ᵤᵤ)` solve.
+
+`Asym(G⁰ᵤᵤ)` is the universe's radiation operator, positive semi-definite with a
+spectrum that falls off a cliff past the radiative channel count of a two-cube
+universe. Well-separated eigenvalues are the easy case for subspace iteration --
+the production RSVD's 14 iterations exist for the *clustered* spectrum of
+`Asym(G⁰ᵤᵣ)` at large separation, which this operator is not -- so 4 power
+iterations is the default here, and the measured 1 λ residuals `‖Av − λv‖/Λ₁` came
+back at the 1e-13 level with it.
+
+`UU_MIN_OVERSAMPLES` is the floor [`plan_uu_solve`](@ref) may cut the oversamples
+down to when the sketch does not fit the device at the full 50. Below that the
+range finder has no slack left at all and the tail of the returned block stops
+being an eigenbasis.
+"""
+const UU_OVERSAMPLES = 50
+const UU_POWER_ITERS = 4
+const UU_MIN_OVERSAMPLES = 10
+
+"""
+    uu_sketch_bytes(N_u, k_uu, oversamples) -> Int
+
+Device bytes the in-memory `reigen_hermitian` for `Asym(G⁰ᵤᵤ)` holds live: the
+three `N_u × (k_uu + oversamples)` ComplexF64 matrices the Hermitian range finder
+keeps at once (the sketch, its image, and the rotation's destination). Same count
+as `rsvd_inmemory_live_bytes` in the cost model and as [`use_panel_path`](@ref)'s,
+so the three cannot drift apart.
+"""
+uu_sketch_bytes(N_u::Integer, k_uu::Integer, oversamples::Integer) =
+    3 * Int(N_u) * (Int(k_uu) + Int(oversamples)) * 16
+
+"""
+    augmented_footprint_bytes(N_u, m, m_aug) -> Int
+
+Device bytes the *augmented* in-memory front end wants at its peak: the
+`N_u × m_aug` basis, the `N_u × m` probes `ss` (built from the `g` columns alone,
+so `m` and not `m_aug` wide) and the `N_u × m_aug` destination `opmat(C, basis)`
+allocates. Reduces to [`bounds_footprint_bytes`](@ref) when `m_aug == m`.
+"""
+augmented_footprint_bytes(N_u::Integer, m::Integer, m_aug::Integer) =
+    (2 * Int(m_aug) + Int(m)) * Int(N_u) * 16
+
+"""
+    K_UU_CLIP_FLOOR
+
+The smallest `k_uu` [`clip_k_uu`](@ref) will clip *to*. Below this there is no
+point augmenting: the 1 λ `k_uu` scan reached the λ/4 reference at `k_uu = 128`
+and was still an order of magnitude short of it at `k_uu = 32`, so a basis
+augmented with 64 directions is paying the whole `Asym(G⁰ᵤᵤ)` solve and the
+`m_aug`-wide pencil stage for a bound that is still invalid. A point that cannot
+afford 64 is refused, loudly and in the first minute, rather than run to produce a
+number nobody can use.
+"""
+const K_UU_CLIP_FLOOR = 64
+
+"""
+    max_k_uu_for_budget(N_u, m, budget_bytes) -> Int
+
+The largest `k_uu` whose augmented front end fits `budget_bytes` on an `N_u`-tall
+universe at kept width `m`. May be negative, which means the *unaugmented* front
+end does not fit either and no `k_uu` rescues it.
+
+Pure arithmetic on the same three quantities [`plan_uu_solve`](@ref) checks,
+solved for `k` instead of tested at a given `k`. With `c = budget / (N_u · 16)`,
+the tall columns the budget pays for:
+
+  * the front end, [`augmented_footprint_bytes`](@ref) `= (2 m_aug + m) N_u 16`,
+    which at `m_aug = m + k` is `3m + 2k` columns, so `k ≤ (c − 3m) / 2`;
+  * the augmentation's QR, `(2 k_uu + m_aug) N_u 16 = m + 3k` columns, so
+    `k ≤ (c − m) / 3`;
+  * the range finder's fudged peak at the *minimum* oversamples,
+    `RSVD_PEAK_FUDGE · 3 (k + p) N_u 16`, so
+    `k ≤ c / (3 RSVD_PEAK_FUDGE) − UU_MIN_OVERSAMPLES`.
+
+`UU_MIN_OVERSAMPLES` and not the requested `p` in the third, on purpose: the
+oversamples are the range finder's slack and `plan_uu_solve` already spends them
+before it gives up, so a `k` that fits at the floor is a `k` that `plan_uu_solve`
+can make room for. Cutting `k` is the more expensive repair of the two and goes
+second.
+
+Kept as a function of an explicit budget rather than of a `ComputeEnvironment` so
+that `bench/cost_model.jl`'s `augment_k_uu_cap` can mirror it line for line and
+`test/augmented_basis.jl` can check the two against each other on a grid of
+fabricated sizes. If this changes, change that.
+"""
+function max_k_uu_for_budget(N_u::Integer, m::Integer, budget_bytes::Real)
+    column_bytes = Int(N_u) * 16
+    columns = floor(Int, budget_bytes / column_bytes)
+    k_front = fld(columns - 3 * Int(m), 2)
+    k_qr = fld(columns - Int(m), 3)
+    k_sketch = floor(Int, columns / (3 * RSVD_PEAK_FUDGE)) - Int(UU_MIN_OVERSAMPLES)
+    return min(k_front, k_qr, k_sketch)
+end
+
+"""
+    clip_k_uu(compute_env, N_u, m, k_uu) -> NamedTuple
+
+The `k_uu` this point can actually afford, given the card it is on. Returns
+`(k_uu, requested, clipped, reason, k_fit, budget_bytes)`; errors when not even
+[`K_UU_CLIP_FLOOR`](@ref) fits.
+
+Why this exists. `--augment-threshold` caps `m` and therefore caps
+`m_aug = m + k_uu`, and at 500 the cap was low enough that the dense augmented
+front end fitted everywhere the sweep ran. At 1000 it is not: `m_aug` reaches 1512,
+and three `N_u × m_aug` matrices at the 4 λ universe (`N_u = 786,432`, 12 MiB a
+column) are tens of gigabytes. The threshold governs *which* points augment, which
+is a question about the physics; this governs *how far* one of them can augment,
+which is a question about the card, and conflating the two would mean lowering the
+threshold globally because one wavelength on one cluster cannot pay for it.
+
+Clipping and not refusing, because the augmentation is worth having partially. The
+1 λ scan is monotone and saturating in `k_uu` (0.0178 at 0, 0.1988 at 256, 0.2019
+at 512), so a point clipped from 512 to 256 keeps 98% of the repair. A point
+clipped below [`K_UU_CLIP_FLOOR`](@ref) keeps almost none of it, and is refused
+with the arithmetic in the message, exactly as `plan_uu_solve` refuses a sketch
+that cannot be made to fit.
+
+A CPU run is not clipped: it has no device budget to clip against, and the systems
+that run on one are the test fixtures.
+"""
+function clip_k_uu(compute_env::ComputeEnvironment, N_u::Integer, m::Integer,
+                   k_uu::Integer)
+    k_uu = Int(k_uu)
+    unclipped = (k_uu=k_uu, requested=k_uu, clipped=false, reason="",
+                 k_fit=k_uu, budget_bytes=0)
+    (k_uu <= 0 || !use_gpu(compute_env)) && return unclipped
+
+    budget = device_budget_bytes() - gila_workspace_bytes(N_u)
+    budget > 0 || error("clip_k_uu: the Green operator's own device workspace " *
+        "($(gila_workspace_bytes(N_u)) bytes) already exceeds 90% of this card " *
+        "($(device_budget_bytes()) bytes); nothing can run here, augmented or not")
+
+    k_fit = max_k_uu_for_budget(N_u, m, budget)
+    k_fit >= k_uu && return merge(unclipped, (k_fit=k_fit, budget_bytes=budget))
+
+    gib(x) = round(x / 2^30; digits=2)
+    k_fit >= K_UU_CLIP_FLOOR || error("clip_k_uu: the augmented front end at " *
+        "N_u = $(N_u), kept m = $(m) does not fit this device at any useful " *
+        "--k-uu. The budget is $(gib(budget)) GiB (90% of the card, " *
+        "$(gib(device_budget_bytes())) GiB, less the Green operator's " *
+        "$(gib(gila_workspace_bytes(N_u))) GiB workspace), which buys " *
+        "$(fld(budget, Int(N_u) * 16)) columns of $(N_u) × 1 ComplexF64 " *
+        "($(gib(Int(N_u) * 16)) GiB each). The three tall matrices are " *
+        "2·m_aug + m = 3m + 2k columns, the augmentation's QR is m + 3k, and the " *
+        "range finder's fudged sketch at $(UU_MIN_OVERSAMPLES) oversamples is " *
+        "3·RSVD_PEAK_FUDGE·(k + $(UU_MIN_OVERSAMPLES)); the largest k satisfying " *
+        "all three is $(k_fit), below the K_UU_CLIP_FLOOR of $(K_UU_CLIP_FLOOR) " *
+        "at which augmenting stops buying a valid bound. At m_aug = m + " *
+        "$(K_UU_CLIP_FLOOR) the front end alone would want " *
+        "$(gib(augmented_footprint_bytes(N_u, m, Int(m) + K_UU_CLIP_FLOOR))) GiB. " *
+        "Run this point on a larger card, lower --augment-threshold below $(m) so " *
+        "it is not augmented at all, or set --k-uu 0")
+
+    @warn string(now()) * " [bounds_bargaining::clip_k_uu] Clipping --k-uu $(k_uu) → $(k_fit) to fit this device: at N_u = $(N_u), kept m = $(m), the budget of $(gib(budget)) GiB (90% of the $(gib(device_budget_bytes())) GiB card less the Green operator's $(gib(gila_workspace_bytes(N_u))) GiB workspace) buys $(fld(budget, Int(N_u) * 16)) tall columns, and k_uu = $(k_uu) would want $(2 * (Int(m) + k_uu) + Int(m)) of them for the front end alone ($(gib(augmented_footprint_bytes(N_u, m, Int(m) + k_uu))) GiB against $(gib(budget)) GiB). At k_uu = $(k_fit) the front end is $(gib(augmented_footprint_bytes(N_u, m, Int(m) + k_fit))) GiB. The k_uu scan is monotone and saturating, so this keeps most of the repair, but the bound at this point is NOT the one a --k-uu $(k_uu) run elsewhere in the sweep reports; augment/k_uu_effective and augment/k_uu_clip_reason in the output record it"
+
+    return (k_uu=k_fit, requested=k_uu, clipped=true, reason="device_budget",
+            k_fit=k_fit, budget_bytes=budget)
+end
+
+"""
+    plan_uu_solve(compute_env, N_u, m, k_uu; oversamples, power_iters) -> NamedTuple
+
+Decide whether the `Asym(G⁰ᵤᵤ)` solve and the basis it produces fit on the device,
+and with how many oversamples. Returns `(oversamples, sketch_bytes, peak_bytes,
+basis_bytes, budget_bytes)`; errors, loudly and with the arithmetic in the message,
+when no admissible configuration exists.
+
+Three quantities are checked against 90% of the card
+([`device_budget_bytes`](@ref)), less the Green operator's own workspace
+([`gila_workspace_bytes`](@ref)), which the residency machinery holds back
+everywhere else for the same reason:
+
+  * the range finder's peak, `RSVD_PEAK_FUDGE` × [`uu_sketch_bytes`](@ref). The
+    fudge is the measured ratio of the real high-water to the three nominal
+    matrices, and it is the same predicate [`use_panel_path`](@ref) uses, so a
+    point the RSVD stage would have called in-memory is called in-memory here too.
+  * the augmentation's own QR, which holds `U_uu`, the Gram-Schmidt copy of it and
+    the concatenated basis at once, i.e. about `2 k_uu + m_aug` columns.
+  * the front end's peak, [`augmented_footprint_bytes`](@ref).
+
+Only the first is negotiable *here*. When it does not fit, the oversamples come
+down (the sketch is `k_uu + p` wide and `p` is pure slack for the range finder, so
+cutting it costs accuracy in the tail of `U_uu` and nothing else) as far as
+[`UU_MIN_OVERSAMPLES`](@ref). Below that, and for the other two, this errors: the
+augmented path has no panel front end (see `_bounds_front_end_augmented`), and an
+OOM three hours into a bounds job is a worse outcome than a refusal in the first
+minute.
+
+Those errors are now a backstop rather than the first line of defence.
+[`clip_k_uu`](@ref) runs before this and has already brought `k_uu` down to a value
+that satisfies all three checks at `UU_MIN_OVERSAMPLES`, so what reaches here is a
+`k_uu` known to fit; the remaining work is spending the oversamples. The checks
+stay because `plan_uu_solve` is called directly by tests and by
+`bench/augmented_basis_experiment.jl`, and because a guard that is never supposed
+to fire is exactly the one worth keeping.
+
+At 4 λ (`N_u = 786,432`) with `k_uu = 512`: the sketch is 7.1 GB per matrix, 21.2
+GB for the three, 33.0 GB fudged, against 38.2 GB of budget on an A100-40. It fits,
+but with only 5 GB to spare, which is why this function exists rather than a
+comment.
+
+A CPU run is not checked: it has no device budget to check against, the systems
+that run on one are the test fixtures, and the host side is Slurm's problem rather
+than the plan's.
+"""
+function plan_uu_solve(compute_env::ComputeEnvironment, N_u::Integer, m::Integer,
+                       k_uu::Integer; oversamples::Integer=UU_OVERSAMPLES,
+                       power_iters::Integer=UU_POWER_ITERS)
+    m_aug = Int(m) + Int(k_uu)
+    basis_bytes = augmented_footprint_bytes(N_u, m, m_aug)
+    qr_bytes = (2 * Int(k_uu) + m_aug) * Int(N_u) * 16
+    if !use_gpu(compute_env)
+        return (oversamples=Int(oversamples), power_iters=Int(power_iters),
+                sketch_bytes=uu_sketch_bytes(N_u, k_uu, oversamples),
+                peak_bytes=0, basis_bytes=basis_bytes, qr_bytes=qr_bytes,
+                budget_bytes=0)
+    end
+
+    budget = device_budget_bytes() - gila_workspace_bytes(N_u)
+    budget > 0 || error("plan_uu_solve: the Green operator's own device workspace " *
+        "($(gila_workspace_bytes(N_u)) bytes) already exceeds 90% of this card " *
+        "($(device_budget_bytes()) bytes); nothing can run here, augmented or not")
+
+    gib(x) = round(x / 2^30; digits=2)
+    fits(p) = RSVD_PEAK_FUDGE * uu_sketch_bytes(N_u, k_uu, p) <= budget
+
+    p = Int(oversamples)
+    if !fits(p)
+        p_ok = nothing
+        for candidate in (Int(oversamples) - 1):-1:Int(UU_MIN_OVERSAMPLES)
+            fits(candidate) && (p_ok = candidate; break)
+        end
+        p_ok === nothing && error("plan_uu_solve: the Asym(G⁰ᵤᵤ) solve for k_uu = " *
+            "$(k_uu) at N_u = $(N_u) does not fit this device even at the minimum " *
+            "$(UU_MIN_OVERSAMPLES) oversamples: the range finder's three " *
+            "$(N_u) × $(Int(k_uu) + Int(UU_MIN_OVERSAMPLES)) matrices are " *
+            "$(gib(uu_sketch_bytes(N_u, k_uu, UU_MIN_OVERSAMPLES))) GiB, " *
+            "$(gib(RSVD_PEAK_FUDGE * uu_sketch_bytes(N_u, k_uu, UU_MIN_OVERSAMPLES))) " *
+            "GiB with the measured RSVD_PEAK_FUDGE = $(RSVD_PEAK_FUDGE), against a " *
+            "budget of $(gib(budget)) GiB (90% of the card less the Green operator's " *
+            "$(gib(gila_workspace_bytes(N_u))) GiB workspace). Lower --k-uu (the " *
+            "sketch is 3·N_u·(k_uu + p)·16 bytes, so k_uu ≈ " *
+            "$(max(0, floor(Int, budget / (RSVD_PEAK_FUDGE * 3 * Int(N_u) * 16)) - Int(UU_MIN_OVERSAMPLES))) " *
+            "would fit), or run this point on a larger card")
+        @warn string(now()) * " [bounds_bargaining::plan_uu_solve] The Asym(G⁰ᵤᵤ) sketch at $(oversamples) oversamples wants $(gib(RSVD_PEAK_FUDGE * uu_sketch_bytes(N_u, k_uu, oversamples))) GiB of a $(gib(budget)) GiB budget; cutting the oversamples to $(p_ok) ($(gib(RSVD_PEAK_FUDGE * uu_sketch_bytes(N_u, k_uu, p_ok))) GiB). The oversamples are the range finder's slack, so this costs accuracy in the tail of U_uu and nothing else; the eigenpair residuals in the log say whether it mattered"
+        p = p_ok
+    end
+
+    qr_bytes <= budget || error("plan_uu_solve: orthonormalizing " *
+        "[g_kept, U_uu] at k_uu = $(k_uu), m = $(m) holds U_uu, its Gram-Schmidt " *
+        "copy and the $(N_u) × $(m_aug) result at once, $(gib(qr_bytes)) GiB, " *
+        "against a budget of $(gib(budget)) GiB. Lower --k-uu or run this point on a " *
+        "larger card; the augmented front end is dense by construction and has no " *
+        "panel path to fall back to")
+    basis_bytes <= budget || error("plan_uu_solve: the augmented front end's three " *
+        "tall matrices (the $(N_u) × $(m_aug) basis, the $(N_u) × $(m) probes and " *
+        "the $(N_u) × $(m_aug) working matrix) want $(gib(basis_bytes)) GiB against " *
+        "a budget of $(gib(budget)) GiB. Lower --k-uu or run this point on a larger " *
+        "card; the augmented front end is dense by construction and has no panel " *
+        "path to fall back to")
+
+    return (oversamples=p, power_iters=Int(power_iters),
+            sketch_bytes=uu_sketch_bytes(N_u, k_uu, p),
+            peak_bytes=round(Int, RSVD_PEAK_FUDGE * uu_sketch_bytes(N_u, k_uu, p)),
+            basis_bytes=basis_bytes, qr_bytes=qr_bytes, budget_bytes=budget)
+end
+
+"""
+    uu_eigenbasis(compute_env, G⁰ᵤᵤ_asym, k; oversamples, power_iters) -> NamedTuple
+
+Top-`k` eigenpairs of `Asym(G⁰ᵤᵤ)`, computed in the bounds job itself with the same
+`reigen_hermitian` the production RSVD uses, on whichever device the run is on.
+Returns `(vectors, values, seconds)`.
+
+In memory, always: [`plan_uu_solve`](@ref) has already established that the sketch
+fits, and a `PanelMatrix` here would have to be materialized dense a moment later
+anyway, since [`augmented_basis`](@ref)'s QR and the front end that follows are
+dense by construction.
+"""
+function uu_eigenbasis(compute_env::ComputeEnvironment, G⁰ᵤᵤ_asym, k::Int;
+                       oversamples::Int=UU_OVERSAMPLES,
+                       power_iters::Int=UU_POWER_ITERS)
+    sample_vec = zeros(ComplexF64, 0)
+    if use_gpu(compute_env)
+        sample_vec = CuArray(sample_vec)
+    end
+    @info string(now()) * " [bounds_bargaining::uu_eigenbasis] Computing the top $(k) " *
+          "eigenpairs of Asym(G⁰ᵤᵤ) ($(size(G⁰ᵤᵤ_asym))) with $(oversamples) oversamples " *
+          "and $(power_iters) power iterations"
+    t = time_ns()
+    out = reigen_hermitian(G⁰ᵤᵤ_asym, k; num_oversamples=oversamples,
+                           num_power_iterations=power_iters, sample_vec=sample_vec)
+    t = (time_ns() - t) / 1e9
+    values = Array(out.values)
+    @info string(now()) * " [bounds_bargaining::uu_eigenbasis] Done in $(round(t; digits=1)) s: " *
+          "$(length(values)) eigenvalues, Λ[1] = $(values[1]), Λ[end] = $(values[end]), " *
+          "Λ[end]/Λ[1] = $(values[end] / values[1])"
+    return (vectors=out.vectors, values=values, seconds=t)
+end
+
+"""
+    uu_residuals(G⁰ᵤᵤ_asym, U, Λ, idxs) -> Vector
+
+`‖A uᵢ − Λᵢ uᵢ‖ / Λ₁` at the given column indices. A handful of matvecs, and the
+only evidence in the log and in the saved JLD that [`UU_POWER_ITERS`](@ref) was
+high enough.
+
+Normalized by the *leading* eigenvalue rather than by `Λᵢ`. `Asym(G⁰ᵤᵤ)`'s spectrum
+falls off a cliff, so `‖Av − λv‖/|λ|` at the tail divides a converged residual by a
+number near the noise floor and reports a large relative error for a direction
+that is, correctly, in the operator's numerical null space. Against `Λ₁` this reads
+as what it is: how well the *subspace* has converged.
+"""
+function uu_residuals(G⁰ᵤᵤ_asym, U::AbstractMatrix, Λ::AbstractVector,
+                      idxs::AbstractVector{Int})
+    out = fill(NaN, length(idxs))
+    scale = isempty(Λ) ? one(eltype(Λ)) : max(abs(Λ[1]), floatmin(eltype(Λ)))
+    for (j, i) in enumerate(idxs)
+        (1 <= i <= size(U, 2)) || continue
+        u = U[:, i]
+        Au = G⁰ᵤᵤ_asym * u
+        out[j] = norm(Au .- Λ[i] .* u) / scale
+    end
+    return out
 end
 
 # Reading the basis h5 without ever holding the width it was saved at.
@@ -956,6 +1586,75 @@ function _bounds_front_end_dense(compute_env::ComputeEnvironment, gs_pos, basis,
             t_c_projection=t_c_projection)
 end
 
+"""
+    _bounds_front_end_augmented(compute_env, gs_pos, basis, Γ_pos_cpu, ζ,
+                                s_projector, G⁰ᵤᵤ_asym, num_pos, sender_size)
+
+The dense front end for an arbitrary orthonormal `basis` -- in production, the
+`[g_kept, U_uu]` of [`augmented_basis`](@ref). Returns everything
+[`_bounds_front_end_dense`](@ref) does, plus `W = basisᴴ gs_pos`, which is what the
+pencil stage needs to build `Bₙ` in a basis where it is no longer diagonal (see
+[`FactoredB`](@ref)).
+
+`_bounds_front_end_dense` gets `C_basis` from `basisᴴ opmat(C, basis)`, sweeping the
+whole of `C` -- `ζ⁻¹Πₛ`, `(−G⁰ᵤᵣ)ᵃ₊` and `(G⁰ᵤᵤ)ᵃ` -- through the Green operator's
+column loop. Only the last of those actually needs matvecs. The other two are
+algebra on objects already in hand, exactly as `_bounds_front_end_panel` observes
+for the pure `g` basis, and the observation survives the augmentation:
+
+    basisᴴ Πₛ basis         = Bₛᴴ Bₛ,  Bₛ = basis[1:sender_size, :]
+    basisᴴ (−G⁰ᵤᵣ)ᵃ₊ basis  = W diag(Γ) Wᴴ
+
+The panel front end can write the second one as `(basisᴴbasis) diag(Γ) (basisᴴbasis)ᴴ`
+only because its basis *is* `gs_pos`; `W` is the general form. `D = (−G⁰ᵤᵣ)ᵃ₊ −
+ζ⁻¹Πᵣ` is then exact in the basis too, since `−ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1` and
+`basisᴴbasis = 1` after the QR, so the whole τ family still comes out of one Green
+sweep -- now `m_aug` columns wide rather than `m`.
+
+The probes are the production probes: `reverse_gram_schmidt!` on `Πₛ·gs_pos`, the
+`g` columns alone. See the section comment above [`augmented_basis`](@ref) for why
+that is deliberate.
+"""
+function _bounds_front_end_augmented(compute_env::ComputeEnvironment, gs_pos, basis,
+                                     Γ_pos_cpu, ζ, s_projector, G⁰ᵤᵤ_asym,
+                                     num_pos::Int, sender_size::Int)
+    N_u = size(gs_pos, 1)
+    T = eltype(basis)
+    m_aug = size(basis, 2)
+
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Performing reverse Gram-Schmidt on the $(num_pos) g columns to construct the ss basis"
+    t_gram_schmidt = time_ns()
+    ss = similar(gs_pos, N_u, num_pos)
+    reverse_gram_schmidt!(ss, gs_pos, s_projector, num_pos)
+    t_gram_schmidt = (time_ns() - t_gram_schmidt) / 1e9
+
+    t_ss_basis = time_ns()
+    ss_basis = basis' * ss
+    t_ss_basis = (time_ns() - t_ss_basis) / 1e9
+
+    @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Projecting C into the augmented basis of size $(m_aug) (one (G⁰ᵤᵤ)ᵃ sweep; ζ⁻¹Πₛ and (−G⁰ᵤᵣ)ᵃ₊ are algebra on W)"
+    t_c_projection = time_ns()
+    W = basis' * gs_pos                                # m_aug × num_pos
+    Bₛ = view(basis, 1:sender_size, :)
+    S_basis = Bₛ' * Bₛ                                 # basisᴴ Πₛ basis, exact
+    Γdev = similar(basis, real(T), num_pos)
+    copyto!(Γdev, Γ_pos_cpu)
+    A_basis = (W .* reshape(Γdev, 1, :)) * W'          # basisᴴ (−G⁰ᵤᵣ)ᵃ₊ basis
+    Guu_basis = basis' * opmat(G⁰ᵤᵤ_asym, basis)       # basisᴴ (G⁰ᵤᵤ)ᵃ basis
+    C_basis = (1 / ζ) .* S_basis .+ A_basis .+ Guu_basis
+    # −ζ⁻¹Πᵣ = ζ⁻¹Πₛ − ζ⁻¹1, and basisᴴbasis = 1 after the QR. The identity is built
+    # as a dense block rather than through `diagind` so that this is one broadcast on
+    # the device with no scalar indexing anywhere.
+    Id = similar(basis, T, m_aug, m_aug)
+    copyto!(Id, Matrix{T}(I, m_aug, m_aug))
+    D_basis = (1 / ζ) .* S_basis .+ A_basis .- (1 / ζ) .* Id
+    t_c_projection = (time_ns() - t_c_projection) / 1e9
+
+    return (ss=ss, ss_basis=ss_basis, C_basis=C_basis, D_basis=D_basis, W=W,
+            t_gram_schmidt=t_gram_schmidt, t_ss_basis=t_ss_basis,
+            t_c_projection=t_c_projection)
+end
+
 # The panel version of the same front end (FUNICULAR_PLAN.md, workstream C1-C3).
 # Every N_u-scale object is a PanelMatrix; every m × m object is formed on the host
 # and handed to the pencil stage in the compute device's array space, exactly as
@@ -1039,6 +1738,16 @@ panel matrices, `Vur_asym` included, are freed before the pencil stage.
 - `G₀_uu`: pre-loaded universe operator, loaded here if not supplied.
 - `outer_indices`: which `n` of the outer `σₙ` loop to actually evaluate.
   `nothing` (the default) means all of them.
+- `nan_unevaluated`: leave `bounds_dual_basis` at `NaN` on the indices the loop
+  did not evaluate, instead of the `0.0` the array is allocated with. `false`
+  (the default) reproduces the pre-existing output exactly. A zero is the
+  tightest bound there is, so an unevaluated index reads as a bound of zero and
+  wins every `argmin` in `which_bounds`; that is harmless when the whole loop
+  ran and wrong when it did not. The block-parallel bounds path
+  (`--outer-range`, `bench/merge_bounds_blocks.jl`) sets this, which is what
+  makes `bounds_dual_basis`, `true_bounds` and `which_bounds` sliceable by
+  index: outside the evaluated range they are `NaN`, `NaN` and `3`, and the
+  merge takes each index from the block that owns it.
 - `on_outer_error`: `:throw` (the default) or `:stop`. With `:stop`, a failure in
   the outer loop is recorded in the returned `outer_error` and the function
   returns with `complete = false` rather than propagating. The benchmark harness
@@ -1093,7 +1802,20 @@ panel matrices, `Vur_asym` included, are freed before the pencil stage.
   to serve almost all of the refinement's `m × m` eigendecompositions from the
   cache. Each entry is an `m × m` whitener plus null space in the compute device's
   array space, so the memory is `pencil_cache_max` times that; `0` disables the
-  cache.
+  cache. Note that on the augmented path the pencils are `m_aug × m_aug`, so the
+  entries grow with `k_uu` as well; see the comment on the cache itself.
+- `k_uu`: how many leading eigenvectors of `Asym(G⁰ᵤᵤ)` to augment the projection
+  basis with, when the point qualifies (see `augment_threshold`). Defaults to
+  [`DEFAULT_K_UU`](@ref). `0` disables the augmentation and reproduces the
+  pre-augmentation output bit for bit. The section comment above
+  [`augmented_basis`](@ref) says what this repairs and why.
+- `augment_threshold`: augment only when the kept `m = num_pos` is *below* this.
+  Defaults to [`DEFAULT_AUGMENT_THRESHOLD`](@ref), so far-field points -- the ones
+  whose projected dual had stopped being a bound -- are augmented and near-field
+  ones run exactly as they did before.
+- `uu_oversamples`, `uu_power_iters`: `reigen_hermitian` parameters for the
+  `Asym(G⁰ᵤᵤ)` solve. [`plan_uu_solve`](@ref) may lower the oversamples to make the
+  sketch fit the device, and reports it when it does.
 
 # Returns
 A named tuple with the bounds, the bookkeeping needed to save them, and
@@ -1103,7 +1825,9 @@ per-index minimum over all evaluated `τ`, `opt_taus` the `τ` that achieved it
 grid-only `num_pos × length(τs)` table (`NaN` where an index/grid point was
 skipped or failed), with the grid echoed in `tau_grid`. `tau_search` counts what
 the search did over the run: refinement pencil cache hits and misses, and how many
-indices fell back to a full grid sweep.
+indices fell back to a full grid sweep. `evaluated_indices` lists the `n` the loop
+actually finished, which is `outer_indices` clipped to `1:min(basis_size, num_pos)`
+unless the loop stopped early.
 
 The basis-side objects `ss` (full-space probe vectors, `N × num_pos`),
 `ss_basis`, `C_basis` (the `τ = 1` projected constraint) and `D_basis` are also
@@ -1117,11 +1841,16 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               basis_size::Int=size(Vur_asym, 2),
                               G₀_uu=nothing,
                               outer_indices::Union{Nothing,AbstractVector{Int}}=nothing,
+                              nan_unevaluated::Bool=false,
                               on_outer_error::Symbol=:throw,
                               τs::AbstractVector{<:Real}=range(0.0, 1.0, length=5),
                               τ_refine_tol::Union{Nothing,Real}=0.05,
                               tau_window::Int=2,
-                              pencil_cache_max::Int=16)
+                              pencil_cache_max::Int=16,
+                              k_uu::Int=DEFAULT_K_UU,
+                              augment_threshold::Int=DEFAULT_AUGMENT_THRESHOLD,
+                              uu_oversamples::Int=UU_OVERSAMPLES,
+                              uu_power_iters::Int=UU_POWER_ITERS)
     on_outer_error in (:throw, :stop) ||
         throw(ArgumentError("on_outer_error must be :throw or :stop, got :$on_outer_error"))
     isempty(τs) && throw(ArgumentError("τs must contain at least one grid point"))
@@ -1198,9 +1927,121 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         "$sender_size + $receiver_size), so Πᵣ ≠ 1 − Πₛ and the τ family " *
         "cannot be assembled from the sender projector alone")
 
+    # Whether this point gets the Asym(G⁰ᵤᵤ) augmentation. Both conditions are
+    # cheap and both are logged, because "did this point augment?" is the first
+    # question anyone reading a bound will ask.
+    k_uu >= 0 || throw(ArgumentError("k_uu must be non-negative (0 disables the " *
+        "Asym(G⁰ᵤᵤ) augmentation), got $k_uu"))
+    N_u = sender_size + receiver_size
+    # The universe has N_u directions and the g basis already holds m of them, so
+    # there are at most N_u − m left to add; and the sketch `reigen_hermitian`
+    # builds is k + p wide, which cannot exceed the operator either. Both clamps
+    # only ever bind on the small test systems -- at 1 λ, N_u = 196,608 against
+    # k_uu = 512 -- but an unclamped `reigen_hermitian(A, 512)` on a 48 × 48
+    # operator is a confusing failure a long way from its cause.
+    k_uu_universe = min(k_uu, N_u - num_pos)
+    augmenting = k_uu > 0 && num_pos < augment_threshold && k_uu_universe > 0
+    if k_uu == 0
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Not augmenting: --k-uu 0"
+    elseif num_pos >= augment_threshold
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Not augmenting: the kept m = $(num_pos) is at or above --augment-threshold $(augment_threshold), so the g basis already represents the constraint and this point runs exactly as it did before --k-uu existed"
+    elseif k_uu_universe <= 0
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Not augmenting: the g basis already spans all $(N_u) directions of the universe, so there is nothing to augment it with"
+    elseif k_uu_universe < k_uu
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Clamping the augmentation to the universe: k_uu $(k_uu) → $(k_uu_universe) (N_u = $(N_u), m = $(num_pos))"
+    end
+    if augmenting && Vur_asym isa Funicular.PanelMatrix
+        error("the Asym(G⁰ᵤᵤ) augmentation was requested (--k-uu $(k_uu), kept m = " *
+              "$(num_pos) < --augment-threshold $(augment_threshold)) for a point whose " *
+              "front end is panelized. The augmented front end is dense by construction " *
+              "-- augmented_basis's Householder QR and the m_aug-wide Green sweep both " *
+              "want the whole $(N_u) × $(num_pos + k_uu_universe) block resident -- and the " *
+              "panel path exists precisely because that block does not fit, so there is " *
+              "nothing sensible to do here. `use_panel_bounds` chose the panel path " *
+              "because RSVD_PEAK_FUDGE · 3 · N_u · m · 16 = " *
+              "$(round(RSVD_PEAK_FUDGE * bounds_footprint_bytes(N_u, num_pos) / 2^30; digits=2)) " *
+              "GiB exceeds this device's budget" *
+              (use_gpu(compute_env) ?
+               " of $(round(device_budget_bytes() / 2^30; digits=2)) GiB" :
+               " (or a plan_override forced it on a CPU run)") *
+              ". With the default threshold that only happens on a card far too small for the " *
+              "point: the sizer (bench/size_bounds_jobs.jl, with the augmentation on) " *
+              "puts an augmenting point on an allocation where the dense front end " *
+              "fits. Run this point on a larger card, lower --augment-threshold below " *
+              "$(num_pos) so it is not augmented, or set --k-uu 0")
+    end
+
+    # What the card can pay for, which is a separate question from what the physics
+    # wants. `--augment-threshold` caps m and therefore caps m_aug = m + k_uu, but at
+    # the larger universes that cap is above what a dense N_u × m_aug front end fits
+    # in, so the effective k_uu comes down here rather than the job dying at its
+    # first big allocation. Only evaluated on a point that is actually going to
+    # augment: `clip_k_uu` errors when nothing useful fits, and a point that is not
+    # augmenting has nothing to refuse. See `clip_k_uu` and `max_k_uu_for_budget`.
+    uu_clip = augmenting ? clip_k_uu(compute_env, N_u, num_pos, k_uu_universe) :
+              (k_uu=k_uu_universe, requested=k_uu_universe, clipped=false, reason="",
+               k_fit=k_uu_universe, budget_bytes=0)
+    k_uu_eff = uu_clip.k_uu
+    uu_p = min(uu_oversamples, max(0, N_u - k_uu_eff))
+    augmenting && uu_p < uu_oversamples &&
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Clamping the sketch to the universe: oversamples $(uu_oversamples) → $(uu_p) (N_u = $(N_u), k_uu = $(k_uu_eff))"
+
+    # The Asym(G⁰ᵤᵤ) eigenbasis, computed here rather than read from the RSVD
+    # output: the RSVD job never wrote one (the commented-out `read_array(jld_in,
+    # "UU/U", ...)` this replaces was aspirational), and at the sizes that augment
+    # the solve is a few minutes against a bounds job that is already tens.
+    uu_plan = nothing
+    uu_values = Float64[]
+    uu_residual_idxs = Int[]
+    uu_residual_values = Float64[]
+    uu_seconds = 0.0
+    k_uu_used = 0
+    num_uu_kept = 0
+    num_uu_dropped = 0
+    dropped_cols = Int[]
+    rdiag_min_ratio = NaN
+    m_aug = RSVD_BASIS_SIZE
+
     front = if Vur_asym isa Funicular.PanelMatrix
         _bounds_front_end_panel(compute_env, Vur_asym, Γ_pos_cpu, ζ, s_projector,
                                 G⁰ᵤᵤ_asym, num_pos, RSVD_BASIS_SIZE)
+    elseif augmenting
+        RSVD_BASIS_SIZE == num_pos || error(
+            "the augmented front end assumes the g block is the whole kept positive " *
+            "block (basis_size = num_pos = $(num_pos)), got RSVD_BASIS_SIZE = " *
+            "$(RSVD_BASIS_SIZE). A truncated g block would make W = basisᴴgs_pos and " *
+            "the Bₙ factor disagree about which channels the outer loop indexes")
+        gs_pos = size(Vur_asym, 2) == num_pos ? Vur_asym : Vur_asym[:, 1:num_pos]
+        uu_plan = plan_uu_solve(compute_env, N_u, num_pos, k_uu_eff;
+                                oversamples=uu_p, power_iters=uu_power_iters)
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Augmenting the $(num_pos)-column g basis with the top $(k_uu_eff) eigenvectors of Asym(G⁰ᵤᵤ)" oversamples=uu_plan.oversamples power_iters=uu_plan.power_iters sketch_GiB=round(uu_plan.sketch_bytes / 2^30; digits=2) fudged_peak_GiB=round(uu_plan.peak_bytes / 2^30; digits=2) front_end_GiB=round(uu_plan.basis_bytes / 2^30; digits=2) budget_GiB=round(uu_plan.budget_bytes / 2^30; digits=2)
+
+        uu = uu_eigenbasis(compute_env, G⁰ᵤᵤ_asym, k_uu_eff;
+                           oversamples=uu_plan.oversamples,
+                           power_iters=uu_plan.power_iters)
+        U_uu, uu_values, uu_seconds = uu.vectors, uu.values, uu.seconds
+        k_uu_used = size(U_uu, 2)
+        k_uu_used == k_uu_eff || @warn string(now()) * " [bounds_bargaining::bounds_from_spectrum] reigen_hermitian returned $(k_uu_used) of the $(k_uu_eff) requested Asym(G⁰ᵤᵤ) components; the augmentation is that much smaller"
+        uu_residual_idxs = unique(clamp.([1, cld(k_uu_used, 4), cld(k_uu_used, 2),
+                                          k_uu_used], 1, max(k_uu_used, 1)))
+        uu_residual_values = uu_residuals(G⁰ᵤᵤ_asym, U_uu, uu_values, uu_residual_idxs)
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Asym(G⁰ᵤᵤ): Λ[1] = $(first(uu_values)), Λ[$(k_uu_used)] = $(last(uu_values)), eigenpair residuals ‖Av − λv‖/Λ₁ at $(uu_residual_idxs): $(uu_residual_values). A residual well above 1e-8 at the last index means the subspace has not converged; raise the power iterations"
+
+        aug = augmented_basis(gs_pos, U_uu)
+        num_uu_kept, num_uu_dropped = aug.num_uu_kept, aug.num_uu_dropped
+        dropped_cols, rdiag_min_ratio = aug.dropped_cols, aug.rdiag_min_ratio
+        basis = aug.basis
+        m_aug = size(basis, 2)
+        @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Augmented basis: m_aug = $(m_aug) (g: $(num_pos), U_uu kept: $(num_uu_kept), dropped: $(num_uu_dropped) $(dropped_cols), min|R|/max|R| = $(rdiag_min_ratio))"
+        # `U_uu` and the QR's working copy are N_u-tall and are done with; the front
+        # end is about to want three more matrices of that height.
+        U_uu = nothing
+        aug = nothing
+        run_gc()
+        use_gpu(compute_env) && CUDA.reclaim()
+
+        _bounds_front_end_augmented(compute_env, gs_pos, basis, Γ_pos_cpu, ζ,
+                                    s_projector, G⁰ᵤᵤ_asym, num_pos, sender_size)
     else
         # These have been sorted in descending order of the corresponding Γ values;
         # keep only the eigenvectors with positive eigenvalues. Aliased when the
@@ -1215,6 +2056,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     C_basis, D_basis = front.C_basis, front.D_basis
     t_gram_schmidt, t_ss_basis = front.t_gram_schmidt, front.t_ss_basis
     t_c_projection = front.t_c_projection
+    # `W = basisᴴgs_pos`, the one extra small matrix the augmented pencil stage
+    # needs; `nothing` on the two paths where Bₙ is diagonal.
+    W_aug = augmenting ? front.W : nothing
 
     # None of the C(τ) depend on n, so the grid pencils are eigendecomposed once
     # here; the golden-section refinement builds its off-grid pencils on demand
@@ -1244,9 +2088,28 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     # to a tolerance because the probe points are arithmetic on the same bracket
     # endpoints, so they reproduce bit for bit.
     #
-    # Each entry holds an m × m whitener plus null space in the compute device's
-    # array space: at m = 4000 complex that is ~256 MiB, so the 16-entry default is
-    # ~4 GiB, which fits alongside the rest of the working set on an A100-40.
+    # Each entry holds an m_aug × m_aug whitener plus null space in the compute
+    # device's array space, m_aug² complex between them. The two regimes:
+    #
+    #   * unaugmented, m_aug = m. At the near-field m = 4000 that is 4000² · 16 =
+    #     256 MB, so the 16-entry default is 4.1 GB, which fits alongside the rest of
+    #     the working set on an A100-40. This is the case the number was chosen for
+    #     and it is unchanged.
+    #   * augmented, m_aug = m + k_uu with m < augment_threshold = 1000 and
+    #     k_uu = 512, so m_aug < 1512 and an entry is under 37 MB: 0.59 GB for all
+    #     16. The augmentation cannot make this term the binding one, because the
+    #     threshold that lets a point augment is what caps m_aug.
+    #
+    # The worst case over both is therefore still the unaugmented m = 4000 one, by a
+    # factor of seven. Raising the threshold from 500 to 1000 raised the augmented
+    # ceiling from 1012 to 1512, which is 2.2× the bytes per entry and still an
+    # order of magnitude below the unaugmented case the 16 was chosen against.
+    #
+    # A --augment-threshold raised far past this would change that: at m = 4000 and
+    # k_uu = 512 the entries would be 4512² · 16 = 326 MB and the cache 5.2 GB. The
+    # guards for that are `clip_k_uu` and `plan_uu_solve`, which cut or refuse the
+    # tall matrices such a point would need long before the cache becomes the
+    # problem -- the tall front end at m = 4000, k_uu = 512 is 25× the cache.
     pencil_cache = Pair{Float64,Any}[] # LRU order, least recently used first
     pencil_cache_hits = 0
     pencil_cache_misses = 0
@@ -1290,6 +2153,12 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     ns = isnothing(outer_indices) ? (1:RSVD_BASIS_SIZE) :
          filter(n -> 1 <= n <= RSVD_BASIS_SIZE, outer_indices)
     complete = length(ns) == num_pos
+    # Which indices actually finished, as opposed to which were asked for: an
+    # `on_outer_error = :stop` run stops part way through `ns`. `nan_unevaluated`
+    # masks against this, and the block path writes it out as `partial/indices`, so
+    # a block that died half way cannot be merged as though it had covered its
+    # whole range.
+    evaluated = falses(num_pos)
     outer_times = Tuple{Int,Float64}[]
     outer_error = nothing
     # The windowed sweep below needs the last index evaluated and where its minimum
@@ -1302,10 +2171,23 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         t_outer = time_ns()
         @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] [$n/$(num_pos)] Computing σₙ(Pᵣₛ) bound"
 
-        @info string(now()) * " [$n/$(num_pos)] Projecting Bₙ into the basis of size $(RSVD_BASIS_SIZE)"
+        @info string(now()) * " [$n/$(num_pos)] Projecting Bₙ into the basis of size $(m_aug)"
         # B_basis_n = B_basis(n)
-        fill!(B_basis_diagonal, zero(eltype(B_basis_diagonal)))
-        B_basis_diagonal[n:RSVD_BASIS_SIZE] .= (4/ζ) .* Γ_pos_cpu[n:RSVD_BASIS_SIZE] # Bₙ is diagonal in the gs_pos basis, so no projection is needed
+        # Two representations of the same operator, picked once by `augmenting`:
+        #   * the g basis, where Bₙ is diagonal and no projection is needed at all;
+        #   * the augmented basis, where it is not, but is still the congruence
+        #     W[:, n:m] diag(4Γ[n:m]/ζ) W[:, n:m]ᴴ, which `FactoredB` holds in
+        #     factored form so the pencil never builds it.
+        B_factor = nothing
+        if augmenting
+            idx = n:num_pos
+            c_n = similar(C_basis, real(eltype(C_basis)), length(idx))
+            copyto!(c_n, sqrt.((4 / ζ) .* Γ_pos_cpu[idx]))
+            B_factor = FactoredB(W_aug[:, idx], c_n)
+        else
+            fill!(B_basis_diagonal, zero(eltype(B_basis_diagonal)))
+            B_basis_diagonal[n:RSVD_BASIS_SIZE] .= (4/ζ) .* Γ_pos_cpu[n:RSVD_BASIS_SIZE] # Bₙ is diagonal in the gs_pos basis, so no projection is needed
+        end
 
         # Solve the GEVP on each C(τ)'s numerical range and keep the tightest τ.
         # Bₙ shrinks with n (Bₙ ⪯ Bₙ₋₁, as they differ by a positive
@@ -1314,7 +2196,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         # happen per index rather than once up front. Every τ bounds σₙ(Pᵣₛ) on
         # its own, so an evaluation that fails numerically is dropped for this
         # index with a warning.
-        pencil_dual(pencil, τ) = maximum(pencil_probe_duals(pencil, B_basis_diagonal, ss_basis, n, num_pos; τ=τ).duals)
+        pencil_dual(pencil, τ) = augmenting ?
+            maximum(factored_probe_duals(pencil, B_factor, ss_basis, n, num_pos; τ=τ).duals) :
+            maximum(pencil_probe_duals(pencil, B_basis_diagonal, ss_basis, n, num_pos; τ=τ).duals)
         best_dual = Inf
         best_τ = NaN
         best_grid_idx = 0
@@ -1409,6 +2293,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         @info string(now()) * " [$n/$(num_pos)] Dual is $best_dual at τ = $best_τ, which gives a bound of $(sqrt(best_dual)) on σₙ(Pᵣₛ)"
         bounds_dual_basis[n] = sqrt(best_dual)
         opt_taus[n] = best_τ
+        evaluated[n] = true
         prev_n, prev_best_grid_idx = n, best_grid_idx
         push!(outer_times, (n, (time_ns() - t_outer) / 1e9))
      catch err
@@ -1425,6 +2310,20 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
      end
     end
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] τ search over $(length(ns)) index/indices: refinement pencil cache $(pencil_cache_hits) hit(s) / $(pencil_cache_misses) miss(es) (pencil_cache_max = $(pencil_cache_max)), $(grid_fallbacks) full-grid fallback(s) (tau_window = $(tau_window))"
+
+    # Before the analytical bounds, because `which_bounds` and `true_bounds` are
+    # `argmin`s over this array: a NaN here propagates into both (Julia's `argmin`
+    # returns the NaN's index), which is exactly what an index nobody computed
+    # should look like. A 0.0 would instead read as a perfectly tight bound.
+    if nan_unevaluated
+        masked = 0
+        for n in 1:num_pos
+            evaluated[n] && continue
+            bounds_dual_basis[n] = NaN
+            masked += 1
+        end
+        masked > 0 && @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Masking $(masked) unevaluated index/indices of $(num_pos) to NaN in bounds_dual_basis (and hence in true_bounds/which_bounds)"
+    end
 
     analytical_bounds_old_form(κ) = ifelse(κ >= one(eltype(κ)), one(eltype(κ)), sqrt(4κ)/(1+κ))
     analytical_bounds_new_form(κ̃) = ifelse(2κ̃ >= one(eltype(κ̃)), one(eltype(κ̃)), sqrt(4κ̃*abs(1-κ̃)))
@@ -1464,6 +2363,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     @info string(now()) * " [bounds_bargaining::bounds_from_spectrum] Stage times [s]:" stage_times
 
     return (num_pos=num_pos, complete=complete, outer_error=outer_error,
+            evaluated_indices=findall(evaluated),
             bounds_dual_basis=bounds_dual_basis,
             tau_grid=collect(Float64, τs), opt_taus=opt_taus,
             bounds_dual_by_tau=bounds_dual_by_tau,
@@ -1475,13 +2375,112 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             tau_search=(pencil_cache_hits=pencil_cache_hits,
                         pencil_cache_misses=pencil_cache_misses,
                         grid_fallbacks=grid_fallbacks),
+            # What the augmentation did, so a plot can tell an augmented point from a
+            # plain one and a rerun can tell whether `plan_uu_solve` had to cut the
+            # oversamples. `augmented = false` leaves every other field at its
+            # do-nothing value, which is what a pre-augmentation run reports.
+            augmentation=(augmented=augmenting, k_uu_requested=k_uu,
+                          k_uu_effective=k_uu_eff,
+                          # What the card, as opposed to the universe, took off the
+                          # request. `k_uu_effective` is already the clipped value;
+                          # these two say whether the clip is why, so that a point
+                          # whose bound was computed at a smaller k_uu than the rest
+                          # of the sweep is identifiable from its output alone.
+                          k_uu_clipped=uu_clip.clipped,
+                          k_uu_clip_reason=uu_clip.reason,
+                          k_uu_budget_bytes=uu_clip.budget_bytes,
+                          k_uu_returned=k_uu_used, augment_threshold=augment_threshold,
+                          m_aug=m_aug, num_uu_kept=num_uu_kept,
+                          num_uu_dropped=num_uu_dropped, dropped_cols=dropped_cols,
+                          rdiag_min_ratio=rdiag_min_ratio,
+                          uu_oversamples=(uu_plan === nothing ? uu_oversamples : uu_plan.oversamples),
+                          uu_power_iters=(uu_plan === nothing ? uu_power_iters : uu_plan.power_iters),
+                          uu_seconds=uu_seconds, uu_values=uu_values,
+                          uu_residual_idxs=uu_residual_idxs,
+                          uu_residuals=uu_residual_values),
             stage_times=stage_times, outer_times=outer_times)
 end
 
+"""
+    partial_bounds_path(project_dir, prefix, tag) -> String
+
+Where a `--partial-suffix <tag>` run writes, and how
+[`bench/merge_bounds_blocks.jl`](../bench/merge_bounds_blocks.jl) finds those
+files again. One definition, used by the writer and the reader, so the two
+cannot drift: `<prefix>_partial_<tag>.jld` beside the final `<prefix>.jld` in
+the project directory.
+
+A tag is restricted to word characters, `-` and `.`, so that it cannot smuggle a
+path separator into the filename and so that the reader's pattern can recover it
+unambiguously from a name that already contains `_`.
+"""
+partial_bounds_path(dir::AbstractString, prefix::AbstractString, tag::AbstractString) =
+    joinpath(dir, "$(prefix)_partial_$(_check_partial_tag(tag)).jld")
+
+const PARTIAL_TAG_PATTERN = r"^[A-Za-z0-9._-]+$"
+
+function _check_partial_tag(tag::AbstractString)
+    occursin(PARTIAL_TAG_PATTERN, tag) || throw(ArgumentError(
+        "a --partial-suffix tag must match $(PARTIAL_TAG_PATTERN) (word characters, " *
+        "'.', '-'), got '$(tag)'. The tag becomes part of a filename and is parsed " *
+        "back out of it by bench/merge_bounds_blocks.jl"))
+    return tag
+end
+
+"""
+    _compute_bounds_sr(compute_env, smr, rsvd_params; kwargs...)
+
+The bounds stage of one SR point: read the RSVD's spectrum off scratch, run
+[`bounds_from_spectrum`](@ref), write `<prefix>.jld` into the project directory.
+
+# Block-parallel keyword arguments
+
+`outer_range` and `partial_suffix` split the run across independent jobs. The
+outer loop over channel indices is embarrassingly parallel -- index `n`'s bound
+depends on nothing computed at any other `n` -- so a job can be given a slice of
+it and B such jobs can run concurrently. On a queue where short jobs backfill
+quickly this turns one 8-hour job into B jobs of an hour that start at once.
+
+- `outer_range`: evaluate only these channel indices. The *whole* front end still
+  runs (the Gram-Schmidt, the projections, the `Asym(G⁰ᵤᵤ)` augmentation if the
+  point qualifies), because every index needs it; that duplicated work is the
+  price of the split, and it is minutes against a loop of hours. The saved arrays
+  carry `NaN` outside the range (see `nan_unevaluated` in
+  [`bounds_from_spectrum`](@ref)).
+- `partial_suffix`: write to `<prefix>_partial_<tag>.jld` instead of
+  `<prefix>.jld`, so the blocks do not overwrite each other and so nothing
+  downstream mistakes a slice for a finished point. `bench/merge_bounds_blocks.jl`
+  assembles the final file from them.
+
+Passing neither reproduces the previous behaviour exactly, down to the file's key
+set: the `partial/` group is written only by a partial run.
+"""
 function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams;
                             gamma_rtol::Float64=DEFAULT_GAMMA_RTOL,
+                            k_uu::Int=DEFAULT_K_UU,
+                            augment_threshold::Int=DEFAULT_AUGMENT_THRESHOLD,
+                            outer_range::Union{Nothing,UnitRange{Int}}=nothing,
+                            partial_suffix::Union{Nothing,AbstractString}=nothing,
                             plan_override=nothing, panel_mode::Union{Nothing,Bool}=nothing)
     @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Computing bounds for SR system"
+    partial = !isnothing(outer_range) || !isnothing(partial_suffix)
+    if partial
+        isnothing(outer_range) && error(
+            "--partial-suffix was given without --outer-range. A partial file that " *
+            "covers every index is a finished point under a name nothing reads; if " *
+            "that is what you want, drop --partial-suffix")
+        isnothing(partial_suffix) && error(
+            "--outer-range was given without --partial-suffix. Writing a block's " *
+            "slice to the point's final <prefix>.jld would leave a file that looks " *
+            "finished and is mostly NaN, and the next block would overwrite it")
+        isempty(outer_range) && error("--outer-range $(outer_range) is empty")
+        first(outer_range) >= 1 || error(
+            "--outer-range $(outer_range) starts below 1; channel indices are 1-based")
+        # Up here rather than at the first use, which is after `load_bounds_inputs`:
+        # a mistyped tag should cost a second, not the minutes it takes to stage the
+        # basis off scratch.
+        _check_partial_tag(partial_suffix)
+    end
 
     inputs = load_bounds_inputs(compute_env, smr; gamma_rtol=gamma_rtol,
                                 plan_override=plan_override, panel_mode=panel_mode)
@@ -1489,14 +2488,37 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
 
     # Written up front (truncating any previous run's file) so that the ordering
     # is on disk even if the bounds loop below is cut short by a time limit.
-    jld_out_path = joinpath(project_dir(compute_env), "$(file_prefix(smr)).jld")
+    jld_out_path = partial ?
+        partial_bounds_path(project_dir(compute_env), file_prefix(smr), partial_suffix) :
+        joinpath(project_dir(compute_env), "$(file_prefix(smr)).jld")
+    partial && @info string(now()) * " [bounds_bargaining::_compute_bounds_sr] Partial run: channel indices $(outer_range) of the kept m = $(inputs.num_pos), writing $(basename(jld_out_path))"
     jld_out = jldopen(jld_out_path, "w")
     jld_out["Γrs"] = Array(Γrs)
     jld_out["ordering_idxs"] = sorted_idxs
     close(jld_out)
 
-    result = bounds_from_spectrum(compute_env, smr, Γ, Vur_asym, Γrs; num_pos=inputs.num_pos)
-    result.complete || error("bounds_from_spectrum returned an incomplete result; refusing to save partial bounds")
+    result = bounds_from_spectrum(compute_env, smr, Γ, Vur_asym, Γrs; num_pos=inputs.num_pos,
+                                  k_uu=k_uu, augment_threshold=augment_threshold,
+                                  outer_indices=isnothing(outer_range) ? nothing :
+                                                collect(outer_range),
+                                  nan_unevaluated=partial)
+    if partial
+        # `complete` is false by construction here (it asks whether the loop covered
+        # every index), so the check that matters instead is that this block covered
+        # everything *it* was asked for. `outer_range` may legitimately hang off the
+        # end of the spectrum: it was sliced from the m the sizer measured, and a
+        # rerun of the RSVD can move that m by a few counts.
+        wanted = intersect(outer_range, 1:inputs.num_pos)
+        done = result.evaluated_indices
+        isnothing(result.outer_error) && length(done) == length(wanted) || error(
+            "block $(outer_range) evaluated $(length(done)) of the $(length(wanted)) " *
+            "index/indices it was asked for" *
+            (isnothing(result.outer_error) ? "" : "; the loop stopped at n = $(result.outer_error.n): $(result.outer_error.exception)") *
+            ". Refusing to save a block that would merge as though it were whole")
+        isempty(wanted) && @warn string(now()) * " [bounds_bargaining::_compute_bounds_sr] --outer-range $(outer_range) lies entirely past the kept m = $(inputs.num_pos), so this block evaluated nothing. Its file is still written, so a merge that has coverage from the other blocks succeeds; if the m moved a lot, resize the blocks"
+    else
+        result.complete || error("bounds_from_spectrum returned an incomplete result; refusing to save partial bounds")
+    end
 
     # Save data to disk
     jld_out = jldopen(jld_out_path, "a")
@@ -1533,12 +2555,77 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsv
     if !haskey(jld_out, "which_bounds")
         jld_out["which_bounds"] = result.which_bounds
     end
+    #=
+    What the Asym(G⁰ᵤᵤ) augmentation did on this point. The existing keys are
+    untouched and keep their meanings -- `bounds_dual_basis` is still the
+    per-channel dual, now computed in the richer basis -- so a plot that knows
+    nothing about this group reads the file exactly as before. What the group adds
+    is the ability to tell an augmented point from a plain one, which matters
+    because the two are not comparable: a sweep replotted mid-migration would
+    otherwise show a step at `augment_threshold` with nothing in the file to explain
+    it.
+
+    `augment/augmented` is the one key a plot needs; the rest is provenance.
+    `uu_residuals` is the evidence that `uu_power_iters` was high enough for the
+    augmentation to be an eigenbasis rather than an arbitrary spanning set, and
+    `uu_oversamples` records what `plan_uu_solve` settled on, which is not
+    necessarily what was asked for.
+
+    `k_uu_clipped` / `k_uu_clip_reason` / `k_uu_budget_bytes` are the second thing
+    that can make two augmented points incomparable, after `augmented` itself:
+    `clip_k_uu` reduces the effective `k_uu` on a point whose dense augmented front
+    end would not fit the card it landed on, so a sweep run across a mix of MIG
+    slices and whole cards can carry two different `k_uu` without anything else in
+    the file saying so. The reason is `""` when nothing was clipped.
+    =#
+    aug = result.augmentation
+    if !haskey(jld_out, "augment/augmented")
+        jld_out["augment/augmented"] = aug.augmented
+        jld_out["augment/k_uu_requested"] = aug.k_uu_requested
+        jld_out["augment/k_uu_effective"] = aug.k_uu_effective
+        jld_out["augment/k_uu_clipped"] = aug.k_uu_clipped
+        jld_out["augment/k_uu_clip_reason"] = aug.k_uu_clip_reason
+        jld_out["augment/k_uu_budget_bytes"] = aug.k_uu_budget_bytes
+        jld_out["augment/k_uu_returned"] = aug.k_uu_returned
+        jld_out["augment/augment_threshold"] = aug.augment_threshold
+        jld_out["augment/m"] = result.num_pos
+        jld_out["augment/m_aug"] = aug.m_aug
+        jld_out["augment/num_uu_kept"] = aug.num_uu_kept
+        jld_out["augment/num_uu_dropped"] = aug.num_uu_dropped
+        jld_out["augment/dropped_cols"] = aug.dropped_cols
+        jld_out["augment/rdiag_min_ratio"] = aug.rdiag_min_ratio
+        jld_out["augment/uu_oversamples"] = aug.uu_oversamples
+        jld_out["augment/uu_power_iters"] = aug.uu_power_iters
+        jld_out["augment/uu_seconds"] = aug.uu_seconds
+        jld_out["augment/uu_values"] = aug.uu_values
+        jld_out["augment/uu_residual_idxs"] = aug.uu_residual_idxs
+        jld_out["augment/uu_residuals"] = aug.uu_residuals
+    end
+    #=
+    What this file is a slice of. Written only by a partial run, so a normal run's
+    key set is bit for bit what it always was, and its presence is how
+    bench/merge_bounds_blocks.jl tells a block apart from a finished point.
+
+    `indices` rather than just the range because it is the ground truth the merge
+    needs: it is what the loop *finished*, already clipped to the kept m, so a
+    merge can check coverage of 1:m by set union without re-deriving anything.
+    `range_lo`/`range_hi` are the range as requested, kept for the log and for the
+    error message when a block is missing.
+    =#
+    if partial && !haskey(jld_out, "partial/indices")
+        jld_out["partial/indices"] = result.evaluated_indices
+        jld_out["partial/range_lo"] = first(outer_range)
+        jld_out["partial/range_hi"] = last(outer_range)
+        jld_out["partial/tag"] = String(partial_suffix)
+        jld_out["partial/num_pos"] = result.num_pos
+    end
     close(jld_out)
     return result
 end
 
 function compute_bounds()
-    compute_env, smr, rsvd_params, gamma_rtol = parse_args()
+    compute_env, smr, rsvd_params, gamma_rtol, k_uu, augment_threshold,
+        outer_range, partial_suffix = parse_args()
 
     if use_gpu(compute_env)
         @info string(now()) * " [bounds_bargaining::compute_bounds] Using GPU acceleration on device $(gpu_device(compute_env))"
@@ -1550,8 +2637,13 @@ function compute_bounds()
     end
 
     if isnothing(mediator(smr))
-        _compute_bounds_sr(compute_env, smr, rsvd_params; gamma_rtol=gamma_rtol)
+        _compute_bounds_sr(compute_env, smr, rsvd_params; gamma_rtol=gamma_rtol,
+                           k_uu=k_uu, augment_threshold=augment_threshold,
+                           outer_range=outer_range, partial_suffix=partial_suffix)
     else
+        isnothing(outer_range) && isnothing(partial_suffix) || error(
+            "--outer-range/--partial-suffix are only implemented for the SR path; " *
+            "the SMR bounds stage is a stub (_compute_bounds_smr)")
         _compute_bounds_smr(compute_env, smr, rsvd_params)
     end
 end

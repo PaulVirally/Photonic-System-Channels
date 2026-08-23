@@ -46,6 +46,30 @@ parse_rational_3tuple(s::AbstractString) = parse_3tuple(s, x -> parse(Rational, 
 ArgParse.parse_item(::Type{NTuple{3, Int}}, s::AbstractString) = parse_int_3tuple(s)
 ArgParse.parse_item(::Type{NTuple{3, Rational{Int}}}, s::AbstractString) = parse_rational_3tuple(s)
 
+"""
+    parse_index_range(s) -> UnitRange{Int}
+
+`--outer-range lo:hi`, the slice of the bounds job's outer loop over channel
+indices this process is responsible for. Inclusive at both ends, 1-based, and the
+same convention Julia's own `lo:hi` has, because that is what the flag's value is
+read back as everywhere downstream. A bare `n` is `n:n`, which is mostly useful
+for a one-index reproduction of a suspicious channel.
+"""
+function parse_index_range(s::AbstractString)
+    parts = split(strip(s), ':')
+    lo, hi = if length(parts) == 1
+        v = parse(Int, strip(parts[1])); (v, v)
+    elseif length(parts) == 2
+        (parse(Int, strip(parts[1])), parse(Int, strip(parts[2])))
+    else
+        error("Invalid index range '$s', expected lo:hi")
+    end
+    lo >= 1 || error("Invalid index range '$s': channel indices are 1-based, got lo = $lo")
+    hi >= lo || error("Invalid index range '$s': hi < lo, which selects no index at all")
+    return lo:hi
+end
+ArgParse.parse_item(::Type{UnitRange{Int}}, s::AbstractString) = parse_index_range(s)
+
 function _default_preload_dir()
     path = joinpath("/Users", ENV["USER"], "Desktop", "preload")
     if haskey(ENV, "MOLERING")
@@ -181,6 +205,24 @@ function ArgParse.parse_args()
             help = "Relative cut on the positive Asym(G⁰ᵤᵣ) spectrum for the bounds: keep only Γ ≥ gamma-rtol * Γ₁ (0 keeps the whole positive block)"
             arg_type = Float64
             default = DEFAULT_GAMMA_RTOL
+
+        "--k-uu"
+            help = "How many leading eigenvectors of Asym(G⁰ᵤᵤ) to augment the bounds' projection basis with, on points below --augment-threshold. 0 disables the augmentation and reproduces the pre-augmentation output bit for bit"
+            arg_type = Int
+            default = DEFAULT_K_UU
+
+        "--augment-threshold"
+            help = "Augment only when the kept m = num_pos is below this. Far-field points, whose g basis is too small to represent Asym(G⁰ᵤᵤ) and whose dual therefore under-reports, are augmented; near-field points run exactly as they did before --k-uu existed. Raising it widens the augmented half of a sweep and raises the ceiling on m_aug = m + k_uu, which clip_k_uu then trims back on any point whose dense front end would not fit the card"
+            arg_type = Int
+            default = DEFAULT_AUGMENT_THRESHOLD
+
+        "--outer-range"
+            help = "Bounds only: compute the outer loop over channel indices lo:hi instead of all of them, so that one long bounds job can be split across B independent short ones that backfill concurrently. The full front end still runs in each; only the loop is sliced. Requires --partial-suffix, and the blocks are assembled by bench/merge_bounds_blocks.jl"
+            arg_type = UnitRange{Int}
+
+        "--partial-suffix"
+            help = "Bounds only: write the output as <prefix>_partial_<tag>.jld in the project directory instead of <prefix>.jld. Goes with --outer-range: it keeps the blocks of one point from overwriting each other, and keeps anything reading the project directory from mistaking a slice for a finished point"
+            arg_type = String
     end
     args = parse_args(settings)
 
@@ -253,7 +295,26 @@ function ArgParse.parse_args()
     gamma_rtol = args["gamma-rtol"]
     @info string(now()) * " [common::parse_args] Using gamma_rtol = $(gamma_rtol) for the bounds' spectral cut"
 
-    return compute_env, smr, rsvd_params, gamma_rtol
+    # Same story as `gamma_rtol`: the Asym(G⁰ᵤᵤ) augmentation belongs to the bounds
+    # stage, so these ride alongside `RSVDParams` rather than going into it, and the
+    # RSVD and greens entry points let them fall off the end of the tuple.
+    k_uu = args["k-uu"]
+    augment_threshold = args["augment-threshold"]
+    @info string(now()) * " [common::parse_args] Using k_uu = $(k_uu) and augment_threshold = $(augment_threshold) for the bounds' Asym(G⁰ᵤᵤ) augmentation"
+
+    # Same story again: the block split belongs to the bounds stage alone, so it
+    # rides on the end of the tuple and every other entry point lets it fall off.
+    # Both are `nothing` unless asked for, and `_compute_bounds_sr` refuses one
+    # without the other -- a block that writes to the point's real filename, or one
+    # that writes every index under a partial name, are both worse than an error.
+    outer_range = get(args, "outer-range", nothing)
+    partial_suffix = get(args, "partial-suffix", nothing)
+    if !isnothing(outer_range) || !isnothing(partial_suffix)
+        @info string(now()) * " [common::parse_args] Partial bounds run: outer_range = $(outer_range), partial_suffix = $(partial_suffix)"
+    end
+
+    return compute_env, smr, rsvd_params, gamma_rtol, k_uu, augment_threshold,
+           outer_range, partial_suffix
 end
 
 """
