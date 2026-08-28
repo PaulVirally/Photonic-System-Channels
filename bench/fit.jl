@@ -365,6 +365,15 @@ production sizes. On the partial fir data that single `matvec_self` point implie
 1.9 s per matvec at 96x32x32, i.e. a 27-hour RSVD estimate, versus 27 ms from
 narval's four-point fit. A silently absurd number in the requests is worse than a
 loudly missing one.
+
+A row measured on a refined mesh is skipped. Its job timed a composite operator,
+which is a loop over region-pair blocks, and `block_M` is the circulant of the
+whole body -- an `M log M` that job never ran. Pooling one here would drag
+`mv_*_fft` toward a regressor that does not describe it, and the composite's own
+surcharge has its own coefficient (`mv_composite_scale`), fitted from the same
+rows against `rs_apply_work` / `rr_apply_work`. A row at a separation too wide to
+refine is a plain single-block matvec whatever `--refine` the job carried, so the
+test is `is_refined` and not the `refine` extra.
 """
 const MIN_MATVEC_POINTS = 3
 
@@ -374,6 +383,8 @@ function fit_matvec(rows::Vector{Row}, kind::AbstractString)
     sizes = Set{Int}()
     for row in rows
         row["kind"] == kind || continue
+        pt = row_to_srpoint(row)
+        (pt !== nothing && CostModel.is_refined(pt)) && continue
         M = block_M(row)
         t = num(row, "time_s")
         (M === nothing || t === nothing || t <= 0) && continue

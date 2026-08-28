@@ -1461,13 +1461,18 @@ because three of its facts have nowhere else to go: which allocation the point
 names (the trials compare allocations, so 0/1 cannot say it), which point must
 finish first (the Green functions and the E4 chain), and what the cost model
 predicts, which is the number the trial is judged against. The extension is
-additive and only on this tier, so anything reading the older manifests keeps
+additive and only on these tiers, so anything reading the older manifests keeps
 working.
+
+`backfill` and `refined` take the wide schema for the same reason. Both chain
+points -- a device point there reads what a host point wrote -- and both are read
+by a human deciding whether the queue cost is worth it, which is a question the
+prediction columns answer and the limit column does not.
 """
 function write_manifest(path::AbstractString, cluster::ClusterSpec,
                        points::Vector{PlannedPoint}, tier::Symbol)
     open(path, "w") do io
-        if tier in (:funicular, :backfill)
+        if tier in (:funicular, :backfill, :refined)
             println(io, "label,kind,threads,host_GB,time_limit_s,gpu,gpu_request," *
                         "depends_on,predicted_wall_s,predicted_gpu_h,args")
             for p in points
