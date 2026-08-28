@@ -33,8 +33,9 @@ reading the code and the primitive costs are the only fitted quantities:
     Hermitian eigendecomposition on the *device* (CUSOLVER heevd), on top of
     an `O(m^2 * evals)` probe loop -- a device gemv, a device-to-host
     transfer, and a host Brent root find per probe -- an `O(m^2)` reverse
-    Gram-Schmidt over length-`N_u` vectors, and `4m` self plus `4m` external
-    Green matvecs.
+    Gram-Schmidt over length-`N_u` vectors, and, per universe apply, `2m` self
+    plus `2m` external Green matvecs (doubled on an unrefined point, where
+    `Asym(G⁰ᵤᵤ)` has no folded form; see `UU_ASYM_APPLIES`).
 
 # Three storage paths
 
@@ -59,12 +60,20 @@ changes the model itself rather than only its constants:
 the same predicate the runtime uses (`uses_dense_path`, then `uses_panel_path`),
 so a prediction and the job it sizes agree on which code will run.
 
-Sizes are always driven by the cell count of **one body**. The separation
-between the bodies changes nothing about the cost except at contact. In
-particular, `union(sender, receiver)` -- the bounding box that includes the gap
--- must never appear in a cost estimate: no operator is ever built on it. (The
-previous estimator used it, which is why a 10000-wavelength separation asked
-for terabytes.)
+Sizes are always driven by the cell count of **one body**. In particular,
+`union(sender, receiver)`, the bounding box that includes the gap, must never
+appear in a cost estimate: no operator is ever built on it. (The previous
+estimator used it, which is why a 10000-wavelength separation asked for
+terabytes.)
+
+The separation changes nothing about the cost except at its two ends. At contact
+the external blocks take the contact quadrature. Under six coarse cells of gap a
+job run with `--refine` refines the two facing surfaces (`src/refinement.jl`),
+which makes each body a tiling rather than a cuboid, every Green operator a block
+matrix over region pairs, and `N_u` larger (by 4.75x at the nearest gap of the
+1/4 lambda sweep). That is on by default on both sides, so a point predicts the
+refined meshes unless `refine_gap = false` says otherwise, matching a job run with
+`--no-refine`. See the gap-refinement section.
 
 # Units
 
@@ -81,11 +90,21 @@ export greens_counts, rsvd_counts, bounds_counts
 export rsvd_panel_counts, rsvd_dense_counts, bounds_panel_counts
 export uses_panel_path, uses_dense_path, rsvd_mode, bounds_mode
 export TauShape, TAU_SHAPE_LEGACY, tau_shape, tau_evals_per_index, bounds_m
+export bounds_time_s, outer_indices_swept, probe_count
 export BOUNDS_M_REF_SEP, rsvd_time_parts
+export bounds_augment, with_augmentation, AugmentShape, AUGMENT_OFF
+export augment_k_uu_cap, augment_budget_bytes, BOUNDS_K_UU_CLIP_FLOOR
+export BOUNDS_K_UU_DEFAULT, BOUNDS_AUGMENT_THRESHOLD_DEFAULT
+export BOUNDS_UU_OVERSAMPLES, BOUNDS_UU_POWER_ITERS
 export panel_width, panel_staging_bytes
 export n_cells, vector_length, universe_length, sketch_width, is_contact
 export self_fourier_bytes, ext_fourier_bytes, block_build_peak_bytes
 export circulant_cells, fft_work
+export MIN_GAP_CELLS, GAP_REFINEMENT_TABLE, GapRefinement, gap_refinement
+export refinement_of, is_refined, MeshRegion, body_regions, point_meshes
+export GreenBlock, region_block, composite_blocks, green_operators
+export sender_length, receiver_length, REFINED_ASYM_SELF_APPLIES
+export ext_operator_bytes, self_operator_bytes, universe_operator_bytes
 
 # --------------------------------------------------------------------------- #
 # Points and jobs
@@ -113,6 +132,10 @@ its cost.
   `NUM_POS_FRACTION`; it is only known after the RSVD has run.
 - `fresh_preload`: whether the shared `self/` Green function still has to be
   built (true on a cold preload directory).
+- `refine_gap`: whether the job refines the two facing surfaces at a near gap,
+  mirroring `SMRSystem`'s keyword of the same name. `true`, the default, is what a
+  production job does and predicts the refined meshes; `false` is `--no-refine`
+  and predicts the plain cuboid ones.
 """
 struct SRPoint
     sender_cells::NTuple{3,Int}
@@ -125,6 +148,7 @@ struct SRPoint
     threads::Int
     num_pos::Union{Nothing,Int}
     fresh_preload::Bool
+    refine_gap::Bool
 end
 
 function SRPoint(sender_cells::NTuple{3,Int}, receiver_cells::NTuple{3,Int};
@@ -132,10 +156,11 @@ function SRPoint(sender_cells::NTuple{3,Int}, receiver_cells::NTuple{3,Int};
                  separation::Rational{Int}=0//1,
                  rank::Int=256, oversamples::Int=50, power_iters::Int=14,
                  threads::Int=4, num_pos::Union{Nothing,Int}=nothing,
-                 fresh_preload::Bool=true)
+                 fresh_preload::Bool=true, refine_gap::Bool=true)
     scl = scale isa Rational ? (scale, scale, scale) : scale
     return SRPoint(sender_cells, receiver_cells, scl, separation, rank,
-                   oversamples, power_iters, threads, num_pos, fresh_preload)
+                   oversamples, power_iters, threads, num_pos, fresh_preload,
+                   refine_gap)
 end
 
 """
@@ -234,6 +259,155 @@ kept count is largest and the model is anchored rather than extrapolated.
 const BOUNDS_M_REF_SEP = 1 // 32
 
 """
+    BOUNDS_K_UU_DEFAULT, BOUNDS_AUGMENT_THRESHOLD_DEFAULT
+    BOUNDS_UU_OVERSAMPLES, BOUNDS_UU_POWER_ITERS
+
+The `Asym(G⁰ᵤᵤ)` augmentation's production defaults, mirrored from `DEFAULT_K_UU`,
+`DEFAULT_AUGMENT_THRESHOLD`, `UU_OVERSAMPLES` and `UU_POWER_ITERS` in
+`src/bounds.jl`. Duplicated rather than imported for the same reason
+`bench/size_bounds_jobs.jl` duplicates `_gamma_kept_count`: the cost model has to
+start in a second on a login node without loading CUDA. If the defaults there
+change, change them here.
+
+Note that these are the values a job *runs* at; whether the model *charges* for
+them is `bounds_augment_mode`, which is `"off"` unless a caller turns it on. That
+split is what keeps every prediction made before the augmentation existed
+byte-identical.
+"""
+const BOUNDS_K_UU_DEFAULT = 512
+const BOUNDS_AUGMENT_THRESHOLD_DEFAULT = 1000
+const BOUNDS_UU_OVERSAMPLES = 50
+const BOUNDS_UU_POWER_ITERS = 4
+
+"""
+    BOUNDS_K_UU_CLIP_FLOOR, BOUNDS_UU_MIN_OVERSAMPLES
+    GILA_N_TEMPORARIES, CUFFT_WORKSPACE_BYTES
+
+The rest of the augmentation's runtime constants, mirrored from `K_UU_CLIP_FLOOR`
+and `UU_MIN_OVERSAMPLES` in `src/bounds.jl` and `GILA_N_TEMPORARIES` /
+`CUFFT_WORKSPACE_BYTES` in `src/rsvd.jl`, and duplicated for the same reason the
+four above are. They exist here only to feed `augment_k_uu_cap`, which has to
+reach the same clipped `k_uu` the job will.
+"""
+const BOUNDS_K_UU_CLIP_FLOOR = 64
+const BOUNDS_UU_MIN_OVERSAMPLES = 10
+const GILA_N_TEMPORARIES = 6
+const CUFFT_WORKSPACE_BYTES = 512 * 2^20
+
+"""
+    gila_workspace_bytes(N_u) -> Int
+
+`gila_workspace_bytes` from `src/rsvd.jl`: the Green composition's per-apply
+`N_u`-vector temporaries plus Gila's CUFFT plan work areas. Held back from the
+device budget everywhere the runtime plans against it, and therefore held back
+here too.
+"""
+gila_workspace_bytes(N_u::Integer) =
+    GILA_N_TEMPORARIES * Int(N_u) * BYTES_PER_COMPLEX + CUFFT_WORKSPACE_BYTES
+
+"""
+    augment_budget_bytes(N_u, vram_capacity_bytes) -> Float64
+
+The device budget `clip_k_uu` clips against, from a card capacity:
+`PANEL_PATH_DEVICE_FRACTION` of the card, less `gila_workspace_bytes`. Exactly
+`device_budget_bytes() - gila_workspace_bytes(N_u)` in `src/bounds.jl`, with the
+named capacity standing in for `CUDA.total_memory()`.
+
+The one thing that does *not* line up, and cannot: the ladders in
+`create_jobs.jl` and `bench/size_bounds_jobs.jl` name a card by its marketing
+capacity (`40` for an A100-40), while `CUDA.total_memory()` reports the 42.5 GB it
+really has. So this budget is about 6% under the runtime's and the clip here is
+correspondingly a little more aggressive. That is the same nominal-versus-reported
+gap `uses_panel_path` already lives with, and the direction is the tolerable one:
+the sizer can predict a smaller `m_aug` than the job ends up using, which the
+`--time-margin` covers, whereas a sizer that predicted a *larger* `k_uu` than the
+card can hold would be sizing a job that cannot run. The invariant that is exact,
+and that `test/augmented_basis.jl` checks, is that `augment_k_uu_cap` and
+`max_k_uu_for_budget` return the same `k` for the same `(N_u, m, budget)`.
+"""
+augment_budget_bytes(N_u::Integer, vram_capacity_bytes::Real) =
+    PANEL_PATH_DEVICE_FRACTION * vram_capacity_bytes - gila_workspace_bytes(N_u)
+
+"""
+    augment_k_uu_cap(N_u, m, budget_bytes) -> Int
+
+`max_k_uu_for_budget` from `src/bounds.jl`, line for line: the largest `k_uu`
+whose augmented front end, augmentation QR and fudged `Asym(G⁰ᵤᵤ)` sketch all fit
+`budget_bytes`. See that function for what the three terms are and why the sketch
+is measured at the minimum oversamples. If it changes, change this.
+"""
+function augment_k_uu_cap(N_u::Integer, m::Integer, budget_bytes::Real)
+    column_bytes = Int(N_u) * BYTES_PER_COMPLEX
+    columns = floor(Int, budget_bytes / column_bytes)
+    k_front = fld(columns - 3 * Int(m), 2)
+    k_qr = fld(columns - Int(m), 3)
+    k_sketch = floor(Int, columns / (3 * PANEL_PATH_FLOOR_FACTOR)) -
+               BOUNDS_UU_MIN_OVERSAMPLES
+    return min(k_front, k_qr, k_sketch)
+end
+
+"""
+    AugmentShape
+
+What the `Asym(G⁰ᵤᵤ)` augmentation costs on one point: whether it happens at all,
+how many directions it adds, and the resulting pencil dimension.
+
+# Fields
+- `augmented::Bool`: Whether this point augments at all. `false` is the whole
+  struct's off switch, and every count that reads it is then zero
+- `k_uu::Int`: Directions of `Asym(G⁰ᵤᵤ)` the basis is actually augmented by,
+  after every clamp. Zero when `augmented` is false
+- `m_aug::Int`: Width of the pencil stage, `m + k_uu` augmented and `m` not
+- `oversamples::Int`, `power_iters::Int`: The `reigen_hermitian` sketch's width
+  above `k_uu` and its power iteration count, mirrored from `BOUNDS_UU_*`
+- `k_uu_requested::Int`: The `k_uu` the caller asked for, before any clamp
+- `clip::Symbol`: Which clamp bound, one of the four below
+
+`m_aug` is the width every `m × m` object in the bounds job becomes, and it is the
+one number that matters most: the pencil stage is `O(m · evals · m_aug³)`, so a
+far-field point that keeps `m = 15` and augments to `m_aug = 527` does not get 35×
+more expensive (the outer loop is still 15 indices) but each of those indices now
+solves a 527-dimensional generalized eigenproblem instead of a 15-dimensional one.
+
+`AUGMENT_OFF` is what every point gets under `bounds_augment_mode = "off"`, and
+its `m_aug == m` makes every count in `bounds_counts` collapse, term for term, to
+the expression it had before this existed.
+
+`k_uu_requested` and `clip` are what the card did to the request, so that a caller
+sizing a job can tell the four outcomes apart:
+
+  * `:none`: `k_uu == k_uu_requested`, the job runs the augmentation it was asked
+    for;
+  * `:universe`: clamped to the `N_u − m` directions that exist, which only binds
+    on the test fixtures;
+  * `:budget`: `clip_k_uu` in `src/bounds.jl` will cut `k_uu` on this card. The
+    counts here are for the *clipped* job, which is the one that will run;
+  * `:infeasible`: not even `BOUNDS_K_UU_CLIP_FLOOR` fits and the job will refuse
+    to start. The shape is still filled in at the floor, so a request built from it
+    is an upper bound on anything that could have run, but a caller choosing a card
+    should treat this as "does not fit" and try a larger one, which is what
+    `bench/size_bounds_jobs.jl`'s `select_gpu` does.
+"""
+struct AugmentShape
+    augmented::Bool
+    k_uu::Int
+    m_aug::Int
+    oversamples::Int
+    power_iters::Int
+    k_uu_requested::Int
+    clip::Symbol
+end
+
+# Five-argument form, for the callers that predate the clip: nothing was asked for
+# beyond what was granted, and nothing was taken away.
+AugmentShape(augmented::Bool, k_uu::Integer, m_aug::Integer, oversamples::Integer,
+             power_iters::Integer) =
+    AugmentShape(augmented, Int(k_uu), Int(m_aug), Int(oversamples),
+                 Int(power_iters), Int(k_uu), :none)
+
+AUGMENT_OFF(m::Integer) = AugmentShape(false, 0, Int(m), 0, 0)
+
+"""
     RECOMPILE_OVERHEAD_S
 
 Flat per-job tax added to every padded time request. Some clusters invalidate
@@ -255,12 +429,17 @@ vector_length(cells::NTuple{3,Int}) = 3 * n_cells(cells)
 
 """
     universe_length(pt)
+    sender_length(pt), receiver_length(pt)
 
 Length of a vector on the *universe*, which in this pipeline is the
 concatenation `[sender; receiver]` -- not the bounding box. See
 `asym_ur` in `src/rsvd.jl` and `projected_operators` in `src/bounds.jl`.
+
+On a refined point a body is a tiling rather than a cuboid, so its length is
+`dof_length` of that tiling (`src/refinement.jl`) and not `3 * prod(cells)`. See
+the gap-refinement section below.
 """
-universe_length(pt::SRPoint) = vector_length(pt.sender_cells) + vector_length(pt.receiver_cells)
+universe_length(pt::SRPoint) = sender_length(pt) + receiver_length(pt)
 
 is_contact(pt::SRPoint) = iszero(pt.separation)
 
@@ -338,17 +517,390 @@ one block, from the allocations in `vacuum/glaVacOprMem.jl`:
 `egoCrc` alone is `144 * M` bytes, which for equal bodies is `1152 * n` -- about
 24 polarisation vectors. This is why "the Green function costs about one vector"
 underestimates by more than an order of magnitude.
+
+`pairs` is the partition-pair count of a cross-scale block (`totParSrc *
+totParTrg` in `glaVacOprMem.jl`), which every array above carries as a trailing
+dimension. It is one on every same-scale block, which is every block there was
+before gap refinement existed.
 """
 function block_build_peak_bytes(target_cells::NTuple{3,Int}, source_cells::NTuple{3,Int};
-                               self::Bool)
+                               self::Bool, pairs::Integer=1)
     M = circulant_cells(target_cells, source_cells)
     tot = target_cells .+ source_cells
-    ego_crc = 9 * M * BYTES_PER_COMPLEX
-    ego_fur_prp = 6 * M * BYTES_PER_COMPLEX
-    ego_fur_int = 6 * prod(ntuple(i -> max(tot[i] ÷ 2, 2), 3)) * BYTES_PER_COMPLEX
+    ego_crc = 9 * M * pairs * BYTES_PER_COMPLEX
+    ego_fur_prp = 6 * M * pairs * BYTES_PER_COMPLEX
+    ego_fur_int = 6 * prod(ntuple(i -> max(tot[i] ÷ 2, 2), 3)) * pairs * BYTES_PER_COMPLEX
     retained = self ? self_fourier_bytes(target_cells) :
-                      ext_fourier_bytes(target_cells, source_cells)
+                      pairs * ext_fourier_bytes(target_cells, source_cells)
     return ego_crc + ego_fur_prp + ego_fur_int + retained
+end
+
+# --------------------------------------------------------------------------- #
+# Gap refinement
+# --------------------------------------------------------------------------- #
+#=
+`src/refinement.jl` is the source of truth for everything in this section. It is
+mirrored here rather than imported for the reason the k_uu clip and
+`_gamma_kept_count` are mirrored: the cost model has to start in a second on a
+login node without loading Gila or CUDA. If the table, the slab layout or the
+face convention there changes, change them here.
+
+What the mirror has to reproduce, region for region, is *shape*: the cost of a
+composite Green operator is a sum over pairs of regions, and which of Gila's
+three code paths a pair takes is decided by whether the two regions share a cell
+size and whether they touch.
+=#
+
+"""
+    MIN_GAP_CELLS, GAP_REFINEMENT_TABLE
+
+`src/refinement.jl`'s constants. `GAP_REFINEMENT_TABLE[g]` is the `(factor,
+thickness)` a gap of `g` coarse x-cells needs: a slab of `thickness` coarse cells
+at the gap face refined by `factor` along x, then a two-cell coarse contact
+layer, then the coarse bulk.
+"""
+const MIN_GAP_CELLS = 6
+const GAP_REFINEMENT_TABLE = ((6, 6), (3, 4), (2, 4), (2, 2), (2, 2))
+
+"""
+    GapRefinement
+
+`src/refinement.jl`'s struct: the gap in coarse x-cells, and the x-only
+refinement factor and slab thickness it calls for.
+"""
+struct GapRefinement
+    gap::Int
+    factor::Int
+    thickness::Int
+end
+
+"""
+    gap_refinement(gap_wl, x_scale) -> Union{Nothing, GapRefinement}
+
+`gap_refinement` from `src/refinement.jl`, line for line. `nothing` at contact
+and at six or more coarse cells of gap, where the operator is accurate as it
+stands and nothing is refined.
+"""
+function gap_refinement(gap_wl::Rational, x_scale::Rational)
+    gap_wl > zero(gap_wl) || return nothing
+    cells = gap_wl // x_scale
+    cells >= MIN_GAP_CELLS && return nothing
+    g = max(1, floor(Int, cells))
+    factor, thickness = GAP_REFINEMENT_TABLE[g]
+    return GapRefinement(g, factor, thickness)
+end
+
+"""
+    refinement_of(pt) -> Union{Nothing, GapRefinement}
+    is_refined(pt) -> Bool
+
+The refinement this point's job will run, or `nothing` for one that will not.
+
+`refine_gap = false`, which is what `--no-refine` asks for, is unrefined by
+construction. So is a body with an odd cell count in any dimension: `refine_body`
+throws on one rather than rounding it, so such a point cannot be refined at all
+and the unrefined prediction is the one that describes it.
+"""
+function refinement_of(pt::SRPoint)
+    pt.refine_gap || return nothing
+    (all(iseven, pt.sender_cells) && all(iseven, pt.receiver_cells)) || return nothing
+    return gap_refinement(pt.separation, pt.scale[1])
+end
+
+is_refined(pt::SRPoint) = refinement_of(pt) !== nothing
+
+"""
+    MeshRegion
+
+One region of a body's tiling, with the two things a block cost needs: its own
+cell count, and where it sits on the pair's shared x axis.
+
+- `cells`: cells of the region, at the region's own scale
+- `factor`: x-refinement, so the region's x cell is `coarse_x / factor`. One on a
+  coarse region, and one everywhere on an unrefined point
+- `x_lo`, `x_hi`: the region's x faces, measured in *coarse* cells from the
+  sender's low-x face, so that two regions touch exactly when their closed
+  intervals meet, which is the test `_cntChk` and `genEgoCrcExt!` make
+"""
+struct MeshRegion
+    cells::NTuple{3,Int}
+    factor::Int
+    x_lo::Rational{Int}
+    x_hi::Rational{Int}
+end
+
+"""
+    body_regions(cells, ref, face, x0) -> Vector{MeshRegion}
+
+`refine_body` from `src/refinement.jl` as a list of shapes: slab, contact layer
+and coarse bulk in flat layout order, with the slab on the `:high` or `:low` x
+face and the body's low-x face at `x0` coarse cells.
+
+`ref === nothing` is the plain cuboid, one region, on which every operator of an
+unrefined point is built.
+"""
+function body_regions(cells::NTuple{3,Int}, ref::Union{Nothing,GapRefinement},
+                      face::Symbol, x0::Rational{Int})
+    nx = cells[1]
+    ref === nothing && return [MeshRegion(cells, 1, x0, x0 + nx)]
+    f = ref.factor
+    t = min(ref.thickness, nx)
+    # Even `nx` and even `thickness` leave no room between the two cases: the slab
+    # either takes the whole body or leaves at least the two-cell layer.
+    spans = t == nx ? [(nx, f)] :
+            t + 2 == nx ? [(t, f), (2, 1)] :
+                          [(t, f), (2, 1), (nx - t - 2, 1)]
+    low_to_high = face === :high ? reverse(spans) : spans
+    regs = MeshRegion[]
+    off = zero(x0)
+    for (width, fac) in low_to_high
+        push!(regs, MeshRegion((width * fac, cells[2], cells[3]), fac,
+                               x0 + off, x0 + off + width))
+        off += width
+    end
+    return face === :high ? reverse(regs) : regs
+end
+
+"""
+    point_meshes(pt) -> NamedTuple
+
+The sender's and receiver's tilings on one shared x axis, in coarse cells with
+the sender's low-x face at zero. The sender turns its high-x face to the gap and
+the receiver its low-x one, so the two are mirror images, which is why they are
+different operators and key differently (`mesh_tag`).
+"""
+function point_meshes(pt::SRPoint)
+    ref = refinement_of(pt)
+    gap = pt.separation // pt.scale[1]
+    return (sender=body_regions(pt.sender_cells, ref, :high, zero(gap)),
+            receiver=body_regions(pt.receiver_cells, ref, :low,
+                                  pt.sender_cells[1] + gap))
+end
+
+sender_length(pt::SRPoint) = is_refined(pt) ?
+    sum(3 * prod(reg.cells) for reg in point_meshes(pt).sender) :
+    vector_length(pt.sender_cells)
+receiver_length(pt::SRPoint) = is_refined(pt) ?
+    sum(3 * prod(reg.cells) for reg in point_meshes(pt).receiver) :
+    vector_length(pt.receiver_cells)
+
+"""
+    GreenBlock
+
+One region-pair block of a composite Green operator, reduced to the shapes its
+cost is a function of. `_cmpBlk` in Gila's `src/glaCmpOpr.jl` picks between four
+constructions; this reduces all four to the *three* code paths the fitted
+coefficients already describe, plus a flag saying which of the two new ones it
+came off:
+
+  * a pair of identical regions on the diagonal of a self operator is `:self`;
+  * a same-scale pair is `:ext`, or `:contact` if the two touch, exactly the
+    split `greens_counts` always made, since `genEgoCrcExt!` branches on contact
+    by itself;
+  * a **cross-scale touching** pair is Gila's sandwich (`GlaSndOprVac`). It
+    remeshes *both* regions at the finer scale and builds one same-scale operator
+    between them, and the remeshed pair still touches, so it is a `:contact`
+    block on the remeshed shapes. This is what the two-cell contact layer is for:
+    without it the sandwich would remesh the whole coarse body;
+  * a **cross-scale separated** pair is the partitioned quadrature. Each side is
+    cut into `div = lcm(scales) / own scale` sub-lattices, every pair of
+    sub-lattices gets its own circulant on the coarser grid, and the block is an
+    `:ext` block on the partition shapes with `pairs > 1`.
+
+# Fields
+- `kind`: `:self`, `:ext` or `:contact`
+- `target`, `source`: cells of *one partition* of each side, already remeshed
+- `pairs`: `totParTrg * totParSrc` (`glaVacOprMem.jl`). One on a same-scale block
+- `fft_passes`: FFT traversals one *matvec* makes, relative to a same-scale
+  block's one. The action transforms each source partition forward and each
+  target partition back (`glaVacAct.jl`), so it is `(trgDiv + srcDiv) / 2` where
+  the *build* transforms all `pairs` blocks at once
+- `crossscale`: whether the block came off one of the two new paths, so the
+  provisional scalings can be charged to it and to nothing else
+"""
+struct GreenBlock
+    kind::Symbol
+    target::NTuple{3,Int}
+    source::NTuple{3,Int}
+    pairs::Int
+    fft_passes::Float64
+    crossscale::Bool
+end
+
+# Closed boxes meeting in x. The two bodies share a y/z cross section by
+# construction (`SMRSystem` centres them on one axis), so x settles it, which is
+# `_cntChk` in `glaCmpOpr.jl` and the `cntChk` in `genEgoCrcExt!`.
+_regions_touch(a::MeshRegion, b::MeshRegion) = max(a.x_lo, b.x_lo) <= min(a.x_hi, b.x_hi)
+
+"""
+    region_block(trg, src, selfblk) -> GreenBlock
+
+`_cmpBlk` in `glaCmpOpr.jl`, reduced to shapes. See `GreenBlock`.
+"""
+function region_block(trg::MeshRegion, src::MeshRegion, selfblk::Bool)
+    selfblk && return GreenBlock(:self, trg.cells, trg.cells, 1, 1.0, false)
+    if trg.factor == src.factor
+        kind = _regions_touch(trg, src) ? :contact : :ext
+        return GreenBlock(kind, trg.cells, src.cells, 1, 1.0, false)
+    end
+    if _regions_touch(trg, src)
+        fine = max(trg.factor, src.factor)
+        remesh(r::MeshRegion) = (r.cells[1] * (fine ÷ r.factor), r.cells[2], r.cells[3])
+        return GreenBlock(:contact, remesh(trg), remesh(src), 1, 1.0, true)
+    end
+    # Refinement is x-only, so only the x axis is ever partitioned.
+    g = gcd(trg.factor, src.factor)
+    trg_div, src_div = trg.factor ÷ g, src.factor ÷ g
+    trg_par = (trg.cells[1] ÷ trg_div, trg.cells[2], trg.cells[3])
+    src_par = (src.cells[1] ÷ src_div, src.cells[2], src.cells[3])
+    return GreenBlock(:ext, trg_par, src_par, trg_div * src_div,
+                      (trg_div + src_div) / 2, true)
+end
+
+"""
+    composite_blocks(trg, src; selfop) -> Vector{GreenBlock}
+
+Every region-pair block of one `GlaCmpOprVac`. `selfop` is Gila's `slfCmp`: the
+two tilings are the same body, so the diagonal takes the self path.
+
+On an unrefined point each tiling is one region, so this is one block: self if
+`selfop`, contact if the bodies touch, external otherwise. That is exactly the
+inventory `greens_counts` counted before gap refinement existed.
+"""
+composite_blocks(trg::Vector{MeshRegion}, src::Vector{MeshRegion}; selfop::Bool) =
+    vec([region_block(trg[i], src[j], selfop && i == j)
+         for i in eachindex(trg), j in eachindex(src)])
+
+"""
+    green_operators(pt) -> NamedTuple
+
+The four body-pair operators of a point, each as its list of region-pair blocks.
+`_generate_green_sr` builds `rs` on its own, `rr` on its own (the shared `self/`
+block), and all four again as the universe operator: a `MultiRegionVacuum-
+GreenOperator` unrefined, a `CmpBlkOprVac` refined, four body-pair blocks either
+way.
+"""
+function green_operators(pt::SRPoint)
+    meshes = point_meshes(pt)
+    s, r = meshes.sender, meshes.receiver
+    return (ss=composite_blocks(s, s; selfop=true),
+            sr=composite_blocks(s, r; selfop=false),
+            rs=composite_blocks(r, s; selfop=false),
+            rr=composite_blocks(r, r; selfop=true))
+end
+
+"Retained Fourier data of one block (`egoFur`), the part that goes to disk."
+block_retained_bytes(b::GreenBlock) =
+    b.kind === :self ? self_fourier_bytes(b.target) :
+                       b.pairs * ext_fourier_bytes(b.target, b.source)
+
+"`M log2 M` one matvec of the block transforms. See `GreenBlock.fft_passes`."
+block_mv_fft(b::GreenBlock) = b.fft_passes * fft_work(circulant_cells(b.target, b.source))
+
+"Transient peak while this one block is built."
+block_peak_bytes(b::GreenBlock) =
+    block_build_peak_bytes(b.target, b.source; self=(b.kind === :self), pairs=b.pairs)
+
+"""
+    REFINED_ASYM_SELF_APPLIES
+
+Green applies `asym_self(G⁰ᵣᵣ)` costs on a refined point. Folding the
+antisymmetrization into the Fourier coefficients costs one apply where
+`(X - X')/2im` costs two, and upstream now has `asym(::GlaCmpOprVac)` (rev
+d4c0516), so `src/rsvd.jl`'s `hasmethod` shim takes the folded path on a composite
+operator as it always did on a plain one.
+
+One on an unrefined point too, for the same reason.
+"""
+const REFINED_ASYM_SELF_APPLIES = 1
+
+asym_self_applies(pt::SRPoint) = is_refined(pt) ? REFINED_ASYM_SELF_APPLIES : 1
+
+"""
+    UU_ASYM_APPLIES
+
+Universe applies one `Asym(G⁰ᵤᵤ)` costs, which is where the bounds job spends its
+Green time. A refined point assembles the universe as `CmpBlkOprVac`, whose `asym`
+folds (`src/refinement.jl`), so one. An unrefined one assembles it as Gila's
+multi-region operator, which has no `asym`, so `asym_self` falls back to
+`(X - X')/2im` and it is two. Either way one universe apply is 2 self plus 2
+external block matvecs.
+"""
+uu_asym_applies(pt::SRPoint) = is_refined(pt) ? 1 : 2
+
+"""
+    rs_apply_work(pt), rr_apply_work(pt), universe_apply_work(pt)
+
+What one application of a Green operator costs, as the regressors the fitted
+matvec coefficients multiply: `fft`, the `M log2 M` summed over the operator's
+region-pair blocks, and `blocks`, how many per-block matvecs the composite
+launches.
+
+`universe_apply_work` reports the pair the bounds job's `4m` self / `4m` external
+split is written against: one "self matvec" is one of the universe operator's two
+self body-blocks and one "external matvec" one of its two external ones, so the
+value is the mean over each pair.
+
+Every one of these is `(fft_work(M), 1.0)` on an unrefined point, so
+`mv_ext * ext_fft_work` stays the expression it always was.
+"""
+function rs_apply_work(pt::SRPoint)
+    is_refined(pt) ||
+        return (fft=fft_work(circulant_cells(pt.receiver_cells, pt.sender_cells)),
+                blocks=1.0)
+    bs = composite_blocks(point_meshes(pt).receiver, point_meshes(pt).sender; selfop=false)
+    return (fft=sum(block_mv_fft, bs), blocks=Float64(length(bs)))
+end
+
+function rr_apply_work(pt::SRPoint)
+    is_refined(pt) ||
+        return (fft=fft_work(circulant_cells(pt.receiver_cells, pt.receiver_cells)),
+                blocks=1.0)
+    r = point_meshes(pt).receiver
+    bs = composite_blocks(r, r; selfop=true)
+    return (fft=sum(block_mv_fft, bs), blocks=Float64(length(bs)))
+end
+
+function universe_apply_work(pt::SRPoint)
+    if !is_refined(pt)
+        return (self_fft=fft_work(circulant_cells(pt.receiver_cells, pt.receiver_cells)),
+                ext_fft=fft_work(circulant_cells(pt.receiver_cells, pt.sender_cells)),
+                self_blocks=1.0, ext_blocks=1.0)
+    end
+    ops = green_operators(pt)
+    work(bs) = sum(block_mv_fft, bs)
+    return (self_fft=(work(ops.ss) + work(ops.rr)) / 2,
+            ext_fft=(work(ops.sr) + work(ops.rs)) / 2,
+            self_blocks=(length(ops.ss) + length(ops.rr)) / 2,
+            ext_blocks=(length(ops.sr) + length(ops.rs)) / 2)
+end
+
+"""
+    ext_operator_bytes(pt), self_operator_bytes(pt), universe_operator_bytes(pt)
+
+Device bytes the `G⁰ᵣₛ`, `G⁰ᵣᵣ` and universe operators hold: their retained
+Fourier data, summed over region-pair blocks. The unrefined values are
+`ext_fourier_bytes(r, s)`, `self_fourier_bytes(r)` and `2` of each, the same
+thing the RSVD and bounds counts always charged.
+"""
+ext_operator_bytes(pt::SRPoint) = is_refined(pt) ?
+    sum(block_retained_bytes,
+        composite_blocks(point_meshes(pt).receiver, point_meshes(pt).sender; selfop=false)) :
+    ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
+
+function self_operator_bytes(pt::SRPoint)
+    is_refined(pt) || return self_fourier_bytes(pt.receiver_cells)
+    r = point_meshes(pt).receiver
+    return sum(block_retained_bytes, composite_blocks(r, r; selfop=true))
+end
+
+function universe_operator_bytes(pt::SRPoint)
+    if !is_refined(pt)
+        return 2 * self_fourier_bytes(pt.receiver_cells) +
+               2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
+    end
+    ops = green_operators(pt)
+    return sum(block_retained_bytes, vcat(ops.ss, ops.sr, ops.rs, ops.rr))
 end
 
 # --------------------------------------------------------------------------- #
@@ -608,6 +1160,36 @@ Base.@kwdef struct Coefficients
     bounds_m_floor::Float64 = 1.0
 
     #=
+    The `Asym(G⁰ᵤᵤ)` augmentation (`--k-uu` / `--augment-threshold` in
+    `src/bounds.jl`), as a mode with an off default, exactly like `bounds_m_mode`
+    above and for the same reason: every prediction made before it existed (every
+    row in `bench/parity_cost_model.jl`, every `coeffs_<cluster>.jl` written
+    earlier) has to keep coming out byte-identical.
+
+    `bounds_augment_mode`:
+      "off": `bounds_augment` returns `AUGMENT_OFF(m)`. Nothing is charged, and
+             every count collapses to its pre-augmentation expression.
+      "on":  points with `bounds_m(pt, c) < bounds_augment_threshold` are charged
+             for the `reigen_hermitian` solve on `Asym(G⁰ᵤᵤ)` at width
+             `bounds_k_uu + bounds_uu_oversamples`, for the augmentation's own
+             QR, for the sketch's device residency, and for a pencil stage at
+             `m_aug = m + bounds_k_uu` instead of at `m`. When the caller names a
+             card, `bounds_k_uu` is first clipped to what that card's augmented
+             front end fits, exactly as `clip_k_uu` clips it at runtime.
+
+    These are not fitted. They are the job's own parameters, and the caller that
+    turns the mode on is the caller that knows which flags the job will carry:
+    `bench/size_bounds_jobs.jl` (which knows `m` from the spectrum on scratch) and
+    `create_jobs.jl` (which writes the flags into the command line). `with_augmentation`
+    is the one-liner that flips them together.
+    =#
+    bounds_augment_mode::String = "off"
+    bounds_k_uu::Float64 = 0.0
+    bounds_augment_threshold::Float64 = 0.0
+    bounds_uu_oversamples::Float64 = BOUNDS_UU_OVERSAMPLES
+    bounds_uu_power_iters::Float64 = BOUNDS_UU_POWER_ITERS
+
+    #=
     Multiplier on the part of the RSVD's predicted time that scales with the power
     iteration count `q`, that is, on the `(2q + 2)`-ish operator passes and the
     per-pass dense work. Identified by running the same geometry at two low `q`
@@ -616,6 +1198,37 @@ Base.@kwdef struct Coefficients
     gemm rates as the only per-pass estimate, which is what they were before.
     =#
     rsvd_pass_scale::Float64 = 1.0
+
+    #=
+    PROVISIONAL, gap refinement. Three multipliers, all 1.0, all charged only on
+    a refined point, so every prediction made before gap refinement existed is
+    untouched and every refined prediction is the structural law with nothing
+    fudged on top. They are 1.0 because the *code paths* are ones the fitted
+    coefficients already describe (see `GreenBlock`), not because anyone has
+    measured them at these shapes. Calibrate with `bench/plan_refined.jl`, which
+    emits the tier, and fold the result in through `bench/fit.jl`.
+
+    `g0_sandwich_scale`: on a cross-scale touching block, which Gila builds by
+    remeshing both regions at the fine scale and running the *contact* quadrature
+    between them (`_sndBlk`). Same code path as `g0_contact_*`, but that triple was
+    fitted on whole-body contact where the fixed Gauss-Legendre setup is amortised
+    over a large volume; a refined point pays it once per region pair on slabs of a
+    few cells, so the fixed term is the one most likely to be wrong here.
+
+    `g0_partition_scale`: on a cross-scale separated block, the partitioned
+    quadrature. `egoFunExt!` is the same kernel `g0_ext_cell` was fitted on, and
+    the count of cells it visits (`pairs * M`) is exact, so the risk is in the
+    per-block fixed cost, which is now paid `pairs` times over on smaller arrays.
+
+    `mv_composite_scale`: on a refined point's Green matvecs. The per-block launch
+    overhead is already counted (`mv_*_launches`), so this covers what is left of
+    `_cmpMul`: the output allocation, the per-region reshapes and views, and the
+    `.+=` accumulation over the block row, none of which the same-scale matvec
+    coefficients ever saw.
+    =#
+    g0_sandwich_scale::Float64 = 1.0
+    g0_partition_scale::Float64 = 1.0
+    mv_composite_scale::Float64 = 1.0
 
     #=
     Panel-path coefficients. All four are uncalibrated defaults, replaced by
@@ -697,6 +1310,89 @@ function bounds_m(pt::SRPoint, c::Coefficients)
     isfinite(cap) || return m
     cap = max(cap, c.bounds_m_floor)
     return clamp(round(Int, cap), 1, m)
+end
+
+"""
+    bounds_augment(pt, c[, m]; vram_capacity_bytes=nothing) -> AugmentShape
+
+Whether this point's bounds job augments its projection basis with the leading
+eigenvectors of `Asym(G⁰ᵤᵤ)`, and how wide that makes the pencil stage.
+
+Mirrors the decision in `bounds_from_spectrum`: augment when `k_uu > 0` and the
+kept `m` is strictly below `augment_threshold`, with `k_uu` clamped to the
+`N_u − m` directions the universe actually has left (which only ever binds on the
+test fixtures) and the oversamples clamped so the sketch is no wider than the
+operator.
+
+`vram_capacity_bytes` names the card, and with it the third clamp: `clip_k_uu` in
+`src/bounds.jl` reduces `k_uu` on a point whose dense augmented front end does not
+fit the device budget, and this reduces it identically (see `augment_k_uu_cap` and
+`augment_budget_bytes`). Without it (`nothing`, the default) there is no card
+and no clip, which is the same convention `uses_panel_path` follows and is what
+keeps a prediction made without a capacity unchanged.
+
+Sizing it is not optional at the production sizes. `augment_threshold = 1000` and
+`k_uu = 512` put the ceiling at `m_aug = 1512`, and three `N_u × m_aug` matrices at
+the 4 λ universe are past an A100-40; a model that charged the unclipped `m_aug`
+would size a job for work the runtime will refuse to do.
+
+`m` may be passed in to save recomputing `bounds_m`; it defaults to it.
+
+Returns `AUGMENT_OFF(m)` under `bounds_augment_mode = "off"`, which is the default
+and is what makes every downstream count reduce to its pre-augmentation form.
+"""
+function bounds_augment(pt::SRPoint, c::Coefficients,
+                        m::Integer=bounds_m(pt, c);
+                        vram_capacity_bytes::Union{Nothing,Real}=nothing)
+    m = Int(m)
+    c.bounds_augment_mode == "on" || return AUGMENT_OFF(m)
+    k_req = round(Int, c.bounds_k_uu)
+    k_req > 0 || return AUGMENT_OFF(m)
+    m < c.bounds_augment_threshold || return AUGMENT_OFF(m)
+    N_u = universe_length(pt)
+    k = min(k_req, N_u - m)
+    k > 0 || return AUGMENT_OFF(m)
+    clip = k < k_req ? :universe : :none
+    if vram_capacity_bytes !== nothing
+        k_fit = augment_k_uu_cap(N_u, m, augment_budget_bytes(N_u, vram_capacity_bytes))
+        if k_fit < BOUNDS_K_UU_CLIP_FLOOR
+            # `clip_k_uu` errors here. Charge the floor, which is the cheapest
+            # augmentation the runtime would have accepted, and label it so the
+            # caller can move to a larger card instead of asking for this one.
+            k, clip = BOUNDS_K_UU_CLIP_FLOOR, :infeasible
+        elseif k_fit < k
+            k, clip = k_fit, :budget
+        end
+    end
+    p = min(round(Int, c.bounds_uu_oversamples), max(0, N_u - k))
+    return AugmentShape(true, k, m + k, p, round(Int, c.bounds_uu_power_iters),
+                        k_req, clip)
+end
+
+"""
+    with_augmentation(c; k_uu, threshold, oversamples, power_iters) -> Coefficients
+
+`c` with `bounds_augment_mode = "on"` and the augmentation's parameters set.
+Everything else is carried over field by field, exactly as
+`bench/size_bounds_jobs.jl`'s `without_truncation` does, so a calibrated
+coefficient set stays calibrated.
+
+This is the *only* way the augmentation gets charged. A caller that does not call
+it predicts what it predicted before the augmentation existed, which is what
+`bench/parity_cost_model.jl` asserts.
+"""
+function with_augmentation(c::Coefficients;
+                           k_uu::Integer=BOUNDS_K_UU_DEFAULT,
+                           threshold::Integer=BOUNDS_AUGMENT_THRESHOLD_DEFAULT,
+                           oversamples::Integer=BOUNDS_UU_OVERSAMPLES,
+                           power_iters::Integer=BOUNDS_UU_POWER_ITERS)
+    fields = fieldnames(Coefficients)
+    nt = NamedTuple{fields}(map(f -> getfield(c, f), fields))
+    return Coefficients(; merge(nt, (bounds_augment_mode=(k_uu > 0 ? "on" : "off"),
+                                     bounds_k_uu=Float64(k_uu),
+                                     bounds_augment_threshold=Float64(threshold),
+                                     bounds_uu_oversamples=Float64(oversamples),
+                                     bounds_uu_power_iters=Float64(power_iters)))...)
 end
 
 """
@@ -854,8 +1550,7 @@ Device bytes the Green operators hold for the whole RSVD job, on every path:
 builds alongside it.
 """
 rsvd_operator_vram_bytes(pt::SRPoint) =
-    ext_fourier_bytes(pt.receiver_cells, pt.sender_cells) +
-    2 * self_fourier_bytes(pt.receiver_cells)
+    ext_operator_bytes(pt) + 2 * self_operator_bytes(pt)
 
 """
     rsvd_inmemory_live_bytes(pt)
@@ -967,71 +1662,106 @@ self block that `src/rsvd.jl` actually loads:
 
 Peak memory comes from the multi-region build, where the blocks already
 finished are still resident while the last one is being constructed.
+
+# Refined points
+
+Nothing above changes in *structure* when the gap is refined. The same three
+operators are built; each is a composite over region pairs rather than one
+circulant, so `green_operators` expands each into a list of `GreenBlock`s and
+every sum below runs over that list instead of over four hard-coded tuples. On an
+unrefined point every list is one block and the two spellings are the same
+arithmetic, term for term.
+
+The two cross-scale block kinds get their own accumulators (`sandwich_*`,
+`partition_*`) rather than being folded into `contact_*` and `ext_*`. They run
+the same code and are charged the same fitted triples, but at shapes nobody has
+measured, so `greens_time_s` puts a named provisional multiplier on each and a
+future refit has something to move. See `GreenBlock` and the `Coefficients`
+docstring.
 """
 function greens_counts(pt::SRPoint)
-    s, r = pt.sender_cells, pt.receiver_cells
-    contact = is_contact(pt)
+    ops = green_operators(pt)
+    multiregion = vcat(ops.ss, ops.sr, ops.rs, ops.rr)
 
-    # (target, source, is_self) for every block that gets built
-    blocks = Tuple{NTuple{3,Int},NTuple{3,Int},Bool}[]
-    push!(blocks, (r, s, false))                    # (R, S) standalone external
-    pt.fresh_preload && push!(blocks, (r, r, true)) # (R, R) shared self block
-    multiregion = [(s, s, true), (s, r, false), (r, s, false), (r, r, true)]
+    blocks = GreenBlock[]
+    append!(blocks, ops.rs)                    # (R, S) standalone
+    pt.fresh_preload && append!(blocks, ops.rr) # (R, R) shared self operator
     append!(blocks, multiregion)
 
-    # Three block kinds, not two plus a surcharge: an external block between
+    # Five block kinds, not two plus a surcharge: an external block between
     # touching bodies runs a different branch of `genEgoCrcExt!` with a large
-    # fixed cost and a small per-cell cost.
+    # fixed cost and a small per-cell cost, and the two cross-scale kinds are
+    # those two paths again at shapes the fit has never seen.
     self_work = 0.0        # sum of M*log2(M) over self blocks
     self_cells = 0         # sum of M over self blocks
     ext_work = 0.0
     ext_cells = 0
     contact_work = 0.0
     contact_cells = 0
+    sandwich_work = 0.0
+    sandwich_cells = 0
+    partition_work = 0.0
+    partition_cells = 0
     n_self = 0
     n_ext = 0
     n_contact = 0
-    for (trg, src, isself) in blocks
-        M = circulant_cells(trg, src)
-        if isself
-            self_work += fft_work(M)
-            self_cells += M
+    n_sandwich = 0
+    n_partition = 0
+    for b in blocks
+        # A build fills every partition pair of the circulant and transforms them
+        # all under one batched plan, so both scale with `pairs`.
+        M = circulant_cells(b.target, b.source)
+        work, cells = b.pairs * fft_work(M), b.pairs * M
+        if b.kind === :self
+            self_work += work
+            self_cells += cells
             n_self += 1
-        elseif contact
-            contact_work += fft_work(M)
-            contact_cells += M
+        elseif b.crossscale && b.kind === :contact
+            sandwich_work += work
+            sandwich_cells += cells
+            n_sandwich += 1
+        elseif b.crossscale
+            partition_work += work
+            partition_cells += cells
+            n_partition += 1
+        elseif b.kind === :contact
+            contact_work += work
+            contact_cells += cells
             n_contact += 1
         else
-            ext_work += fft_work(M)
-            ext_cells += M
+            ext_work += work
+            ext_cells += cells
             n_ext += 1
         end
     end
 
     # Bytes serialised: the retained Fourier data of every operator written out.
-    bytes_written = ext_fourier_bytes(r, s)                              # (R, S)
-    pt.fresh_preload && (bytes_written += self_fourier_bytes(r))          # (R, R)
-    bytes_written += self_fourier_bytes(s) + self_fourier_bytes(r) +
-                     ext_fourier_bytes(s, r) + ext_fourier_bytes(r, s)    # multi-region
+    bytes_written = sum(block_retained_bytes, ops.rs)                      # (R, S)
+    pt.fresh_preload &&
+        (bytes_written += sum(block_retained_bytes, ops.rr))               # (R, R)
+    bytes_written += sum(block_retained_bytes, multiregion)                # universe
 
-    # Peak: everything retained by the multi-region operator except the block
+    # Peak: everything retained by the universe operator except the block
     # currently under construction, plus that block's transient peak. Take the
-    # worst ordering.
-    retained = [self_fourier_bytes(s), ext_fourier_bytes(s, r),
-                ext_fourier_bytes(r, s), self_fourier_bytes(r)]
-    peaks = [block_build_peak_bytes(trg, src; self=isself) for (trg, src, isself) in multiregion]
+    # worst ordering. Region-pair granularity, since that is what Gila's
+    # constructor loops over.
+    retained = block_retained_bytes.(multiregion)
+    peaks = block_peak_bytes.(multiregion)
     peak_bytes = 0
     for i in eachindex(multiregion)
         resident = sum(retained[j] for j in eachindex(retained) if j != i; init=0)
         peak_bytes = max(peak_bytes, resident + peaks[i])
     end
-    # Serialisation of the finished multi-region operator buffers a copy.
+    # Serialisation of the finished universe operator buffers a copy.
     peak_bytes = max(peak_bytes, sum(retained) * 2)
 
     return (n_self_blocks=n_self, n_ext_blocks=n_ext, n_contact_blocks=n_contact,
+            n_sandwich_blocks=n_sandwich, n_partition_blocks=n_partition,
             self_fft_work=self_work, ext_fft_work=ext_work, contact_fft_work=contact_work,
+            sandwich_fft_work=sandwich_work, partition_fft_work=partition_work,
             self_cells=self_cells, ext_cells=ext_cells, contact_cells=contact_cells,
-            n_blocks=n_self + n_ext + n_contact,
+            sandwich_cells=sandwich_cells, partition_cells=partition_cells,
+            n_blocks=n_self + n_ext + n_contact + n_sandwich + n_partition,
             bytes_written=bytes_written, peak_bytes=peak_bytes)
 end
 
@@ -1044,6 +1774,22 @@ function greens_time_s(pt::SRPoint, c::Coefficients)
           c.g0_contact_cell * counts.contact_cells) / eta
     t += c.g0_self_fixed * counts.n_self_blocks + c.g0_ext_fixed * counts.n_ext_blocks +
          c.g0_contact_fixed * counts.n_contact_blocks
+    # The two cross-scale kinds, guarded so that an unrefined point takes literally
+    # the arithmetic it took before gap refinement existed. Each runs the code path
+    # its own triple was fitted for, times a provisional scaling; see
+    # `Coefficients`.
+    if counts.n_sandwich_blocks > 0
+        t += c.g0_sandwich_scale *
+             (c.g0_contact_fft * counts.sandwich_fft_work +
+              c.g0_contact_cell * counts.sandwich_cells / eta +
+              c.g0_contact_fixed * counts.n_sandwich_blocks)
+    end
+    if counts.n_partition_blocks > 0
+        t += c.g0_partition_scale *
+             (c.g0_ext_fft * counts.partition_fft_work +
+              c.g0_ext_cell * counts.partition_cells / eta +
+              c.g0_ext_fixed * counts.n_partition_blocks)
+    end
     t += counts.bytes_written / c.disk_write_rate
     return t + c.g0_startup_s
 end
@@ -1087,8 +1833,8 @@ dense-exact branch; `rsvd_mode` picks between the three. All three share the
 matvec counts above, which is why they are stated here only.
 """
 function rsvd_counts(pt::SRPoint)
-    N_s = vector_length(pt.sender_cells)
-    N_r = vector_length(pt.receiver_cells)
+    N_s = sender_length(pt)
+    N_r = receiver_length(pt)
     N_u = N_s + N_r
     q = pt.power_iters
     k = pt.rank
@@ -1098,10 +1844,13 @@ function rsvd_counts(pt::SRPoint)
 
     herm_applications = c_herm * (q + 2)
     mv_ext = 2 * herm_applications + c_svd * (2q + 2)
-    mv_self = herm_applications
+    # One apply of `Asym(G⁰ᵣᵣ)` on a refined point, where Gila has no composite
+    # `asym` yet and `asym_self` falls back to the difference. See
+    # `REFINED_ASYM_SELF_APPLIES`.
+    mv_self = asym_self_applies(pt) * herm_applications
 
-    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
-    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
+    ext_apply = rs_apply_work(pt)
+    self_apply = rr_apply_work(pt)
 
     # Dense flops.
     qr_flops = (q + 1) * flops_qr(N_u, c_herm) + (2q + 2) * flops_qr(N_r, c_svd)
@@ -1121,8 +1870,10 @@ function rsvd_counts(pt::SRPoint)
     bytes_written = host_dense + c_herm * BYTES_PER_COMPLEX + c_svd * BYTES_PER_COMPLEX
 
     return (mv_ext=mv_ext, mv_self=mv_self,
-            ext_fft_work=mv_ext * fft_work(M_ext),
-            self_fft_work=mv_self * fft_work(M_self),
+            mv_ext_launches=mv_ext * ext_apply.blocks,
+            mv_self_launches=mv_self * self_apply.blocks,
+            ext_fft_work=mv_ext * ext_apply.fft,
+            self_fft_work=mv_self * self_apply.fft,
             qr_flops=qr_flops, gemm_flops=gemm_flops, solve_flops=solve_flops,
             sketch_width_herm=c_herm, sketch_width_svd=c_svd,
             vram_bytes=vram_bytes, host_dense_bytes=host_dense,
@@ -1225,8 +1976,8 @@ it binds only where the sender and receiver are very different sizes, when
 `max(N_r, N_s)` approaches `N_u` and `3 c_svd` can exceed `2 c_herm + m`.
 """
 function rsvd_panel_counts(pt::SRPoint)
-    N_s = vector_length(pt.sender_cells)
-    N_r = vector_length(pt.receiver_cells)
+    N_s = sender_length(pt)
+    N_r = receiver_length(pt)
     N_u = N_s + N_r
     q = pt.power_iters
 
@@ -1236,10 +1987,10 @@ function rsvd_panel_counts(pt::SRPoint)
     # Identical to the in-memory path: the panel path does the same applications.
     herm_applications = c_herm * (q + 2)
     mv_ext = 2 * herm_applications + c_svd * (2q + 2)
-    mv_self = herm_applications
+    mv_self = asym_self_applies(pt) * herm_applications
 
-    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
-    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
+    ext_apply = rs_apply_work(pt)
+    self_apply = rr_apply_work(pt)
 
     cholqr_flops = (q + 1) * flops_cholqr2(N_u, c_herm) +
                    (2q + 2) * flops_cholqr2(N_r, c_svd)
@@ -1275,8 +2026,10 @@ function rsvd_panel_counts(pt::SRPoint)
                     c_herm * BYTES_PER_COMPLEX + c_svd * BYTES_PER_COMPLEX
 
     return (mv_ext=mv_ext, mv_self=mv_self,
-            ext_fft_work=mv_ext * fft_work(M_ext),
-            self_fft_work=mv_self * fft_work(M_self),
+            mv_ext_launches=mv_ext * ext_apply.blocks,
+            mv_self_launches=mv_self * self_apply.blocks,
+            ext_fft_work=mv_ext * ext_apply.fft,
+            self_fft_work=mv_self * self_apply.fft,
             cholqr_flops=cholqr_flops, gemm_flops=gemm_flops,
             solve_flops=solve_flops,
             sketch_width_herm=c_herm, sketch_width_svd=c_svd,
@@ -1307,14 +2060,14 @@ Memory is exact: three `N_u x N_u` complex matrices on the device (the operator,
 LAPACK / cuSOLVER's copy, the eigenvectors), one on the host.
 """
 function rsvd_dense_counts(pt::SRPoint)
-    N_s = vector_length(pt.sender_cells)
-    N_r = vector_length(pt.receiver_cells)
+    N_s = sender_length(pt)
+    N_r = receiver_length(pt)
     N_u = N_s + N_r
 
     mv_ext = N_u
-    mv_self = N_u
-    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
-    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
+    mv_self = asym_self_applies(pt) * N_u
+    ext_apply = rs_apply_work(pt)
+    self_apply = rr_apply_work(pt)
 
     solve_flops = flops_eigh(N_u)
     vram_bytes = 3 * N_u^2 * BYTES_PER_COMPLEX + rsvd_operator_vram_bytes(pt)
@@ -1323,8 +2076,10 @@ function rsvd_dense_counts(pt::SRPoint)
     bytes_written = N_u * m * BYTES_PER_COMPLEX
 
     return (mv_ext=mv_ext, mv_self=mv_self,
-            ext_fft_work=mv_ext * fft_work(M_ext),
-            self_fft_work=mv_self * fft_work(M_self),
+            mv_ext_launches=mv_ext * ext_apply.blocks,
+            mv_self_launches=mv_self * self_apply.blocks,
+            ext_fft_work=mv_ext * ext_apply.fft,
+            self_fft_work=mv_self * self_apply.fft,
             solve_flops=solve_flops,
             vram_bytes=vram_bytes, host_dense_bytes=host_dense_bytes,
             num_saved=m, bytes_written=bytes_written)
@@ -1346,17 +2101,18 @@ the wrong direction: a slower slice hides *more* of the transfer behind compute,
 not less.
 """
 function _rsvd_time_raw(pt::SRPoint, c::Coefficients, mode::Symbol)
+    mvs = composite_mv_scale(pt, c)
     if mode == :dense_exact
         n = rsvd_dense_counts(pt)
-        device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-        device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+        device = mvs * (c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext_launches)
+        device += mvs * (c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self_launches)
         device += n.solve_flops / c.eigh_rate
         host = n.bytes_written / c.disk_write_rate + c.gpu_startup_s
         return (host + device, device)
     elseif mode == :panel
         n = rsvd_panel_counts(pt)
-        device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-        device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+        device = mvs * (c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext_launches)
+        device += mvs * (c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self_launches)
         device += n.cholqr_flops / c.gemm_rate + n.gemm_flops / c.gemm_rate
         device += n.solve_flops / c.eigh_rate
         host = n.sweep_bytes / c.pcie_rate * c.overlap_factor
@@ -1364,8 +2120,8 @@ function _rsvd_time_raw(pt::SRPoint, c::Coefficients, mode::Symbol)
         return (host + device, device)
     end
     n = rsvd_counts(pt)
-    device = c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-    device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+    device = mvs * (c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext_launches)
+    device += mvs * (c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self_launches)
     device += n.qr_flops / c.qr_rate + n.gemm_flops / c.gemm_rate
     device += n.solve_flops / c.eigh_rate
     host = n.bytes_written / c.disk_write_rate + c.gpu_startup_s
@@ -1375,7 +2131,18 @@ end
 "Same point with the power iterations removed, for the per-pass split below."
 _at_zero_power_iters(pt::SRPoint) =
     SRPoint(pt.sender_cells, pt.receiver_cells, pt.scale, pt.separation, pt.rank,
-            pt.oversamples, 0, pt.threads, pt.num_pos, pt.fresh_preload)
+            pt.oversamples, 0, pt.threads, pt.num_pos, pt.fresh_preload,
+            pt.refine_gap)
+
+"""
+    composite_mv_scale(pt, c) -> Float64
+
+`mv_composite_scale` on a refined point and exactly `1.0` on every other, so an
+unrefined prediction keeps the arithmetic it had before composite operators
+existed. See the `Coefficients` docstring for what the multiplier covers.
+"""
+composite_mv_scale(pt::SRPoint, c::Coefficients) =
+    is_refined(pt) ? c.mv_composite_scale : 1.0
 
 """
     rsvd_time_parts(pt, c; vram_capacity_bytes=nothing) -> NamedTuple
@@ -1465,9 +2232,12 @@ function bounds_vram_floor_bytes(pt::SRPoint, c::Coefficients;
                                  vram_capacity_bytes::Union{Nothing,Real}=nothing)
     tau, m = tau_shape(c), bounds_m(pt, c)
     bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
-        return bounds_panel_counts(pt; tau=tau, m=m).vram_bytes + c.panel_workspace_bytes +
-               c.bounds_vram_base
-    return c.vram_floor_factor * bounds_counts(pt; tau=tau, m=m).vram_bytes + c.bounds_vram_base
+        return bounds_panel_counts(pt; tau=tau, m=m,
+                                   augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes)).vram_bytes +
+               c.panel_workspace_bytes + c.bounds_vram_base
+    return c.vram_floor_factor *
+           bounds_counts(pt; tau=tau, m=m, augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes)).vram_bytes +
+           c.bounds_vram_base
 end
 
 """
@@ -1534,6 +2304,38 @@ end
 # --------------------------------------------------------------------------- #
 
 """
+    outer_indices_swept(m, indices) -> AbstractUnitRange{Int}
+    probe_count(m, ns) -> Float64
+
+The slice of the bounds job's outer loop a prediction is for, and how many probe
+evaluations that slice costs.
+
+`indices === nothing` means the whole loop, `1:m`, which is what every caller
+written before the block split means and what every fitted coefficient was
+calibrated against. Anything else is clipped to `1:m`: a block sized from a
+measured `m` can hang off the end of a spectrum that has since moved by a few
+counts, exactly as it can in `_compute_bounds_sr`.
+
+The probe count is where the outer loop's cost stops being uniform in `n`. Index
+`n` probes `k = n, …, m`, so it does `m − n + 1` root finds and gemvs per
+τ evaluation, and the first index costs `m` times what the last one does. Summed
+over the whole loop that is the familiar `m(m+1)/2`; summed over a block it is
+what makes equal-*count* blocks unequal in time, and why
+`bench/size_bounds_jobs.jl` sizes them by this instead.
+"""
+function outer_indices_swept(m::Integer, indices::Union{Nothing,AbstractUnitRange{Int}})
+    indices === nothing && return 1:Int(m)
+    return max(1, first(indices)):min(Int(m), last(indices))
+end
+
+function probe_count(m::Integer, ns::AbstractUnitRange{Int})
+    isempty(ns) && return 0.0
+    # sum_{n=lo}^{hi} (m - n + 1), in closed form so a 4000-index loop is arithmetic
+    lo, hi = first(ns), last(ns)
+    return (Float64(m - lo + 1) + Float64(m - hi + 1)) * length(ns) / 2
+end
+
+"""
     bounds_counts(pt) -> NamedTuple
 
 Work done by `_compute_bounds_sr` after the τ-optimized pencil refactor, with
@@ -1545,9 +2347,10 @@ dual evaluations per index:
     on the device. Two kernel launches each, so launch latency matters as much
     as bandwidth.
   * `ss_basis = basis' * ss` and the `C`/`D` projections: `m` applications of
-    `C` -- each applies `asym(G0_uu)`, a difference of two multi-region
-    operators whose applications run all four blocks, so `4m` self plus `4m`
-    external Green matvecs -- plus the `(m x N_u)(N_u x m)` gemms.
+    `C` -- each applies `asym(G0_uu)`, whose applications run all four blocks of
+    the universe, so `2m` self plus `2m` external Green matvecs on a refined
+    point and twice that on an unrefined one (`UU_ASYM_APPLIES`) -- plus the
+    `(m x N_u)(N_u x m)` gemms.
   * Pencil whitenings (device heevd, `psd_pencil_whitener`): `TAU_GRID_POINTS`
     shared `m x m` Hermitian eigendecompositions up front, plus
     `TAU_REFINE_EVALS` throwaway ones per index for the golden-section probes.
@@ -1557,37 +2360,91 @@ dual evaluations per index:
     `evals * m^2/2` in total: an `m x m` device gemv, one device-to-host
     transfer of the projected b-vector, and a host-side Brent root find over
     length-`m` resolvent expansions.
+
+# The augmented path
+
+Under `bounds_augment_mode = "on"` (see `bounds_augment`) a far-field point first
+runs `reigen_hermitian` on `Asym(G⁰ᵤᵤ)` at sketch width `k_uu + p`, orthonormalizes
+`[g_kept, U_uu]`, and then does everything above at `m_aug = m + k_uu` rather than
+at `m`. Three things change and one does not:
+
+  * the pencil stage's dimension, everywhere. `flops_eigh(m_aug)`,
+    `flops_gemm(m_aug, m_aug, m_aug)`, the probe gemv, the resolvent length.
+  * the Green sweep, which now projects `m_aug` columns rather than `m`, hence
+    `2 m_aug` self plus `2 m_aug` external matvecs per universe apply.
+  * device residency: `2 m_aug + m` tall columns for the front end, against the
+    `3 m` of the plain path, plus the sketch's own three `N_u x (k_uu + p)`
+    matrices, which are transient but peak *before* the front end rather than
+    alongside it, hence a `max` and not a sum.
+  * what does **not** change is the outer loop's length or the probe count. Both
+    are `m`: the channels being bounded are still the `g` directions, and the
+    probes are still built from `Πₛ·gs_pos` alone. That is why a point at `m = 15`
+    and `m_aug = 527` is minutes rather than hours.
+
+The `uu_*` counts are the same expressions `rsvd_counts` uses for
+`reigen_hermitian`, evaluated at this width and against this operator: `c(q + 2)`
+applications, each of `asym(G⁰ᵤᵤ)` on the `[S, R] <- [S, R]` universe, so `2` self
+plus `2` external matvecs apiece per universe apply, `q + 1` thin QRs, the reduction gemms
+and one `c x c` eigensolve. Checked against the measured 1 λ point (`N_u = 196,608`,
+`k_uu = 512`, `q = 4`): the model says 273 s of device time against 227 s measured,
+i.e. 20% high, which is the direction a request should err in.
+
+Every one of these terms is exactly zero, and every `m_aug` is exactly `m`, when
+the augmentation is off.
 """
 function bounds_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
-                      m::Union{Nothing,Integer}=nothing)
+                      m::Union{Nothing,Integer}=nothing,
+                      augment::Union{Nothing,AugmentShape}=nothing,
+                      indices::Union{Nothing,AbstractUnitRange{Int}}=nothing)
     N_u = universe_length(pt)
     k = pt.rank
     m = m === nothing ? min(effective_num_pos(pt), N_u) : min(Int(m), N_u)
+    aug = augment === nothing ? AUGMENT_OFF(m) : augment
+    m_aug = min(aug.m_aug, N_u)
     pairs = m * (m - 1) / 2
     evals_per_index = tau_evals_per_index(tau)
-    probes = evals_per_index * m * (m + 1) / 2
+    ns = outer_indices_swept(m, indices)
+    n_indices = length(ns)
+    probes = evals_per_index * probe_count(m, ns)
 
     gs_bytes = pairs * 3 * N_u * BYTES_PER_COMPLEX   # read s_j, read/write w_i
     gs_launches = 2 * pairs
 
-    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
-    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
-    mv_ext = 4 * m
-    mv_self = 4 * m
+    uni = universe_apply_work(pt)
+    uu_applies = uu_asym_applies(pt)
+    mv_ext = 2 * uu_applies * m_aug
+    mv_self = 2 * uu_applies * m_aug
 
-    # Device-side dense work: the m-wide basis projections, then the pencil
+    # Device-side dense work: the m_aug-wide basis projections, then the pencil
     # stage -- whitenings (grid shared, refinement per index) and one
-    # diag_pencil_eigen (eigh + two gemms) per evaluation, all through
-    # CUSOLVER/CUBLAS. Only the root finds stay on the host.
-    gemm_flops = flops_gemm(m, N_u, m) +            # ss_basis
-                 2 * m * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
-                 flops_gemm(m, N_u, m) +            # basis' * (C basis)
-                 flops_gemm(m, N_u, m)              # D: Bs' Bs on the sender rows
-    whitenings = tau.grid_points + m * tau.refine_whitenings
-    pencil_eigh_flops = (whitenings + m * evals_per_index) * flops_eigh(m)
-    pencil_gemm_flops = 2 * m * evals_per_index * flops_gemm(m, m, m)
-    probe_gemv_flops = probes * flops_gemm(m, m, 1)
-    root_work = probes * m
+    # diag_pencil_eigen / factored_pencil_eigen (eigh + two gemms) per evaluation,
+    # all through CUSOLVER/CUBLAS. Only the root finds stay on the host.
+    gemm_flops = flops_gemm(m_aug, N_u, m) +            # ss_basis (and W = basis'gs)
+                 2 * m_aug * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
+                 flops_gemm(m_aug, N_u, m_aug) +        # basis' * (C basis)
+                 flops_gemm(m_aug, N_u, m_aug)          # D: Bs' Bs on the sender rows
+    whitenings = tau.grid_points + n_indices * tau.refine_whitenings
+    pencil_eigh_flops = (whitenings + n_indices * evals_per_index) * flops_eigh(m_aug)
+    pencil_gemm_flops = 2 * n_indices * evals_per_index * flops_gemm(m_aug, m_aug, m_aug)
+    probe_gemv_flops = probes * flops_gemm(m_aug, m_aug, 1)
+    root_work = probes * m_aug
+
+    # The Asym(G⁰ᵤᵤ) solve and the augmentation's QR. All zero when off.
+    c_uu = aug.augmented ? aug.k_uu + aug.oversamples : 0
+    q_uu = aug.power_iters
+    uu_applications = aug.augmented ? c_uu * (q_uu + 2) : 0
+    uu_mv_ext = 2 * uu_applies * uu_applications
+    uu_mv_self = 2 * uu_applies * uu_applications
+    uu_qr_flops = aug.augmented ? (q_uu + 1) * flops_qr(N_u, c_uu) : 0.0
+    uu_gemm_flops = aug.augmented ?
+        2 * flops_gemm(N_u, c_uu, c_uu) + flops_gemm(N_u, c_uu, aug.k_uu) : 0.0
+    uu_solve_flops = aug.augmented ? flops_eigh(c_uu) : 0.0
+    # augmented_basis: two classical Gram-Schmidt passes against the g block (two
+    # gemms each) then a Householder QR of the N_u x k_uu remainder.
+    aug_qr_flops = aug.augmented ?
+        2 * (flops_gemm(m, N_u, aug.k_uu) + flops_gemm(N_u, m, aug.k_uu)) +
+        flops_qr(N_u, aug.k_uu) : 0.0
+    uu_sketch_bytes = aug.augmented ? 3 * N_u * c_uu * BYTES_PER_COMPLEX : 0
 
     #=
     Three `N_u x m` device matrices, which is `bounds_footprint_bytes` in
@@ -1616,24 +2473,43 @@ function bounds_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
     pair is `m^2` complex between them, which is what this line's own comment always
     said and what the code does.
     =#
-    vram_bytes = 3 * m * N_u * BYTES_PER_COMPLEX +
-                 (tau.grid_points + tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
-                 2 * self_fourier_bytes(pt.receiver_cells) +
-                 2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
+    # The tall term is `bounds_footprint_bytes`'s generalization,
+    # `augmented_footprint_bytes(N_u, m, m_aug)` in `src/bounds.jl`: the basis, the
+    # `ss` probes (`m` wide, because they are built from the g columns alone) and
+    # `opmat`'s destination. At `m_aug == m` it is `3 m N_u 16` exactly.
+    #
+    # `max` and not `+` against the sketch: `reigen_hermitian` finishes, its three
+    # matrices are freed and `CUDA.reclaim()`ed, and only then does the front end
+    # allocate. The two peaks do not coexist, and charging their sum would push the
+    # 4 lambda point off an A100-40 for a peak that never happens.
+    vram_bytes = max((2 * m_aug + m) * N_u * BYTES_PER_COMPLEX, uu_sketch_bytes) +
+                 (tau.grid_points + tau.cache_entries + 8) * m_aug^2 * BYTES_PER_COMPLEX +
+                 universe_operator_bytes(pt)
     # One host-side copy of the eigenvector block; JLD2's own buffering and the
     # `CuArray(...)` staging copy are what `bounds_host_mem_factor` absorbs.
     host_bytes = N_u * k * BYTES_PER_COMPLEX
     bytes_read = N_u * k * BYTES_PER_COMPLEX
 
-    return (num_pos=m, gs_bytes=gs_bytes, gs_launches=gs_launches,
+    return (num_pos=m, m_aug=m_aug, gs_bytes=gs_bytes, gs_launches=gs_launches,
             mv_ext=mv_ext, mv_self=mv_self,
-            ext_fft_work=mv_ext * fft_work(M_ext),
-            self_fft_work=mv_self * fft_work(M_self),
+            mv_ext_launches=mv_ext * uni.ext_blocks,
+            mv_self_launches=mv_self * uni.self_blocks,
+            ext_fft_work=mv_ext * uni.ext_fft,
+            self_fft_work=mv_self * uni.self_fft,
             gemm_flops=gemm_flops,
             pencil_eigh_flops=pencil_eigh_flops,
             pencil_gemm_flops=pencil_gemm_flops,
             probe_gemv_flops=probe_gemv_flops, probes=probes,
-            root_work=root_work, vram_bytes=vram_bytes, host_bytes=host_bytes,
+            root_work=root_work,
+            uu_mv_ext=uu_mv_ext, uu_mv_self=uu_mv_self,
+            uu_mv_ext_launches=uu_mv_ext * uni.ext_blocks,
+            uu_mv_self_launches=uu_mv_self * uni.self_blocks,
+            uu_ext_fft_work=uu_mv_ext * uni.ext_fft,
+            uu_self_fft_work=uu_mv_self * uni.self_fft,
+            uu_qr_flops=uu_qr_flops, uu_gemm_flops=uu_gemm_flops,
+            uu_solve_flops=uu_solve_flops, aug_qr_flops=aug_qr_flops,
+            uu_sketch_bytes=uu_sketch_bytes,
+            vram_bytes=vram_bytes, host_bytes=host_bytes,
             bytes_read=bytes_read)
 end
 
@@ -1694,21 +2570,26 @@ changes.
     from the code.
   * The read shrinks to the `m` positive vectors, which is all that was saved.
 
-The `m` applications of `C` and their `4m` self plus `4m` external Green matvecs
-are unchanged: `panelmul!` applies the operator column by column, exactly as the
-resident path does.
+The `m` applications of `C` and their Green matvecs are unchanged: `panelmul!`
+applies the operator column by column, exactly as the resident path does.
 """
 function bounds_panel_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
-                            m::Union{Nothing,Integer}=nothing)
+                            m::Union{Nothing,Integer}=nothing,
+                            augment::Union{Nothing,AugmentShape}=nothing,
+                            indices::Union{Nothing,AbstractUnitRange{Int}}=nothing)
     N_u = universe_length(pt)
     m = m === nothing ? min(effective_num_pos(pt), N_u) : min(Int(m), N_u)
+    aug = augment === nothing ? AUGMENT_OFF(m) : augment
+    m_aug = min(aug.m_aug, N_u)
     evals_per_index = tau_evals_per_index(tau)
-    probes = evals_per_index * m * (m + 1) / 2
+    ns = outer_indices_swept(m, indices)
+    n_indices = length(ns)
+    probes = evals_per_index * probe_count(m, ns)
 
-    M_ext = circulant_cells(pt.receiver_cells, pt.sender_cells)
-    M_self = circulant_cells(pt.receiver_cells, pt.receiver_cells)
-    mv_ext = 4 * m
-    mv_self = 4 * m
+    uni = universe_apply_work(pt)
+    uu_applies = uu_asym_applies(pt)
+    mv_ext = 2 * uu_applies * m_aug
+    mv_self = 2 * uu_applies * m_aug
 
     # The panelized front end: one gram sweep, an m x m host Cholesky, one
     # rightmul! sweep. Bytes are counted up and back for each sweep.
@@ -1716,35 +2597,89 @@ function bounds_panel_counts(pt::SRPoint; tau::TauShape=TAU_SHAPE_LEGACY,
     gs_sweep_bytes = BOUNDS_PANEL_SWEEPS * N_u * m * BYTES_PER_COMPLEX * 2
     gs_cholesky_flops = flops_cholesky(m)
 
-    gemm_flops = flops_gemm(m, N_u, m) +            # ss_basis
-                 2 * m * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
-                 flops_gemm(m, N_u, m) +            # basis' * (C basis)
-                 flops_gemm(m, N_u, m)              # D: Bs' Bs on the sender rows
-    whitenings = tau.grid_points + m * tau.refine_whitenings
-    pencil_eigh_flops = (whitenings + m * evals_per_index) * flops_eigh(m)
-    pencil_gemm_flops = 2 * m * evals_per_index * flops_gemm(m, m, m)
-    probe_gemv_flops = probes * flops_gemm(m, m, 1)
-    root_work = probes * m
+    gemm_flops = flops_gemm(m_aug, N_u, m) +            # ss_basis (and W = basis'gs)
+                 2 * m_aug * flops_gemm(N_u, m, 1) +    # C: G' v and G w per application
+                 flops_gemm(m_aug, N_u, m_aug) +        # basis' * (C basis)
+                 flops_gemm(m_aug, N_u, m_aug)          # D: Bs' Bs on the sender rows
+    whitenings = tau.grid_points + n_indices * tau.refine_whitenings
+    pencil_eigh_flops = (whitenings + n_indices * evals_per_index) * flops_eigh(m_aug)
+    pencil_gemm_flops = 2 * n_indices * evals_per_index * flops_gemm(m_aug, m_aug, m_aug)
+    probe_gemv_flops = probes * flops_gemm(m_aug, m_aug, 1)
+    root_work = probes * m_aug
 
-    # One `m^2` per pencil, as in `bounds_counts`: whitener plus null space.
-    vram_bytes = panel_staging_bytes(N_u, m) +
-                 (tau.grid_points + tau.cache_entries + 8) * m^2 * BYTES_PER_COMPLEX +
-                 2 * self_fourier_bytes(pt.receiver_cells) +
-                 2 * ext_fourier_bytes(pt.receiver_cells, pt.sender_cells)
+    # The Asym(G0_uu) solve and the augmentation's QR; see `bounds_counts` for the
+    # counts and for the check against the measured 1 lambda point. All zero when
+    # the augmentation is off.
+    c_uu = aug.augmented ? aug.k_uu + aug.oversamples : 0
+    q_uu = aug.power_iters
+    uu_applications = aug.augmented ? c_uu * (q_uu + 2) : 0
+    uu_mv_ext = 2 * uu_applies * uu_applications
+    uu_mv_self = 2 * uu_applies * uu_applications
+    uu_qr_flops = aug.augmented ? (q_uu + 1) * flops_qr(N_u, c_uu) : 0.0
+    uu_gemm_flops = aug.augmented ?
+        2 * flops_gemm(N_u, c_uu, c_uu) + flops_gemm(N_u, c_uu, aug.k_uu) : 0.0
+    uu_solve_flops = aug.augmented ? flops_eigh(c_uu) : 0.0
+    aug_qr_flops = aug.augmented ?
+        2 * (flops_gemm(m, N_u, aug.k_uu) + flops_gemm(N_u, m, aug.k_uu)) +
+        flops_qr(N_u, aug.k_uu) : 0.0
+    uu_sketch_bytes = aug.augmented ? 3 * N_u * c_uu * BYTES_PER_COMPLEX : 0
+
+    #=
+    One `m^2` per pencil, as in `bounds_counts`: whitener plus null space.
+
+    An augmented point is charged the *dense* tall term on top of the staging
+    buffers, because it really does hold three dense `N_u`-tall matrices. This mode
+    label is inherited from the RSVD's storage choice (did it write an h5 or an
+    inline JLD2 block?) and not from the bounds front end's: `bounds_from_spectrum`
+    refuses the augmented/panel combination outright, so an augmenting point reads
+    its `m` columns out of the h5 into one dense block and proceeds densely. `max`
+    against the sketch for the same reason as in `bounds_counts`: the two peaks do
+    not coexist.
+
+    What keeps that refusal from firing is this count and the card selection built
+    on it, not slack in `use_panel_bounds`. At `augment_threshold = 1000` the two
+    predicates are no longer far apart on a small slice (`use_panel_bounds` at
+    1 lambda, `m = 999` wants 13.6 GiB against a 10 GB MIG's 8.4 GiB budget), but
+    the dense tall term charged here is larger still, so a caller sizing this point
+    rejects that slice before the job ever sees it. A card chosen against a count
+    that did *not* include the tall term is what would produce the refusal.
+
+    The `gs_*` terms are left as the panelized ones even when augmenting, where the
+    run really does the `O(m^2)` BLAS-1 loop instead. At the `m < 1000` that lets a
+    point augment both are seconds against a job of many minutes, and keeping one
+    expression here is worth more than the third decimal place.
+    =#
+    vram_bytes = (aug.augmented ?
+                  max(panel_staging_bytes(N_u, m),
+                      (2 * m_aug + m) * N_u * BYTES_PER_COMPLEX,
+                      uu_sketch_bytes) :
+                  panel_staging_bytes(N_u, m)) +
+                 (tau.grid_points + tau.cache_entries + 8) * m_aug^2 * BYTES_PER_COMPLEX +
+                 universe_operator_bytes(pt)
     host_bytes = 3 * N_u * m * BYTES_PER_COMPLEX
     bytes_read = N_u * m * BYTES_PER_COMPLEX
 
-    return (num_pos=m,
+    return (num_pos=m, m_aug=m_aug,
             gs_gemm_flops=gs_gemm_flops, gs_sweep_bytes=gs_sweep_bytes,
             gs_cholesky_flops=gs_cholesky_flops,
             mv_ext=mv_ext, mv_self=mv_self,
-            ext_fft_work=mv_ext * fft_work(M_ext),
-            self_fft_work=mv_self * fft_work(M_self),
+            mv_ext_launches=mv_ext * uni.ext_blocks,
+            mv_self_launches=mv_self * uni.self_blocks,
+            ext_fft_work=mv_ext * uni.ext_fft,
+            self_fft_work=mv_self * uni.self_fft,
             gemm_flops=gemm_flops,
             pencil_eigh_flops=pencil_eigh_flops,
             pencil_gemm_flops=pencil_gemm_flops,
             probe_gemv_flops=probe_gemv_flops, probes=probes,
             root_work=root_work,
+            uu_mv_ext=uu_mv_ext, uu_mv_self=uu_mv_self,
+            uu_mv_ext_launches=uu_mv_ext * uni.ext_blocks,
+            uu_mv_self_launches=uu_mv_self * uni.self_blocks,
+            uu_ext_fft_work=uu_mv_ext * uni.ext_fft,
+            uu_self_fft_work=uu_mv_self * uni.self_fft,
+            uu_qr_flops=uu_qr_flops, uu_gemm_flops=uu_gemm_flops,
+            uu_solve_flops=uu_solve_flops, aug_qr_flops=aug_qr_flops,
+            uu_sketch_bytes=uu_sketch_bytes,
             panel_width=panel_width(N_u, m),
             vram_bytes=vram_bytes, host_bytes=host_bytes,
             bytes_read=bytes_read)
@@ -1765,32 +2700,79 @@ the small-body sweeps that are otherwise cheap enough to fit in a slice.
 The panel path adds two more terms to the host bucket for the same reason: the
 front end's sweep traffic (PCIe, not SMs) and its `m x m` Cholesky, which
 workstream C2 does on the host between the two sweeps.
+
+`indices` predicts one *block* of the outer loop (`compute_bounds.jl
+--outer-range lo:hi`) rather than the whole of it. Everything outside the loop
+(the Gram-Schmidt, the Green sweep, the shared grid whitenings, the `Asym(G⁰ᵤᵤ)`
+solve) is charged in full, because a block really does run all of it; only the
+per-index terms shrink. Two consequences worth naming:
+
+  * `indices = 1:0` is the front-end cost on its own, which is what a block pays
+    before it computes anything. `bench/size_bounds_jobs.jl` reads it off exactly
+    that way, and it is why B blocks cost more in total than one job does.
+  * the cost is affine in the two counts the slice moves, `length(ns)` and
+    `probe_count`, so a block's time is `F + Σ_{n ∈ block} (α + β(m − n + 1))`
+    with `F`, `α` and `β` recoverable from three evaluations of this function.
+    That is what makes an equal-*time* split a closed-form calculation rather
+    than a search.
+
+`nothing`, the default, is the whole loop and reproduces the previous arithmetic
+term for term.
 """
 function bounds_time_s(pt::SRPoint, c::Coefficients;
-                       vram_capacity_bytes::Union{Nothing,Real}=nothing)
+                       vram_capacity_bytes::Union{Nothing,Real}=nothing,
+                       indices::Union{Nothing,AbstractUnitRange{Int}}=nothing)
     tau = tau_shape(c)
     m = bounds_m(pt, c)
+    mvs = composite_mv_scale(pt, c)
     if bounds_mode(pt, vram_capacity_bytes, c) == :panel
-        n = bounds_panel_counts(pt; tau=tau, m=m)
+        n = bounds_panel_counts(pt; tau=tau, m=m, augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes),
+                                indices=indices)
         device = n.gs_gemm_flops / c.gemm_rate
-        device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-        device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+        device += mvs * (c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext_launches)
+        device += mvs * (c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self_launches)
         device += n.gemm_flops / c.gemm_rate
         device += n.pencil_eigh_flops / c.eigh_rate
         device += (n.pencil_gemm_flops + n.probe_gemv_flops) / c.gemm_rate
+        if n.uu_mv_ext > 0
+            device += mvs * (c.mv_ext_fft * n.uu_ext_fft_work + c.mv_ext_fixed * n.uu_mv_ext_launches)
+            device += mvs * (c.mv_self_fft * n.uu_self_fft_work + c.mv_self_fixed * n.uu_mv_self_launches)
+            device += (n.uu_qr_flops + n.aug_qr_flops) / c.qr_rate
+            device += n.uu_gemm_flops / c.gemm_rate
+            device += n.uu_solve_flops / c.eigh_rate
+        end
         host = n.gs_sweep_bytes / c.pcie_rate * c.overlap_factor
         host += n.gs_cholesky_flops / c.eigh_rate
         host += n.probes * c.sync_latency + n.root_work * c.host_root_find
         host += n.bytes_read / c.disk_read_rate + c.gpu_startup_s
         return (host + device, device)
     end
-    n = bounds_counts(pt; tau=tau, m=m)
+    n = bounds_counts(pt; tau=tau, m=m, augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes), indices=indices)
     device = n.gs_bytes / c.bandwidth + n.gs_launches * c.launch_latency
-    device += c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext
-    device += c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self
+    device += mvs * (c.mv_ext_fft * n.ext_fft_work + c.mv_ext_fixed * n.mv_ext_launches)
+    device += mvs * (c.mv_self_fft * n.self_fft_work + c.mv_self_fixed * n.mv_self_launches)
     device += n.gemm_flops / c.gemm_rate
     device += n.pencil_eigh_flops / c.eigh_rate
     device += (n.pencil_gemm_flops + n.probe_gemv_flops) / c.gemm_rate
+    #=
+    The Asym(G⁰ᵤᵤ) solve and the augmentation's QR, all of it device work. Guarded
+    rather than added as zeros so that an unaugmented point takes literally the
+    same arithmetic path it did before this existed, which is what
+    bench/parity_cost_model.jl checks.
+
+    At the measured 1 lambda point (N_u = 196,608, k_uu = 512, q = 4, narval's
+    coefficients) this block alone comes to 273 s, of which 272 s is the 13,488
+    external plus 13,488 self matvecs; the measurement was 227 s. The dense terms
+    are under a second, so the whole estimate lives or dies on the matvec rates,
+    which are the best-calibrated coefficients in the set.
+    =#
+    if n.uu_mv_ext > 0
+        device += mvs * (c.mv_ext_fft * n.uu_ext_fft_work + c.mv_ext_fixed * n.uu_mv_ext_launches)
+        device += mvs * (c.mv_self_fft * n.uu_self_fft_work + c.mv_self_fixed * n.uu_mv_self_launches)
+        device += (n.uu_qr_flops + n.aug_qr_flops) / c.qr_rate
+        device += n.uu_gemm_flops / c.gemm_rate
+        device += n.uu_solve_flops / c.eigh_rate
+    end
     # Per-probe D2H syncs and root finds go in the host bucket: neither gets
     # slower on a MIG slice, so neither should be stretched by its fraction.
     host = n.probes * c.sync_latency + n.root_work * c.host_root_find
@@ -1819,18 +2801,24 @@ function bounds_vram_bytes(pt::SRPoint, c::Coefficients;
                            vram_capacity_bytes::Union{Nothing,Real}=nothing)
     tau, m = tau_shape(c), bounds_m(pt, c)
     bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
-        return bounds_panel_counts(pt; tau=tau, m=m).vram_bytes + c.panel_workspace_bytes +
-               c.bounds_vram_base
-    return c.bounds_vram_factor * bounds_counts(pt; tau=tau, m=m).vram_bytes + c.bounds_vram_base
+        return bounds_panel_counts(pt; tau=tau, m=m,
+                                   augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes)).vram_bytes +
+               c.panel_workspace_bytes + c.bounds_vram_base
+    return c.bounds_vram_factor *
+           bounds_counts(pt; tau=tau, m=m, augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes)).vram_bytes +
+           c.bounds_vram_base
 end
 
 function bounds_host_bytes(pt::SRPoint, c::Coefficients;
                            vram_capacity_bytes::Union{Nothing,Real}=nothing)
     tau, m = tau_shape(c), bounds_m(pt, c)
     bounds_mode(pt, vram_capacity_bytes, c) == :panel &&
-        return c.panel_host_mem_factor * bounds_panel_counts(pt; tau=tau, m=m).host_bytes +
+        return c.panel_host_mem_factor *
+               bounds_panel_counts(pt; tau=tau, m=m,
+                                   augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes)).host_bytes +
                c.bounds_host_mem_base
-    return c.bounds_host_mem_factor * bounds_counts(pt; tau=tau, m=m).host_bytes +
+    return c.bounds_host_mem_factor *
+           bounds_counts(pt; tau=tau, m=m, augment=bounds_augment(pt, c, m; vram_capacity_bytes=vram_capacity_bytes)).host_bytes +
            c.bounds_host_mem_base
 end
 
@@ -1856,9 +2844,18 @@ it once the allocation is known. Note, however, that the choice is circular: the
 prediction sizes the request, the request picks the card, and the card picks the
 path. A caller sizing a job should evaluate candidate cards and take the first
 that fits rather than expect one pass to settle it.
+
+`indices` (`ComputeBounds` only, `nothing` for the whole loop) predicts one
+`--outer-range` block: the front end in full, the outer loop only over those
+channel indices. The memory numbers are unchanged by it, since a block holds the
+same front end, so only `time_s` and `device_time_s` move. See `bounds_time_s`.
 """
 function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_for("molering");
-                 pad::Bool=true, vram_capacity_bytes::Union{Nothing,Real}=nothing)
+                 pad::Bool=true, vram_capacity_bytes::Union{Nothing,Real}=nothing,
+                 indices::Union{Nothing,AbstractUnitRange{Int}}=nothing)
+    indices === nothing || job == ComputeBounds || throw(ArgumentError(
+        "`indices` slices the bounds job's outer loop over channel indices; it means " *
+        "nothing for $(job)"))
     if job == GenerateGreens
         # CPU-only job: no device-bound share to stretch for a GPU slice, and no
         # card, so `vram_capacity_bytes` has nothing to select.
@@ -1873,7 +2870,8 @@ function predict(job::JobKind, pt::SRPoint, coeffs::Coefficients=coefficients_fo
         floor = rsvd_vram_floor_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
     elseif job == ComputeBounds
         mode = bounds_mode(pt, vram_capacity_bytes, coeffs)
-        t, device_t = bounds_time_s(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
+        t, device_t = bounds_time_s(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes,
+                                    indices=indices)
         host = bounds_host_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
         vram = bounds_vram_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)
         floor = bounds_vram_floor_bytes(pt, coeffs; vram_capacity_bytes=vram_capacity_bytes)

@@ -3,11 +3,15 @@ module SMRSystems
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
 export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
 export load_green_function, file_prefix, fix_mask, serialize_atomic
+export GapRefinement, gap_refinement, refine_body, dof_length, mesh_tag, CmpBlkOprVac, AsyCmpBlkOprVac
+export mesh, sender_mesh, receiver_mesh, refinement, is_refined, MIN_GAP_CELLS
 
 using GilaElectromagnetics
 using Serialization
 using Dates
 using ..Params
+
+include("refinement.jl")
 
 """
     SMRVolumeSymbol
@@ -60,6 +64,14 @@ A structure representing 3 volumes, a sender, mediator (optional), and receiver,
 - `design_volume::GlaVol`: The design volume.
 - `design_regions::AbstractVector{SMRVolumeSymbol}`: The regions that are part of the design volume.
 - `χ::ComplexF64`: The complex susceptibility of the mediator.
+- `sender_mesh::GlaCmpVol`: The tiling the sender is actually discretized on.
+- `receiver_mesh::GlaCmpVol`: The tiling the receiver is actually discretized on.
+- `refinement::Union{Nothing, GapRefinement}`: How the two meshes were refined at
+    the gap, or `nothing` when they are the plain volumes.
+
+The volumes stay the coarse cuboids whatever the meshes are, so anything that
+names an experiment or measures a separation reads the plain geometry. The Green
+operators and the degree of freedom counts are built from the meshes.
 """
 struct SMRSystem
     sender_volume::GlaVol
@@ -68,7 +80,17 @@ struct SMRSystem
     design_volume::GlaVol
     design_regions::AbstractVector{SMRVolumeSymbol}
     χ::ComplexF64
+    sender_mesh::GlaCmpVol
+    receiver_mesh::GlaCmpVol
+    refinement::Union{Nothing, GapRefinement}
 end
+
+SMRSystem(sender_volume::GlaVol, mediator_volume::Union{Nothing, GlaVol},
+          receiver_volume::GlaVol, design_volume::GlaVol,
+          design_regions::AbstractVector{SMRVolumeSymbol}, χ::ComplexF64) =
+    SMRSystem(sender_volume, mediator_volume, receiver_volume, design_volume,
+              design_regions, χ, GlaCmpVol(sender_volume), GlaCmpVol(receiver_volume),
+              nothing)
 
 sender(system::SMRSystem) = system.sender_volume
 mediator(system::SMRSystem) = system.mediator_volume
@@ -78,6 +100,42 @@ universe(system::SMRSystem) = design(system)
 
 design_regions(system::SMRSystem) = system.design_regions
 universe_regions(system::SMRSystem) = design_regions(system)
+
+sender_mesh(system::SMRSystem) = system.sender_mesh
+receiver_mesh(system::SMRSystem) = system.receiver_mesh
+refinement(system::SMRSystem) = system.refinement
+is_refined(system::SMRSystem) = !isnothing(system.refinement)
+
+"""
+    mesh(system::SMRSystem, symbol::SMRVolumeSymbol)
+
+Get the tiling that the given volume of the system is discretized on.
+
+# Arguments
+- `system::SMRSystem`: The SMR system.
+- `symbol::SMRVolumeSymbol`: The volume symbol (Sender, Mediator, or Receiver).
+    `Design` has no tiling: the universe spans the gap, and a composite volume is
+    one solid cuboid.
+
+# Return
+- `mesh::GlaCmpVol`: The tiling corresponding to the given symbol. It is the plain
+    volume unless the gap was refined.
+"""
+function mesh(system::SMRSystem, symbol::SMRVolumeSymbol)
+    symbol == Sender && return sender_mesh(system)
+    symbol == Receiver && return receiver_mesh(system)
+    symbol == Mediator && return GlaCmpVol(mediator(system))
+    # `CmpBlkOprVac` assembles the universe out of the two meshes instead.
+    symbol == Design && throw(ArgumentError("The universe spans the gap between the sender and the receiver, so it has no single tiling. Ask for the sender and receiver meshes instead."))
+    throw(ArgumentError("Invalid SMRVolumeSymbol: $symbol"))
+end
+
+# The cache-key fragment for one volume of the system, empty when its mesh is the
+# plain volume. See `mesh_tag`.
+volume_tag(system::SMRSystem, symbol::SMRVolumeSymbol) =
+    symbol == Design ? mesh_tag(sender_mesh(system), sender(system)) *
+                       mesh_tag(receiver_mesh(system), receiver(system)) :
+                       mesh_tag(mesh(system, symbol), volume(system, symbol))
 
 χ(system::SMRSystem) = system.χ
 susceptibility(system::SMRSystem) = χ(system)
@@ -126,7 +184,13 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3,
     return SMRSystem(sender_volume, mediator_volume, receiver_volume, design_volume, design_regions, χ)
 end
 
-function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64)
+# `refine_gap` is on by default. The cross-scale jacobian that made a two-scale
+# composite mesh give an indefinite Asym(G⁰ᵤᵤ) is fixed upstream (rev d4c0516), and
+# with it the universe operator is positive semidefinite to roundoff again, so a
+# near separation is meshed the way its quadrature needs. `--no-refine` turns it
+# off and takes the plain uniform volumes. bench/refined_near_field.jl is the
+# measurement.
+function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64; refine_gap::Bool=true)
 
     if scale > zero(typeof(scale))
         scale = (scale, scale, scale)
@@ -158,27 +222,42 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
     end
     design_volume = union(design_volumes...)
 
-    return SMRSystem(sender_volume, nothing, receiver_volume, design_volume, design_regions, χ)
+    ref = refine_gap ? gap_refinement(abs(rs_separation_wl[1]), scale[1]) : nothing
+    if isnothing(ref)
+        return SMRSystem(sender_volume, nothing, receiver_volume, design_volume, design_regions, χ)
+    end
+    # The sender faces the gap across its high-x surface and the receiver across
+    # its low-x one, so the two slabs sit on opposite faces.
+    return SMRSystem(sender_volume, nothing, receiver_volume, design_volume,
+                     design_regions, χ,
+                     refine_body(sender_volume, ref, :high),
+                     refine_body(receiver_volume, ref, :low), ref)
 end
 
-function SMRSystem(sender_num_cells::NTuple{3, Int}, mediator_num_cells::Union{Nothing, NTuple{3, Int}}, receiver_num_cells::NTuple{3, Int}, sm_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, mr_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, rs_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, scale::Rational{Int}, χ::ComplexF64)
+function SMRSystem(sender_num_cells::NTuple{3, Int}, mediator_num_cells::Union{Nothing, NTuple{3, Int}}, receiver_num_cells::NTuple{3, Int}, sm_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, mr_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, rs_separation_wl::Union{Nothing, NTuple{3, Rational{Int}}}, scale::Rational{Int}, χ::ComplexF64; refine_gap::Bool=true)
     if isnothing(mediator_num_cells)
         design_regions = [Sender, Receiver]
-        return SMRSystem(sender_num_cells, rs_separation_wl, receiver_num_cells, design_regions, scale, χ)
+        return SMRSystem(sender_num_cells, rs_separation_wl, receiver_num_cells, design_regions, scale, χ; refine_gap=refine_gap)
     end
+    # Gap refinement is derived for the sender/receiver pair alone, so a system
+    # with a mediator keeps the plain meshes it always had.
     design_regions = [Mediator]
     return SMRSystem(sender_num_cells, sm_separation_wl, mediator_num_cells, mr_separation_wl, receiver_num_cells, design_regions, scale, χ)
 end
 
 # Generate the filename for the Green's function between the target and source volumes.
-function green_fname(target_volume::GlaVol, source_volume::GlaVol)
+# `target_tag` and `source_tag` name each side's refinement and are empty for a
+# plain volume, so an unrefined system keys its blocks where a finished sweep's
+# preload directory already has them.
+function green_fname(target_volume::GlaVol, source_volume::GlaVol,
+                     target_tag::AbstractString="", source_tag::AbstractString="")
     rational2str(r::Rational) = string(numerator(r), "ss", denominator(r))
-    if target_volume == source_volume
+    if target_volume == source_volume && target_tag == source_tag
          # Self green function
          which = "self"
          size = join(target_volume.cel, "x")
          scale = join(map(rational2str, target_volume.scl), "x")
-         return "$(which)/$(size)_$(scale).glaG0"
+         return "$(which)/$(size)_$(scale)$(target_tag).glaG0"
     end
     # External green's function
     which = "ext"
@@ -188,8 +267,14 @@ function green_fname(target_volume::GlaVol, source_volume::GlaVol)
     size_target = join(target_volume.cel, "x")
     scale_target = join(map(rational2str, target_volume.scl), "x")
     pos_target = join(map(rational2str, target_volume.org), "x")
-    return "$(which)/$(size_source)_$(scale_source)@$(pos_source)_to_$(size_target)_$(scale_target)@$(pos_target).glaG0"
+    return "$(which)/$(size_source)_$(scale_source)@$(pos_source)$(source_tag)_to_$(size_target)_$(scale_target)@$(pos_target)$(target_tag).glaG0"
 end
+
+# The same path relative to the preload directory, for two volumes of a system,
+# with each side's refinement tag filled in.
+green_fname(system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol) =
+    green_fname(volume(system, target), volume(system, source),
+                volume_tag(system, target), volume_tag(system, source))
 
 """
     volume(system::SMRSystem, symbol::SMRVolumeSymbol)
@@ -298,6 +383,9 @@ Load or generate the vacuum Green's function operator G₀ between the target an
 - `G₀::VacuumGreenOperator`: The vacuum Green's function operator between the target and source volumes.
 """
 function load_green_function(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol; force_generate::Bool=false, save_to_disk::Bool=true)
+    is_refined(system) && return _load_green_composite(environment, system, target, source;
+                                                       force_generate=force_generate,
+                                                       save_to_disk=save_to_disk)
     target_volume = volume(system, target)
     source_volume = volume(system, source)
 
@@ -341,7 +429,74 @@ function load_green_function(environment::ComputeEnvironment, system::SMRSystem,
     @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
     return G₀
 end
+
+# The refined counterpart of the single block path. The mesh of a refined body is
+# a tiling rather than a cuboid, so its block is a composite operator.
+function _load_green_composite(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol; force_generate::Bool=false, save_to_disk::Bool=true)
+    target_mesh = mesh(system, target)
+    source_mesh = mesh(system, source)
+
+    fpath = joinpath(preload_dir(environment), green_fname(system, target, source))
+
+    if isfile(fpath) && !force_generate
+        @info string(now()) * " [SMRSystem::load_green_function] Loading composite G₀ from $(fpath)"
+        G₀ = open(io -> deserialize(io, GlaCmpOprVac), fpath, "r")
+        @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
+    else
+        @info string(now()) * " [SMRSystem::load_green_function] Generating composite G₀"
+        G₀ = GlaCmpOprVac(target_mesh, source_mesh)
+        @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
+        if save_to_disk
+            @info string(now()) * " [SMRSystem::load_green_function] Saving G₀ to $(fpath)"
+            serialize_atomic(fpath, G₀)
+        end
+    end
+    if use_gpu(environment)
+        @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
+        useGpu!(G₀)
+    end
+    @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
+    return G₀
+end
+
+# The refined counterpart of the multi-region path. Gila's composite volume has to
+# be one solid cuboid, so the universe of two separated bodies is assembled here as
+# a block matrix over the two meshes. The four blocks go to disk on their own and
+# the assembly is rebuilt on load.
+function _load_green_block(environment::ComputeEnvironment, system::SMRSystem, targets::Vector{SMRVolumeSymbol}, source::Vector{SMRVolumeSymbol}; force_generate::Bool=false, save_to_disk::Bool=true)
+    fpath = joinpath(preload_dir(environment), green_fname(system, Design, Design))
+
+    if isfile(fpath) && !force_generate
+        @info string(now()) * " [SMRSystem::load_green_function] Loading block composite G₀ from $(fpath)"
+        G₀ = CmpBlkOprVac(open(deserialize, fpath, "r")::Matrix{GlaCmpOprVac})
+        @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
+    else
+        @info string(now()) * " [SMRSystem::load_green_function] Generating block composite G₀"
+        target_meshes = GlaCmpVol[mesh(system, t) for t in targets]
+        source_meshes = GlaCmpVol[mesh(system, s) for s in source]
+        G₀ = CmpBlkOprVac(target_meshes, source_meshes)
+        @info string(now()) * " [SMRSystem::load_green_function] Loaded G₀"
+        if save_to_disk
+            @info string(now()) * " [SMRSystem::load_green_function] Saving G₀ to $(fpath)"
+            serialize_atomic(fpath, G₀.blocks)
+        end
+    end
+    if use_gpu(environment)
+        @info string(now()) * " [SMRSystem::load_green_function] Moving G₀ to GPU"
+        useGpu!(G₀)
+    end
+    @info string(now()) * " [SMRSystem::load_green_function] Using G₀:" G₀
+    return G₀
+end
+
 function load_green_function(environment::ComputeEnvironment, system::SMRSystem, targets::Vector{SMRVolumeSymbol}, source::Vector{SMRVolumeSymbol}; force_generate::Bool=false, save_to_disk::Bool=true)
+    if is_refined(system)
+        length(targets) > 1 || length(source) > 1 ||
+            return _load_green_composite(environment, system, targets[1], source[1];
+                                         force_generate=force_generate, save_to_disk=save_to_disk)
+        return _load_green_block(environment, system, targets, source;
+                                 force_generate=force_generate, save_to_disk=save_to_disk)
+    end
     target_is_design = false
     if length(targets) > 1
         target_is_design = true
@@ -407,10 +562,16 @@ function file_prefix(system::SMRSystem)
 
     universe_string = prod(volume_symbol2char.(universe_regions(system)))
 
+    # Empty unless the gap was refined, so an unrefined point keeps its usual
+    # scratch key. The table entry alone identifies the refinement: the sizes it is
+    # clamped against are already in the prefix.
+    ref = refinement(system)
+    refinement_string = isnothing(ref) ? "" : "__refF$(ref.factor)T$(ref.thickness)"
+
     if isnothing(medium_volume)
-        prefix = "$(sender_size)__$(receiver_size)__$(numerator(spacing))ss$(denominator(spacing))__$(universe_string)"
+        prefix = "$(sender_size)__$(receiver_size)__$(numerator(spacing))ss$(denominator(spacing))__$(universe_string)$(refinement_string)"
     else
-        prefix = "$(sender_size)__$(medium_size)__$(receiver_size)__$(numerator(spacing))ss$(denominator(spacing))__$(universe_string)"
+        prefix = "$(sender_size)__$(medium_size)__$(receiver_size)__$(numerator(spacing))ss$(denominator(spacing))__$(universe_string)$(refinement_string)"
     end
     return prefix
 end

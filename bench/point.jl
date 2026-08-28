@@ -124,6 +124,13 @@ rides the backfill queue at low priority):
                           overrides for `bounds_from_spectrum`'s own keywords.
                           Left unset they inherit the production defaults, which is
                           what a calibration point wants.
+  --refine                refine the two facing surfaces when the separation is
+                          under `MIN_GAP_CELLS` coarse cells, the same mesh
+                          `src/common.jl` spells `--refine`. Off by default here,
+                          unlike production: a calibration point measures the plain
+                          cuboid meshes unless the tier asks otherwise, and the
+                          rows already on disk were measured that way. The row
+                          records which it was in its `refine` extra.
 """
 
 using PhotonicSystemChannels
@@ -239,6 +246,7 @@ struct PointSpec
     pencil_cache_max::Union{Nothing,Int}
     tau_refine_tol::Union{Nothing,Float64}
     design::String
+    refine_gap::Bool
 end
 
 function PointSpec(opts::Dict{String,String})
@@ -284,7 +292,8 @@ function PointSpec(opts::Dict{String,String})
                      haskey(opts, "tau-window") ? parse(Int, opts["tau-window"]) : nothing,
                      haskey(opts, "pencil-cache-max") ? parse(Int, opts["pencil-cache-max"]) : nothing,
                      haskey(opts, "tau-refine-tol") ? parse(Float64, opts["tau-refine-tol"]) : nothing,
-                     lowercase(getopt(opts, "design", "sr")))
+                     lowercase(getopt(opts, "design", "sr")),
+                     getopt(opts, "refine", "false") in ("true", "1", "yes"))
 end
 
 """
@@ -327,7 +336,8 @@ function build_system(spec::PointSpec)
                      spec.receiver_cells,
                      design_regions_for(spec.design),
                      spec.scale,
-                     spec.chi)
+                     spec.chi;
+                     refine_gap=spec.refine_gap)
 end
 
 function build_environment(spec::PointSpec)
@@ -375,6 +385,10 @@ function emit(spec::PointSpec, m::Measurement; baseline_rss, baseline_vram, vram
         name == m.headline && continue
         push!(extras, "t_$(name)=$(@sprintf("%.6g", seconds))")
     end
+    # Which mesh the row was measured on, so that `bench/fit.jl` fits it against
+    # the block laws the job actually ran rather than against whatever `SRPoint`
+    # defaults to.
+    spec.refine_gap && push!(extras, "refine=1")
     isempty(spec.note) || push!(extras, spec.note)
 
     row = csv_row(
@@ -629,7 +643,10 @@ end
 function point_bounds_core(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
-    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    # Off the meshes rather than off the spec's cell counts: a point close enough
+    # for the gap refinement to fire is discretized on more degrees of freedom
+    # than its two cuboids have cells.
+    N_u = dof_length(sender_mesh(smr)) + dof_length(receiver_mesh(smr))
 
     G₀_uu = load_green_function(env, smr, [Sender, Receiver], [Sender, Receiver])
     Γ, V, Γrs, num_pos = synthetic_spectrum(spec, N_u)
@@ -648,9 +665,14 @@ function point_bounds_core(spec::PointSpec)
             # `on_outer_error=:stop` so that a loop that cannot run on synthetic
             # input still returns the setup-stage timings, which are measured
             # before it and are the whole point of this measurement.
+            # `k_uu = 0`: the calibration measures the plain projected front end,
+            # which is what every fitted coefficient in bench/coeffs_*.jl describes
+            # and what `bounds_augment_mode = "off"` predicts. Letting the default
+            # augmentation fire here would put an Asym(G⁰ᵤᵤ) solve and an
+            # m_aug-sized pencil stage into rows the model reads as unaugmented.
             result = bounds_from_spectrum(env, smr, Γ, V, Γrs;
                                           G₀_uu=G₀_uu, outer_indices=outer_indices,
-                                          on_outer_error=:stop)
+                                          on_outer_error=:stop, k_uu=0)
         catch err
             frames = stacktrace(catch_backtrace())
             where_str = isempty(frames) ? "unknown" :
@@ -1008,7 +1030,7 @@ function point_mem_rsvd(spec::PointSpec)
     _, dt = timed(() -> PhotonicSystemChannels._generate_rsvd_sr(env, smr, params);
                   device_sync=true)
     written = isfile(jld) ? filesize(jld) : 0
-    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    N_u = dof_length(sender_mesh(smr)) + dof_length(receiver_mesh(smr))
     c = spec.rank + spec.oversamples
     return Measurement(times=Dict("stage" => dt), headline="stage",
                        bytes_written=written,
@@ -1104,7 +1126,7 @@ function point_stage_rsvd(spec::PointSpec)
     end
     before = isfile(jld) ? filesize(jld) : 0
 
-    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    N_u = dof_length(sender_mesh(smr)) + dof_length(receiver_mesh(smr))
     c = spec.rank + spec.oversamples
     plan = _forced_plan(spec, env, N_u)
     notes = ["N_u=$N_u", "sketch_width=$c", "seed=$(spec.seed)",
@@ -1215,7 +1237,7 @@ function point_stage_bounds(spec::PointSpec)
     env = build_environment(spec)
     smr = build_system(spec)
     params = RSVDParams(spec.rank, spec.oversamples, spec.power_iters, spec.seed)
-    N_u = 3 * (prod(spec.sender_cells) + prod(spec.receiver_cells))
+    N_u = dof_length(sender_mesh(smr)) + dof_length(receiver_mesh(smr))
     stored = _stored_num_pos(env, smr)
     notes = ["N_u=$N_u", "gamma_rtol=$(@sprintf("%.6g", spec.gamma_rtol))"]
     stored === nothing || push!(notes, "stored_num_pos=$stored")
@@ -1249,8 +1271,11 @@ function point_stage_bounds(spec::PointSpec)
     m = inputs.num_pos
     idxs = outer_index_blocks(m, spec.outer_blocks, spec.outer_block_len)
     isempty(idxs) && (idxs = [1])
+    # `k_uu = 0`: see the note in the synthetic-input measurement above. The
+    # augmented path needs its own calibration rows, not rows the fit cannot tell
+    # apart from unaugmented ones.
     kwargs = Dict{Symbol,Any}(:num_pos => m, :outer_indices => idxs,
-                              :on_outer_error => :stop)
+                              :on_outer_error => :stop, :k_uu => 0)
     spec.tau_window === nothing || (kwargs[:tau_window] = spec.tau_window)
     spec.pencil_cache_max === nothing || (kwargs[:pencil_cache_max] = spec.pencil_cache_max)
     spec.tau_refine_tol === nothing || (kwargs[:tau_refine_tol] = spec.tau_refine_tol)

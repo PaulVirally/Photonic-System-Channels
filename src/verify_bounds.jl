@@ -331,7 +331,7 @@ function _verify_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem;
 
     # Full-space
     s_projector = projected_operators(G₀_uu, smr, compute_env)
-    G⁰ᵤᵤ_asym = asym(LinearMap(G₀_uu))
+    G⁰ᵤᵤ_asym = asym_self(G₀_uu)
     family = full_space_family(gs_pos, Γ_pos, ζ, s_projector, G⁰ᵤᵤ_asym)
 
     x₀ = similar(gs_pos, size(gs_pos, 1))

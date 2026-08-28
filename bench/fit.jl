@@ -1637,6 +1637,12 @@ end
 Reconstruct the point a row was measured at. `num_pos` is taken from the row when
 the measurement reported it, so that bounds fits use the real value instead of
 the `NUM_POS_FRACTION` guess.
+
+`refine_gap` comes from the `refine` extra `bench/point.jl` writes, and is false
+for a row that predates it. `bench/point.jl` refines only when a tier asks with
+`--refine`, so a silent row is an unrefined measurement whatever `SRPoint` now
+defaults to, and reading it off the row is what keeps a near-separation greens row
+from being fitted against block laws its job never ran.
 """
 function row_to_srpoint(row::Row)
     c = cells(row)
@@ -1661,7 +1667,8 @@ function row_to_srpoint(row::Row)
                    oversamples=something(int(row, "oversamples"), 50),
                    power_iters=something(int(row, "power_iters"), 14),
                    threads=something(int(row, "threads"), 4),
-                   num_pos=num_pos)
+                   num_pos=num_pos,
+                   refine_gap=get(ex, "refine", 0.0) != 0.0)
 end
 
 """

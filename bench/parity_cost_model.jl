@@ -9,6 +9,22 @@ text on stdout. Diff two dumps to see whether a change to the model moved anythi
     git stash && julia bench/parity_cost_model.jl > before.txt && git stash pop
     diff before.txt after.txt
 
+# Three modes
+
+    (no argument)  the production grid, as the jobs will really run it
+    --baseline     the same grid with `refine_gap = false` spelled out
+    --refined      the near band only, at the five refined separations
+
+Gap refinement is on by default, so the default dump and `--baseline` are no longer
+the same. `SEPARATIONS` holds exactly one gap under `MIN_GAP_CELLS`, namely
+`1//32`, and its rows are the ones that differ: 5184 of the 36288, one per
+(cluster, geometry, scale, rank, num_pos, capacity, job) at that separation. Every
+other separation is at or beyond the six coarse cells the quadrature needs, or is
+contact, and refinement leaves those meshes alone, so those rows have to agree
+exactly. A change to the refinement code that reaches one of them shows up as a
+difference where there should be none. `--refined` is the near band on its own, and
+`--baseline` is the unrefined dump a `--no-refine` sweep would run.
+
 # Why this exists
 
 The model has two kinds of change. One deliberately moves a prediction: a refit, a
@@ -52,21 +68,26 @@ const GEOMETRIES = ((8, 8, 8), (16, 16, 16), (24, 24, 24), (32, 32, 32),
                     (64, 32, 32), (128, 32, 32))
 const SCALES = (1 // 32, -1 // 8)
 const SEPARATIONS = (0 // 1, 1 // 32, 1 // 2, 1 // 1, 10 // 1, 1000 // 1, 50000 // 1)
+# The five gaps under `MIN_GAP_CELLS` at the production x scale, that is, every
+# separation `--refine` refines. `1//32` is in the grid above as well, where it
+# stands for the same geometry left unrefined.
+const REFINED_SEPARATIONS = (1 // 32, 1 // 16, 3 // 32, 1 // 8, 5 // 32)
 const RANKS = (400, 800, 1350, 4000)
 const NUM_POS = (nothing, 900, 1832)
 const CAPACITIES = (nothing, 20 * 2^30, 40 * 2^30, 80 * 2^30)
 
-function main()
+function dump(separations, refine_gap::Bool)
     load_coefficients!(@__DIR__)
     n = 0
     for cluster in CLUSTERS
         coeffs = coefficients_for(cluster)
-        for cells in GEOMETRIES, scale in SCALES, sep in SEPARATIONS,
+        for cells in GEOMETRIES, scale in SCALES, sep in separations,
             rank in RANKS, num_pos in NUM_POS
 
             scl = scale < 0 ? (1 // 32, abs(scale), abs(scale)) : (scale, scale, scale)
             pt = SRPoint(cells, cells; scale=scl, separation=sep, rank=rank,
-                         oversamples=50, power_iters=14, threads=4, num_pos=num_pos)
+                         oversamples=50, power_iters=14, threads=4, num_pos=num_pos,
+                         refine_gap=refine_gap)
             for capacity in CAPACITIES, job in (GenerateGreens, GenerateRSVD, ComputeBounds)
                 p = predict(job, pt, coeffs; pad=true, vram_capacity_bytes=capacity)
                 @printf("%s %s %s %s %d %s %s %s | %.9g %.9g %.9g %.9g %.9g %s\n",
@@ -82,6 +103,12 @@ function main()
     return n
 end
 
+function main(argv::Vector{String}=String[])
+    "--baseline" in argv && return dump(SEPARATIONS, false)
+    "--refined" in argv && return dump(REFINED_SEPARATIONS, true)
+    return dump(SEPARATIONS, true)
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    main(ARGS)
 end

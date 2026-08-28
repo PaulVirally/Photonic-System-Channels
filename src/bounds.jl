@@ -561,8 +561,6 @@ function bicgstab_gpu(op, b::AbstractVector; preconditioner=nothing, max_iter::I
 end
 
 function projected_operators(G₀_uu::AbstractGlaOpr, smr::SMRSystem, env::ComputeEnvironment)
-    s = sender(smr)
-    r = receiver(smr)
     # G₀_uu.mem.srcVol == G₀_uu.mem.trgVol || error("G₀_uu is not a self operator")
     # union_volume = G₀_uu.mem.srcVol # srcVol == trgVol
     # if union(s, r) != union_volume
@@ -595,8 +593,8 @@ function projected_operators(G₀_uu::AbstractGlaOpr, smr::SMRSystem, env::Compu
     # end
     # s_projector = LinearMap{ComplexF64}(s_projector_action!, s_projector_action!, size(G₀_uu)...; ismutating=true, ishermitian=true)
 
-    sender_size = prod(s.cel)*3
-    receiver_size = prod(r.cel)*3
+    sender_size = dof_length(sender_mesh(smr))
+    receiver_size = dof_length(receiver_mesh(smr))
     sender_projector_action!(s_included_in_u::AbstractVector{ComplexF64}, u::AbstractVector{ComplexF64}) = begin
         # our convention is [sender; receiver]
         fill!(s_included_in_u, zero(eltype(s_included_in_u)))
@@ -1371,8 +1369,8 @@ function load_bounds_inputs(compute_env::ComputeEnvironment, smr::SMRSystem;
             @warn string(now()) * " [bounds_bargaining::load_bounds_inputs] Spectral truncation at gamma_rtol = $(gamma_rtol): keeping $(num_pos) of the $(stored_cols) positive Γ. Γ[$(num_pos)]/Γ[1] = $(Γ[num_pos] / Γ[1]) is kept, Γ[$(num_pos + 1)]/Γ[1] = $(Γ[num_pos + 1] / Γ[1]) is cut. The dropped directions sit at the RSVD's noise floor, so they are neither eigenvectors nor independent of the kept ones"
         end
 
-        sender_size = prod(sender(smr).cel) * 3
-        receiver_size = prod(receiver(smr).cel) * 3
+        sender_size = dof_length(sender_mesh(smr))
+        receiver_size = dof_length(receiver_mesh(smr))
         N_u = sender_size + receiver_size
 
         plan = if plan_override !== nothing
@@ -1884,7 +1882,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     # r_projector, s_projector, u_projector, G₀_uu_disjoint = projected_operators(G₀_uu, smr, compute_env)
     s_projector = projected_operators(G₀_uu, smr, compute_env)
     # G⁰ᵤᵤ_asym = u_projector * asym(LinearMap(G₀_uu)) * u_projector
-    G⁰ᵤᵤ_asym = asym(LinearMap(G₀_uu))
+    G⁰ᵤᵤ_asym = asym_self(G₀_uu)
 
     GC.gc()
     GC.gc()
@@ -1920,8 +1918,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     # projections: D = (−G⁰ᵤᵣ)ᵃ₊ − ζ⁻¹Πᵣ is exact in this basis, because
     # basis'(−G⁰ᵤᵣ)ᵃ₊basis = diag(Γ₊) by the same orthonormality that makes Bₙ
     # diagonal, and basis'Πₛbasis is the Gram matrix of the stored sender rows.
-    sender_size = prod(sender(smr).cel) * 3
-    receiver_size = prod(receiver(smr).cel) * 3
+    sender_size = dof_length(sender_mesh(smr))
+    receiver_size = dof_length(receiver_mesh(smr))
     size(Vur_asym, 1) == sender_size + receiver_size || error(
         "the universe is not [sender; receiver] ($(size(Vur_asym, 1)) ≠ " *
         "$sender_size + $receiver_size), so Πᵣ ≠ 1 − Πₛ and the τ family " *

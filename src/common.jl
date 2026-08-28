@@ -223,6 +223,14 @@ function ArgParse.parse_args()
         "--partial-suffix"
             help = "Bounds only: write the output as <prefix>_partial_<tag>.jld in the project directory instead of <prefix>.jld. Goes with --outer-range: it keeps the blocks of one point from overwriting each other, and keeps anything reading the project directory from mistaking a slice for a finished point"
             arg_type = String
+
+        "--refine"
+            help = "Refine the two facing surfaces when the sender and the receiver are closer than the six cells Gila's quadrature needs. This is the default; the flag is there so that a launcher can say so explicitly"
+            action = :store_true
+
+        "--no-refine"
+            help = "Mesh the sender and the receiver as plain uniform volumes whatever their separation, and accept the quadrature error of the unrefined gap at the near separations"
+            action = :store_true
     end
     args = parse_args(settings)
 
@@ -257,6 +265,14 @@ function ArgParse.parse_args()
         any(args["mr-sep"] .== 1//0) && error("Mediator specified, but mediator–receiver separation was not set")
     end
 
+    # Gap refinement changes the mesh the Green blocks are built on, so it also
+    # changes their cache keys and the scratch key of the point. It is on unless
+    # `--no-refine` turns it off; `--refine` says the default out loud and is
+    # otherwise a no-op.
+    args["refine"] && args["no-refine"] &&
+        error("--refine and --no-refine ask for two different meshes")
+    refine_gap = !args["no-refine"]
+
     if has_mediator
         smr = SMRSystem(
             args["sender"],
@@ -276,9 +292,13 @@ function ArgParse.parse_args()
             args["receiver"],
             design_symbols,
             args["scale"],
-            args["chi"]
+            args["chi"];
+            refine_gap=refine_gap
         )
         @info string(now()) * " [common::parse_args] Using SR system without mediator" rs_separation(smr)
+        if is_refined(smr)
+            @info string(now()) * " [common::parse_args] Refining the gap surfaces" refinement(smr) dof_length(sender_mesh(smr)) dof_length(receiver_mesh(smr))
+        end
     end
 
     rsvd_params = RSVDParams(
@@ -314,7 +334,7 @@ function ArgParse.parse_args()
     end
 
     return compute_env, smr, rsvd_params, gamma_rtol, k_uu, augment_threshold,
-           outer_range, partial_suffix
+           outer_range, partial_suffix, refine_gap
 end
 
 """

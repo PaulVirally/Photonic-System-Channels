@@ -45,8 +45,13 @@ println("workspace: ", ROOT)
 
 const ENV_CPU = ComputeEnvironment(joinpath(ROOT, "preload"), joinpath(ROOT, "project"),
                                    joinpath(ROOT, "scratch"), GPUChoice(false, -1))
+## `refine_gap=false`: these checks are about the bounds algebra, not the mesh, and
+## they are written against the plain uniform universe. The refined mesh of a
+## one-cell gap is a different (and much larger) operator; test/gap_refinement.jl
+## and test/refined_pipeline.jl cover that side.
 const SMR = SMRSystem((2, 2, 2), (1//32, 0//1, 0//1), (2, 2, 2),
-                      SMRVolumeSymbol[Sender, Receiver], 1//32, 13.6 + 0.05im)
+                      SMRVolumeSymbol[Sender, Receiver], 1//32, 13.6 + 0.05im;
+                      refine_gap=false)
 const N_U = 3 * (prod(sender(SMR).cel) + prod(receiver(SMR).cel))
 const K = 8 # num_pos, and the number of outer indices
 
@@ -66,9 +71,16 @@ const G_UU = load_green_function(ENV_CPU, SMR, [Sender, Receiver], [Sender, Rece
 const TAUS = range(0.0, 1.0, length=11)
 
 # The per-index @info lines are the loop's own noise; only warnings matter here.
+#
+# `k_uu = 0` throughout: this file is about the τ search, and `num_pos = K = 8` is
+# below the production `augment_threshold`, so the default would augment every run
+# here and every number below would be a statement about an m_aug = 48 pencil
+# rather than about the window and the cache. The τ machinery is basis-agnostic (it
+# never sees `B` at all) so testing it on the plain basis tests it on both.
+# `test/augmented_basis.jl` covers the augmented path.
 run_bounds(; kwargs...) = with_logger(SimpleLogger(stderr, Logging.Warn)) do
     bounds_from_spectrum(ENV_CPU, SMR, Γ, V, Γrs; num_pos=K, G₀_uu=G_UU, τs=TAUS,
-                         kwargs...)
+                         k_uu=0, kwargs...)
 end
 
 const REF = run_bounds(tau_window=0, pencil_cache_max=0)

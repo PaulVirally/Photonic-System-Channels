@@ -1,0 +1,12 @@
+label,kind,threads,host_GB,time_limit_s,gpu,args
+refg_c8_g1,stage_greens,12,11,4011,0,"--cells 8,8,8 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refg_c8_g3,stage_greens,12,11,5511,0,"--cells 8,8,8 --scale 1//32 --chi 13.6+0.05im --sep 3//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refg_c8_g6,stage_greens,12,11,2741,0,"--cells 8,8,8 --scale 1//32 --chi 13.6+0.05im --sep 3//16 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refg_c32_g1,stage_greens,12,16,9580,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refg_c32_g3,stage_greens,12,13,7132,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 3//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refg_c32_g6,stage_greens,12,12,3022,0,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 3//16 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refmv_ext_c32_g1,matvec_ext,12,16,600,1,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refmv_self_c32_g1,matvec_self,12,16,600,1,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refmv_uu_c32_g1,matvec_uu,12,16,600,1,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine"
+refrsvd_c32_g1,stage_rsvd,12,26,9222,1,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine --scratch $CAL_ROOT/refined/refrsvd_c32_g1 --fresh"
+refbounds_c32_g1,stage_bounds,12,26,2971,1,"--cells 32,32,32 --scale 1//32 --chi 13.6+0.05im --sep 1//32 --rank 800 --oversamples 50 --power-iters 6 --seed 20260827 --refine --scratch $CAL_ROOT/refined/refrsvd_c32_g1 --gamma-rtol 1.0e-12 --outer-blocks 4 --outer-block-len 24"

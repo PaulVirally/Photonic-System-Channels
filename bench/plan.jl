@@ -221,12 +221,16 @@ end
 cells_arg(cells::NTuple{3,Int}) = join(cells, ",")
 rat(r::Rational{Int}) = "$(numerator(r))//$(denominator(r))"
 
+# `refine_gap = false` because the jobs this tier emits do not pass `--refine`,
+# and `bench/point.jl` leaves it off. `SEPARATIONS` reaches down to one cell, where
+# the production default would refine, so the point has to say which mesh it is
+# predicting rather than inherit a default the job does not share.
 as_srpoint(body, separation::Rational{Int}, threads::Int) =
     SRPoint(body.cells, body.cells;
             scale=body.scale < 0 ? (1 // 32, abs(body.scale), abs(body.scale)) :
                   (body.scale, body.scale, body.scale),
             separation=separation, rank=body.rank, oversamples=DEFAULT_OVERSAMPLES,
-            power_iters=DEFAULT_POWER_ITERS, threads=threads)
+            power_iters=DEFAULT_POWER_ITERS, threads=threads, refine_gap=false)
 
 "Resources for a Green-block point: three times the analytic peak, floored at 8 GB."
 function block_resources(cluster::ClusterSpec, body, separation::Rational{Int}, threads::Int)

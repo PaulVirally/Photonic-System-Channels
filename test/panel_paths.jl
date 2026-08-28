@@ -39,8 +39,13 @@ end
 
 # The system generate_rsvd would build for an SR run: (4,4,4) sender and receiver,
 # separation 1/32 λ, scale 1/32 λ per cell, χ = 13.6 + 0.05i. N_u = 3 * (64 + 64).
+## `refine_gap=false`: these checks are about the bounds algebra, not the mesh, and
+## they are written against the plain uniform universe. The refined mesh of a
+## one-cell gap is a different (and much larger) operator; test/gap_refinement.jl
+## and test/refined_pipeline.jl cover that side.
 const SMR = SMRSystem((4, 4, 4), (1//32, 0//1, 0//1), (4, 4, 4),
-                      SMRVolumeSymbol[Sender, Receiver], 1//32, 13.6 + 0.05im)
+                      SMRVolumeSymbol[Sender, Receiver], 1//32, 13.6 + 0.05im;
+                      refine_gap=false)
 const N_U = 3 * (prod(sender(SMR).cel) + prod(receiver(SMR).cel))
 const SEED = 20260814
 const PARAMS = RSVDParams(48, 24, 14, SEED)

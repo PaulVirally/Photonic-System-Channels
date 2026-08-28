@@ -39,12 +39,12 @@ using .CostModel
 # universe is big enough to hold them. 1/4 λ has N_u = 3072 < 4000, so its "rank" is
 # the full spectrum and it goes down the dense-exact path instead.
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_0p25x0p25x0p25_3072comps_50oversamples_32scale"
-const PROJECT_NAME = "molering_Ge1000_arxivV3_0p25x0p25x0p25_3072comps_50oversamples_32scale"
+# const PROJECT_NAME = "molering_Ge1000_arxivV3_0p25x0p25x0p25_3072comps_50oversamples_32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_0p5x0p5x0p5_4000comps_50oversamples_32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_1x1x1_4000comps_50oversamples_32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_2x2x2_4000comps_50oversamples_aniso-64-n32-n32scale"
 # const PROJECT_NAME = "narval_Ge1000_arxivV3_4x4x4_4000comps_50oversamples_aniso-128-n8-n8scale"
-
+const PROJECT_NAME = "molering_Ge1000_arxivV3_4x4x4_4000comps_50oversamples_aniso-128-n8-n8scale_q6"
 
 # Previous project names:
 #   heat-transfer_sep_2x2x0p5_512comps
@@ -85,13 +85,15 @@ How the Green-function stage is submitted. `:sbatch` or `:glost`.
 - `:sbatch` (the default): one `sbatch` job per separation. A 333-separation sweep
   therefore spends 333 of the 1000 running+queued jobs Alliance's `MaxSubmit`
   allows, which is what pins these sweeps at 333 x 3 = 999 jobs.
-- `:glost`: one `sbatch` job runs every separation's Green-function task through
-  GLOST (CEA's Greedy Launcher Of Small Tasks). GLOST is an MPI farm: rank 0 is a
-  manager, and ranks 1..N-1 pull lines out of a task file as they free up. One
-  GLOST job occupies one queue slot no matter how many tasks it holds, so the 333
-  greens jobs collapse to 1 and the slot budget goes to the GPU stages. All the
-  tasks also share one node and one depot, so Julia's compile cache is warm after
-  the first task instead of paying `CostModel.RECOMPILE_OVERHEAD_S` 333 times.
+- `:glost`: every separation's Green-function task runs through GLOST (CEA's Greedy
+  Launcher Of Small Tasks). GLOST is an MPI farm: rank 0 is a manager, and ranks
+  1..N-1 pull lines out of a task file as they free up. A GLOST job occupies one
+  queue slot no matter how many tasks it holds, so the 333 greens jobs collapse to a
+  handful and the slot budget goes to the GPU stages. All the tasks also share one
+  node and one depot, so Julia's compile cache is warm after the first task instead
+  of paying `CostModel.RECOMPILE_OVERHEAD_S` 333 times. The farm is submitted as a
+  chain of short, resumable links rather than one long job: see `GLOST_LINK_HOURS`
+  and `glost_chain_block`.
 
 Only the CPU-only Green-function job can be farmed this way. The GPU stages need
 one GPU each and stay as ordinary `sbatch` jobs. GLOST is an MPI program from the
@@ -157,6 +159,33 @@ const GLOST_MAX_TIME_S = 7 * 24 * 3600
 const GLOST_DRAIN_LEAD_S = 600
 
 """
+    GLOST_LINK_HOURS
+
+Walltime cap on one *link* of the Green-function chain, in hours.
+
+The farm is not submitted as one multi-hour job. `glost_walltime_s` still says how
+long the whole sweep needs, but that time is served by a chain of
+`ceil(walltime / link) + 1` sbatch jobs, each asking for at most `GLOST_LINK_HOURS`
+and each depending `afterany` on the one before it. At a low priority a 7-hour job
+sits behind everything while a 2-hour job backfills into gaps, so the chain starts
+sooner and, once the first link runs, the rest of the chain is already queued behind
+it.
+
+Every link runs the same task file through the same resume filter (see
+`glost_link_block`), so a link that the scheduler kills at its time limit loses only
+the tasks that were in flight; the next link picks up whatever is still missing.
+The `+ 1` is a spare link: it exists so that, in the common case where the work
+finishes inside the budget, the *last* link starts with an empty remaining list and
+exits 0 in seconds. That is what the RSVD jobs hang their `afterok` on.
+
+Two hours works well on the Alliance clusters: short enough to backfill, long
+enough that the per-link overhead (module loads plus one cold Julia compile, a
+couple of minutes) is noise. Lowering it costs more restarts and more overhead;
+raising it towards the sweep total gives back the single long job.
+"""
+const GLOST_LINK_HOURS = 2.0
+
+"""
     NUM_POS_FRACTION
 
 Assumed fraction of the computed rank that has a positive `Asym(G⁰ᵤᵣ)` eigenvalue.
@@ -184,6 +213,51 @@ but only `load_bounds_inputs` reads it, so the greens and RSVD command lines are
 left without it rather than carrying an argument that does nothing to them.
 """
 const GAMMA_RTOL = 1e-12
+
+"""
+    K_UU, AUGMENT_THRESHOLD
+
+`--k-uu` and `--augment-threshold` for the bounds jobs: augment the projection
+basis with the top `K_UU` eigenvectors of `Asym(G⁰ᵤᵤ)` on every point whose kept
+`m` is below `AUGMENT_THRESHOLD`.
+
+Why this exists at all. The production bounds project every operator into the span
+of the kept positive-Γ eigenvectors of `Asym(G⁰ᵤᵣ)`, and that span collapses with
+separation: on the 1 λ sweep, `s = 357/32 λ` keeps 15 of 196,608 directions. The
+constraint operators (above all `Asym(G⁰ᵤᵤ)`, whose rank does *not* collapse)
+cannot be represented in a 15-dimensional span, so the projected dual stops being a
+bound and under-reports. The exact λ/4 sweep, whose domain is strictly *contained*
+in the 1 λ one, came out above it at the same gap (0.0422 against 0.0178). Adding
+`Asym(G⁰ᵤᵤ)`'s leading eigenvectors back to the basis repairs it:
+`bench/augmented_basis_experiment.jl` measured channel 1 going 0.0178 → 0.2019 at
+that point, monotone in `k_uu` and saturating, and crossing the λ/4 reference at
+`k_uu = 128`.
+
+`AUGMENT_THRESHOLD = 1000` rather than 500. The boundary is a policy: augmenting
+only ever moves a bound towards validity, so what fixes it is where the *reported*
+trace has a step small enough to plot across. At m = 500 the
+q-validation measured the same point 2.5% apart augmented versus not, and the kept
+count jitters by about ±30 between RSVD reruns, which flips points across the
+boundary and turns that 2.5% into sweep noise; at m = 1000 the same comparison is
+inside the line width.
+
+These are `DEFAULT_K_UU` and `DEFAULT_AUGMENT_THRESHOLD` in `src/bounds.jl` written
+out explicitly, for the same reason `GAMMA_RTOL` is: a generated launcher should
+record the numbers its results were produced under rather than inherit whatever the
+default happens to be when it is run. `K_UU = 0` disables the augmentation entirely
+and reproduces the pre-augmentation output bit for bit.
+
+The threshold caps `m` and therefore caps `m_aug = m + K_UU`, at 1512. On the
+larger universes that is more than the dense augmented front end fits in, and
+`clip_k_uu` in `src/bounds.jl` reduces the effective `k_uu` on
+those points; `bounds_augmented_coefficients` below charges the same clip, so the
+`--time` and `--mem` written next to a command line are the clipped job's.
+
+Bounds-only, like `GAMMA_RTOL`: the flags are parsed by every main file but only
+`bounds_from_spectrum` reads them.
+"""
+const K_UU = 512
+const AUGMENT_THRESHOLD = 1000
 
 """
     MIN_MEMORY_GB, MIN_TIME_S
@@ -604,6 +678,28 @@ function fallback_resources(job::JobType, exp::Experiment, cluster::ClusterConfi
 end
 
 """
+    bounds_augmented_coefficients(cluster) -> Coefficients
+
+The cluster's calibrated coefficients with the `Asym(G⁰ᵤᵤ)` augmentation switched on
+at this launcher's `K_UU` / `AUGMENT_THRESHOLD`, so a bounds job's `--time`,
+`--mem` and `--gpus` are sized for the work the command line it is written next to
+will actually do.
+
+`bounds_augment` is consulted only by the `ComputeBounds` predictors, so this is
+safe to use for every job kind: the Green-function and RSVD requests come out
+exactly as they did before.
+
+It also makes the requests card-aware in a second way. `bounds_augment` clips
+`K_UU` to what the named allocation's dense augmented front end fits, exactly as
+`clip_k_uu` does at runtime, so a point that will run at a reduced `k_uu` is sized
+for the reduced one. `select_gpu` below then refuses an allocation on which the
+augmentation is infeasible outright.
+"""
+bounds_augmented_coefficients(cluster::ClusterConfig) =
+    with_augmentation(coefficients_for(cluster.name);
+                      k_uu=K_UU, threshold=AUGMENT_THRESHOLD)
+
+"""
     select_gpu(job, exp, cluster, coeffs, cores) -> NamedTuple
 
 The allocation for one GPU job, chosen by trying every allocation the cluster
@@ -669,7 +765,18 @@ function select_gpu(job::JobType, exp::Experiment, cluster::ClusterConfig,
                      host_GB=host_GB, vram_GB=min(vram_GB, capacity_GB),
                      vram_floor_GB=floor_GB, over_vram=floor_GB > capacity_GB,
                      host_uncapped_GB=host_uncapped_GB)
-        vram_GB <= capacity_GB && host_GB <= bundle_host_GB && return candidate
+        # A bounds job whose augmentation is `:infeasible` on this allocation is one
+        # `clip_k_uu` will refuse to start: not even `K_UU_CLIP_FLOOR` directions of
+        # `Asym(G⁰ᵤᵤ)` fit alongside the dense front end. That is a reason to move up
+        # the ladder, not a memory request to round up, so it fails the fit here the
+        # same way it does in `bench/size_bounds_jobs.jl`'s `select_gpu`. Every other
+        # job kind, and every point that does not augment, answers `:none` and is
+        # unaffected.
+        augment_fits = cost_job(job) != CostModel.ComputeBounds ||
+            bounds_augment(pt, coeffs, bounds_m(pt, coeffs);
+                           vram_capacity_bytes=capacity_GB * 1e9).clip != :infeasible
+        vram_GB <= capacity_GB && host_GB <= bundle_host_GB && augment_fits &&
+            return candidate
     end
     # Nothing fitted: the last candidate is the largest allocation the cluster has,
     # already carrying its own floor-based `over_vram`.
@@ -849,8 +956,9 @@ function job_command(job::JobType, cluster::ClusterConfig, smr::SMRSystem,
                      params::RSVDParams; gpu_index::Int=0)
     job_args = args(smr, params)
     job_args *= uses_gpu(job) ? " --gpu $(gpu_index)" : " --gpu false"
-    # See GAMMA_RTOL: the spectral cut belongs to the bounds stage alone.
-    job == ComputeBoundsJob && (job_args *= " --gamma-rtol $(GAMMA_RTOL)")
+    # See GAMMA_RTOL / K_UU: the spectral cut and the Asym(G⁰ᵤᵤ) augmentation both
+    # belong to the bounds stage alone.
+    job == ComputeBoundsJob && (job_args *= " --gamma-rtol $(GAMMA_RTOL) --k-uu $(K_UU) --augment-threshold $(AUGMENT_THRESHOLD)")
     return "julia --project=. -t $(num_threads(cluster)) $(main_file(job)) $job_args --project $(cluster.project_dir)/$(PROJECT_NAME)/ --scratch $(cluster.scratch_dir)/$(PROJECT_NAME)/"
 end
 
@@ -933,64 +1041,156 @@ function glost_task_line(cluster::ClusterConfig, exp::Experiment)
 end
 
 # One line per experiment, with no header and no comments: GLOST counts lines as
-# tasks, `glost_filter` reads them back positionally, and the pre-step below takes
-# line 1 literally.
+# tasks, the resume filter pairs them line for line with `glost_outputs_file`, and
+# the pre-step inside each link takes the first *remaining* line literally.
 glost_tasks_file(cluster::ClusterConfig, experiments::AbstractVector{Experiment}) =
     join((glost_task_line(cluster, exp) for exp in experiments), "\n") * "\n"
 
 """
-    glost_sbatch_block(cluster, experiments, walltime_s) -> String
+    glost_output_paths(cluster, exp) -> Vector{String}
 
-The single farmed Green-function job, written in the same
-`g0_job=\$(sbatch ... <<EOF ... EOF)` shape as the per-experiment jobs so that the
-RSVD jobs' `--dependency=afterok:\${g0_job}` picks it up unchanged. With `:glost`
-there is one greens job id instead of 333, under the same `job_var_name`, so emitting
-this block in place of the per-experiment ones is all the dependency rewiring there
-is.
+Every Green block one farmed task is supposed to leave in the preload directory,
+as absolute paths.
+
+This is the completion record the chain resumes from, so it has to be exactly what
+`generate_green` writes, in the same order: `_generate_green_sr` builds
+receiver<-sender, then receiver<-receiver, then universe<-universe, and
+`_generate_green_smr` builds the mediator triple (only when the mediator has cells)
+plus receiver<-sender. The names come from `green_fname` itself rather than being
+re-derived here, so the filter cannot drift away from the writer.
+
+The blocks are geometry-keyed and susceptibility-independent, which is why a task
+that an earlier sweep already ran is skipped for free.
 """
-function glost_sbatch_block(cluster::ClusterConfig,
-                            experiments::AbstractVector{Experiment}, walltime_s::Int)
-    var_name = job_var_name(GenerateGreensJob)
+function glost_output_paths(cluster::ClusterConfig, exp::Experiment)
+    smr = to_smr_system(exp)
+    # Through the system rather than the two volumes, so that a refined point's
+    # manifest names the refined blocks the greens job will actually write.
+    path(target, source) = joinpath(cluster.preload_dir,
+                                    PhotonicSystemChannels.SMRSystems.green_fname(smr, target, source))
+    paths = String[]
+    if isnothing(mediator(smr))
+        push!(paths, path(Receiver, Sender))
+        push!(paths, path(Receiver, Receiver))
+        push!(paths, path(Design, Design))
+    else
+        if prod(mediator(smr).cel) != 0
+            push!(paths, path(Mediator, Sender))
+            push!(paths, path(Mediator, Mediator))
+            push!(paths, path(Receiver, Mediator))
+        end
+        push!(paths, path(Receiver, Sender))
+    end
+    return paths
+end
+
+"""
+    glost_outputs_file(cluster, experiments) -> String
+
+The companion to the task file: line `i` is the space-separated list of Green blocks
+task line `i` must produce. Written into the launcher as a quoted heredoc rather than
+shipped as a third file, so the sweep still travels as launcher + task file.
+
+Paths contain no spaces and no glob characters (cells, scales and origins render as
+digits, `x`, `ss`, `@` and `/`), so the unquoted `for f in ...` split in the filter is
+safe.
+"""
+glost_outputs_file(cluster::ClusterConfig, experiments::AbstractVector{Experiment}) =
+    join((join(glost_output_paths(cluster, exp), " ") for exp in experiments), "\n") * "\n"
+
+"The completion manifest lives next to the task file, under the same project key."
+glost_outputs_filename() = "greens_outputs_$(PROJECT_NAME).txt"
+
+"Shell variable holding link `i`'s job id inside the launcher."
+glost_link_var(index::Int) = "g0_link$(index)"
+
+"""
+    glost_chain_shape(walltime_s) -> (link_s, num_links)
+
+How to cut `walltime_s` of farm work into short jobs: every link asks for
+`min(GLOST_LINK_HOURS, walltime_s)` and there are `ceil(walltime_s / link) + 1` of
+them. See `GLOST_LINK_HOURS` for why the chain exists and what the spare link is for.
+
+The chain's total capacity is therefore at least one whole link more than the
+prediction asks for, which is the margin that pays for the per-link module loads and
+cold Julia compile, and for the tasks a time-limit kill leaves half done.
+"""
+function glost_chain_shape(walltime_s::Int)
+    link_s = clamp(round(Int, GLOST_LINK_HOURS * 3600), MIN_TIME_S, GLOST_MAX_TIME_S)
+    link_s = max(MIN_TIME_S, min(link_s, walltime_s))
+    return link_s, ceil(Int, walltime_s / link_s) + 1
+end
+
+"""
+    glost_outputs_block(cluster, experiments) -> String
+
+The launcher line that drops `glost_outputs_file` next to the task file on the
+cluster. The heredoc delimiter is quoted, so nothing in it is expanded at submission
+time.
+"""
+function glost_outputs_block(cluster::ClusterConfig,
+                             experiments::AbstractVector{Experiment})
+    return """
+# ---------------------------------------------------------------------------
+# Completion manifest for the Green-function chain: line i lists the blocks that
+# task line i of $(glost_tasks_filename()) has to leave behind. Each
+# link of the chain reads it to work out what is still missing. Regenerated here
+# rather than copied over, so it can never be a stale pairing with the launcher.
+# ---------------------------------------------------------------------------
+cat > jobs/$(glost_outputs_filename()) <<'GREENS_OUTPUTS_EOF'
+$(glost_outputs_file(cluster, experiments))GREENS_OUTPUTS_EOF
+
+"""
+end
+
+"""
+    glost_link_block(cluster, experiments, link_s, index, num_links) -> String
+
+One link of the Green-function chain: a farm job capped at `link_s`, depending
+`afterany` on the link before it, that runs whatever the resume filter says is still
+missing and then reports whether anything is left.
+
+THE EXIT-CODE INVARIANT, which is what the RSVD stage's `afterok` rests on:
+
+    a link exits 0 if and only if, at the moment it exits, every task in the sweep
+    has all of its Green blocks on disk.
+
+There are exactly two `exit 0` paths and they test the same predicate: the
+remaining list is empty on entry (the link is a no-op), or the remaining list is
+empty after the farm (this link finished the sweep). Everything else is nonzero: a
+failed pre-step exits 1, a link that farmed and still has work left exits 1, and a
+link killed at its time limit never reaches an exit at all and lands in TIMEOUT.
+`afterany` on the *next* link means none of those break the chain, while `afterok`
+on the *last* link means the RSVD jobs are released only if the greens stage is
+genuinely complete. If it is not, they sit unsatisfiable and are purged rather than
+running against half a sweep.
+
+`--dependency=afterany` and not `afterok` between links is the whole point: the
+normal way a link ends when there is real work left is a time-limit kill.
+"""
+function glost_link_block(cluster::ClusterConfig,
+                          experiments::AbstractVector{Experiment},
+                          link_s::Int, index::Int, num_links::Int)
+    var_name = glost_link_var(index)
     tasks = "jobs/$(glost_tasks_filename())"
+    outputs = "jobs/$(glost_outputs_filename())"
     logs_dir = "$(cluster.project_dir)/$(PROJECT_NAME)/logs"
     account = cluster.name in CC_RRG_CLUSTERS ? CC_RRG_NAME : CC_DEFAULT_GROUP_NAME
+    label = "link $(index)/$(num_links)"
     #=
     Everything below that must survive to the *job* script has its `$` escaped
     (`\\\$` in this source): the heredoc delimiter is unquoted, so the submitting
-    shell expands anything left bare, and none of these variables exist there.
+    shell expands anything left bare, and none of these variables exist there. For
+    the same reason there is not a single backtick anywhere in the generated text.
     =#
-    return """
-# ---------------------------------------------------------------------------
-# Green functions, farmed through GLOST: one queue slot for all $(length(experiments)) tasks.
-#
-# $(GLOST_NTASKS) MPI ranks = 1 GLOST manager (rank 0 runs no task when size > 1)
-# + $(GLOST_WORKERS) workers x $(GLOST_CPUS_PER_TASK) threads. Tasks are processes, so each one
-# threads freely; "serial" only means one task per rank.
-#
-# --time=$(slurm_time_string(walltime_s)) = $(GLOST_TIME_SAFETY) x (predicted greens time for the whole
-# sweep) / $(GLOST_WORKERS) workers + $(round(Int, GLOST_TIME_SLACK_S / 60)) min, capped at $(slurm_time_string(GLOST_MAX_TIME_S)).
-#
-# --signal=B:USR1@$(GLOST_DRAIN_LEAD_S): GLOST drains on SIGUSR1. It lets the tasks in flight
-# finish and stops handing out new ones, instead of every worker being killed
-# mid-task at the walltime edge. NOTE the `B:` prefix delivers the signal to the
-# batch shell only. Check in the first smoke test on narval whether it reaches
-# the `srun` step, and so glost_launch. If it does not, drop the `B:` so that
-# Slurm signals the step's tasks directly.
-#
-# To resume after a walltime kill or a partial failure: GLOST logs a per-task exit
-# code, and glost_filter turns that log plus the original task file into the list
-# of tasks that did not finish. Roughly
-#     glost_filter -H $(logs_dir)/greens_glost_<jobid>.out $(tasks) > jobs/greens_remaining.txt
-# but the flags are version-dependent and unverified here, so check
-# `glost_filter -h` on narval. Whatever the flags turn out to be, use glost_filter
-# to extract the unfinished tasks and resubmit this same block pointed at the
-# remaining list.
-# ---------------------------------------------------------------------------
-$var_name=\$(sbatch \\
-    --job-name=$(PROJECT_NAME)_greens_glost \\
-    --output=$(logs_dir)/greens_glost_%j.out \\
+    block = "$(var_name)=\$(sbatch \\\n"
+    if index > 1
+        block *= "    --dependency=afterany:\${$(glost_link_var(index - 1))} \\\n"
+    end
+    block *= """    --job-name=$(PROJECT_NAME)_greens_glost_$(index)of$(num_links) \\
+    --output=$(logs_dir)/greens_glost_$(index)of$(num_links)_%j.out \\
     --account=$(account) \\
-    --time=$(slurm_time_string(walltime_s)) \\
+    --time=$(slurm_time_string(link_s)) \\
     --chdir=$(cluster.code_dir) \\
     --nodes=1 \\
     --ntasks=$(GLOST_NTASKS) \\
@@ -1012,39 +1212,170 @@ module load gcc openmpi glost
 export SLURM_CPUS_PER_TASK=\\\${SLURM_CPUS_PER_TASK:-$(GLOST_CPUS_PER_TASK)}
 
 tasks="$(tasks)"
+outputs="$(outputs)"
 work="\\\${SLURM_TMPDIR:-/tmp}"
+
+#=== resume filter ===========================================================
+# greens_remaining <dest> writes to <dest> every task line whose Green blocks are
+# not all on disk. Line i of the outputs file lists what task line i owes, and a
+# task counts as done only when every one of those is a non-empty file.
+#
+# Why the blocks and not glost_filter. glost_filter rebuilds the unfinished list
+# from a GLOST run log, and that log does not survive a chain: every link is a
+# separate job with its own log, every link farms an already-filtered subset so
+# line numbers stop indexing the original task file, and a task killed in flight
+# at the time limit may never be logged at all. The blocks have none of those
+# problems. They are written through serialize_atomic (temp file plus rename), so
+# a file that exists is a file that is complete; they are what the RSVD stage
+# consumes; and load_green_function already treats "the file is there" as "there
+# is nothing to do", so this filter agrees with the writer by construction. It
+# also credits work done by earlier, unchained submissions of the same sweep.
+greens_remaining() {
+    : > "\\\$1"
+    exec 8< "\\\$tasks"
+    exec 9< "\\\$outputs"
+    while IFS= read -r task_line <&8; do
+        IFS= read -r want <&9 || want=""
+        need=0
+        for f in \\\$want; do
+            if [ ! -s "\\\$f" ]; then need=1; break; fi
+        done
+        if [ "\\\$need" -eq 1 ]; then printf '%s\\n' "\\\$task_line" >> "\\\$1"; fi
+    done
+    exec 8<&-
+    exec 9<&-
+}
+#============================================================================
+
+greens_remaining "\\\$work/greens_remaining.txt"
+nleft=\\\$(wc -l < "\\\$work/greens_remaining.txt")
+echo "[glost] $(label): \\\$nleft of $(length(experiments)) tasks are still missing Green blocks"
+if [ "\\\$nleft" -eq 0 ]; then
+    echo "[glost] $(label): nothing left to do, the sweep is complete"
+    exit 0
+fi
 
 #=== shared-preload pre-step =================================================
 # The self Green function is named after geometry alone (self/<cells>_<scale>),
 # so the receiver self block is identical for every separation in the sweep, and
 # $(GLOST_WORKERS) workers starting at once would all check-then-build it. Build it once,
-# serially, by running task line 1 here and farming only lines 2..N.
+# serially, by running the first line of the remaining list here and farming only
+# the rest of it. Any remaining task builds the shared block, so this works the
+# same on the first link and on a resumed one.
 #
 # bench/generate_single_greens.jl cannot do this job as it stands. It calls
 # load_greens_function (the exported name is load_green_function, so it throws
 # immediately), it passes save_to_disk=false with an empty preload dir, so even
 # fixed it would leave no file behind, and it hardcodes cubic (n,n,n) volumes at
 # an isotropic 1//32 scale, so it cannot express the anisotropic sweeps
-# (scale < 0 meaning (1//32,|s|,|s|)) or non-cubic senders. Running the first
-# task line instead builds the shared block through the same code path the
-# farmed tasks use, and gets that separation's own blocks done at the same time,
-# so no work is duplicated.
-head -n 1 "\\\$tasks" > "\\\$work/greens_preload.sh"
-tail -n +2 "\\\$tasks" > "\\\$work/greens_farm.txt"
-echo "[glost] pre-step: building the shared self blocks via task 1"
+# (scale < 0 meaning (1//32,|s|,|s|)) or non-cubic senders. Running a real task
+# line instead builds the shared block through the same code path the farmed
+# tasks use, and gets that separation's own blocks done at the same time, so no
+# work is duplicated.
+head -n 1 "\\\$work/greens_remaining.txt" > "\\\$work/greens_preload.sh"
+tail -n +2 "\\\$work/greens_remaining.txt" > "\\\$work/greens_farm.txt"
+echo "[glost] pre-step: building the shared self blocks via the first remaining task"
 bash "\\\$work/greens_preload.sh" || { echo "[glost] pre-step FAILED; refusing to farm into a race"; exit 1; }
 echo "[glost] pre-step done"
 #============================================================================
 
 nfarm=\\\$(wc -l < "\\\$work/greens_farm.txt")
-echo "[glost] farming \\\$nfarm tasks over $(GLOST_WORKERS) workers"
-srun glost_launch "\\\$work/greens_farm.txt"
+if [ "\\\$nfarm" -gt 0 ]; then
+    echo "[glost] farming \\\$nfarm tasks over $(GLOST_WORKERS) workers"
+    srun glost_launch "\\\$work/greens_farm.txt"
+else
+    echo "[glost] the pre-step was the only task left; nothing to farm"
+fi
+
+#=== completion gate =========================================================
+# Exit 0 if and only if the whole sweep is on disk. The next link depends on this
+# one with afterany, so a nonzero exit does not break the chain; the RSVD jobs
+# depend on the LAST link with afterok, so a nonzero exit there is what stops
+# them from running against an incomplete greens stage.
+greens_remaining "\\\$work/greens_still_missing.txt"
+nleft=\\\$(wc -l < "\\\$work/greens_still_missing.txt")
+if [ "\\\$nleft" -eq 0 ]; then
+    echo "[glost] $(label): every task has its Green blocks; exiting 0"
+    exit 0
+fi
+echo "[glost] $(label): \\\$nleft tasks are still incomplete; the next link picks them up"
+exit 1
 EOF
 )
-$var_name=\${$var_name##* }
+$(var_name)=\${$(var_name)##* }
 sleep 0.05
 
 """
+    return block
+end
+
+"""
+    glost_chain_block(cluster, experiments, walltime_s) -> String
+
+The whole Green-function stage: the completion manifest, then a chain of
+`glost_link_block`s, then the one assignment that hands the last link's job id to
+the `job_var_name(GenerateGreensJob)` variable the RSVD jobs already depend on.
+With `:glost` there is one greens job id instead of one per separation, under that
+same name, so emitting this block in place of the per-experiment ones is all the
+dependency rewiring there is.
+
+Same node, same ranks, same memory and same task file as a single multi-hour farm
+job would use; only the walltime is cut up. See `GLOST_LINK_HOURS` for why and
+`glost_link_block` for the exit-code invariant that keeps `afterok` meaningful
+across the cut.
+"""
+function glost_chain_block(cluster::ClusterConfig,
+                           experiments::AbstractVector{Experiment}, walltime_s::Int)
+    var_name = job_var_name(GenerateGreensJob)
+    link_s, num_links = glost_chain_shape(walltime_s)
+    block = glost_outputs_block(cluster, experiments)
+    block *= """
+# ---------------------------------------------------------------------------
+# Green functions, farmed through GLOST: one queue slot for all $(length(experiments)) tasks,
+# but split over a chain of $(num_links) short jobs instead of one long one.
+#
+# $(GLOST_NTASKS) MPI ranks = 1 GLOST manager (rank 0 runs no task when size > 1)
+# + $(GLOST_WORKERS) workers x $(GLOST_CPUS_PER_TASK) threads. Tasks are processes, so each one
+# threads freely; "serial" only means one task per rank.
+#
+# The whole sweep is predicted to need $(slurm_time_string(walltime_s)) of farm time
+# ($(GLOST_TIME_SAFETY) x predicted greens time / $(GLOST_WORKERS) workers + $(round(Int, GLOST_TIME_SLACK_S / 60)) min, capped at
+# $(slurm_time_string(GLOST_MAX_TIME_S))). Asking for that in one job means queueing behind everything
+# at a low priority, so it is served instead by $(num_links) links of
+# --time=$(slurm_time_string(link_s)) each: ceil($(slurm_time_string(walltime_s)) / $(slurm_time_string(link_s))) links of work plus one spare.
+# Short jobs backfill; the links after the first are already queued behind it.
+#
+# Each link is chained with --dependency=afterany, not afterok, because the normal
+# way a link ends with work left over is Slurm killing it at its time limit. Each
+# link starts by filtering the task file against the blocks already on disk, so a
+# kill costs only the tasks that were in flight, and a link with nothing left to do
+# exits 0 in seconds. The spare link is there so that, when the work finishes inside
+# the budget, the last link is one of those no-ops.
+#
+# The RSVD jobs depend on the LAST link with afterok. A link exits 0 if and only if
+# every task in the sweep has all of its Green blocks on disk when it exits, so that
+# dependency is satisfied exactly when the greens stage really is finished. If the
+# chain runs out of links with work remaining, the last link exits 1 and the RSVD
+# jobs are purged unsatisfied instead of running against half a sweep. Resubmitting
+# this launcher then starts a fresh chain that picks up where this one stopped.
+#
+# --signal=B:USR1@$(GLOST_DRAIN_LEAD_S): GLOST drains on SIGUSR1. It lets the tasks in flight
+# finish and stops handing out new ones, instead of every worker being killed
+# mid-task at the walltime edge. NOTE the B: prefix delivers the signal to the
+# batch shell only. Check in the first smoke test on narval whether it reaches
+# the srun step, and so glost_launch. If it does not, drop the B: so that
+# Slurm signals the step's tasks directly.
+# ---------------------------------------------------------------------------
+"""
+    for index in 1:num_links
+        block *= glost_link_block(cluster, experiments, link_s, index, num_links)
+    end
+    block *= """
+# The RSVD stage depends on $(var_name); point it at the last link of the chain.
+$(var_name)=\${$(glost_link_var(num_links))}
+
+"""
+    return block
 end
 
 """
@@ -1063,7 +1394,7 @@ function job_launcher_script(jobs::AbstractVector{JobType}, cluster::ClusterConf
                              experiments::AbstractVector{Experiment};
                              gpu_index::Int=0)
     validate_greens_launcher(cluster)
-    coeffs = coefficients_for(cluster.name)
+    coeffs = bounds_augmented_coefficients(cluster)
     coeffs.calibrated ||
         @warn "Cluster '$(cluster.name)' has no calibrated cost model; requests are analytic guesses. Run the harness in bench/ (see bench/README.md)."
 
@@ -1091,25 +1422,27 @@ mkdir -p $(cluster.project_dir)/$(PROJECT_NAME)/
     script *= "\n# Job submission commands follow\n\n"
 
     #=
-    With :glost the Green-function stage is one job, emitted here, ahead of
-    everything that depends on it. It binds the same `g0_job` shell variable the
-    per-experiment greens jobs would have, so the RSVD jobs' `--dependency=afterok:${g0_job}`
-    points at the farm and every RSVD job waits for the whole farm rather than for
-    its own greens job. That is coarser, since the slowest task gates the fastest
-    RSVD, but greens is the cheap stage. RSVD -> bounds chaining is unaffected.
+    With :glost the Green-function stage is emitted here, ahead of everything that
+    depends on it. It is a chain of short farm jobs (see `glost_chain_block`), and
+    the last link binds the same `g0_job` shell variable the per-experiment greens
+    jobs would have, so the RSVD jobs' `--dependency=afterok:${g0_job}` points at the
+    end of the chain and every RSVD job waits for the whole farm rather than for its
+    own greens job. That is coarser, since the slowest task gates the fastest RSVD,
+    but greens is the cheap stage. RSVD -> bounds chaining is unaffected.
     =#
     glost = nothing
     glost_active = GREENS_LAUNCHER == :glost && GenerateGreensJob in jobs
     if glost_active
         walltime_s = glost_walltime_s(experiments, cluster, coeffs)
-        script *= glost_sbatch_block(cluster, experiments, walltime_s)
+        link_s, num_links = glost_chain_shape(walltime_s)
+        script *= glost_chain_block(cluster, experiments, walltime_s)
         glost = (tasks_filename=glost_tasks_filename(),
                  tasks=glost_tasks_file(cluster, experiments),
                  num_tasks=length(experiments),
                  farmed_tasks=max(0, length(experiments) - 1),
                  nodes=1, ntasks=GLOST_NTASKS, workers=GLOST_WORKERS,
                  cpus_per_task=GLOST_CPUS_PER_TASK, mem_GB=GLOST_MEM_GB,
-                 time_s=walltime_s)
+                 time_s=walltime_s, link_time_s=link_s, num_links=num_links)
     end
 
     plan = Tuple{Experiment,Dict{JobType,Resources}}[]
@@ -1293,17 +1626,18 @@ function print_plan(plan, jobs::AbstractVector{JobType}, cluster::ClusterConfig;
     end
 
     if !isnothing(glost)
-        glost_core_hours = glost.time_s * glost.ntasks * glost.cpus_per_task / 3600
+        glost_core_hours = glost.num_links * glost.link_time_s * glost.ntasks * glost.cpus_per_task / 3600
         println(stderr)
-        println(stderr, "  Green functions: 1 GLOST job (not $(glost.num_tasks) jobs), $(glost.nodes) node, $(glost.ntasks) ranks")
+        println(stderr, "  Green functions: a $(glost.num_links)-link GLOST chain (not $(glost.num_tasks) jobs), $(glost.nodes) node, $(glost.ntasks) ranks per link")
         println(stderr, "    workers            $(glost.workers) x $(glost.cpus_per_task) threads (rank 0 is the manager and runs no task)")
         println(stderr, "    tasks              $(glost.num_tasks) total; 1 run serially as the shared-preload pre-step, $(glost.farmed_tasks) farmed")
-        println(stderr, "    walltime           $(slurm_time_string(glost.time_s))  (mem $(glost.mem_GB)G)")
-        @printf(stderr, "    core-hours         %.1f (not counted in the total above)\n", glost_core_hours)
-        println(stderr, "    queue slots        1 instead of $(glost.num_tasks); every RSVD job depends on this one job id")
+        println(stderr, "    farm walltime      $(slurm_time_string(glost.time_s)) predicted for the whole sweep  (mem $(glost.mem_GB)G)")
+        println(stderr, "    chain              $(glost.num_links) links x $(slurm_time_string(glost.link_time_s)) (afterany), the last one a spare that exits 0 when there is nothing left")
+        @printf(stderr, "    core-hours         %.1f if the chain runs its full length (not counted in the total above)\n", glost_core_hours)
+        println(stderr, "    queue slots        $(glost.num_links) instead of $(glost.num_tasks); every RSVD job depends afterok on the last link")
     end
 
-    coeffs = coefficients_for(cluster.name)
+    coeffs = bounds_augmented_coefficients(cluster)
     if !coeffs.calibrated
         println(stderr)
         println(stderr, "  NOTE: $(cluster.name) has no measured calibration. These requests come from")
@@ -1380,14 +1714,16 @@ end
 # Molering two-GPU 1/4 λ sweep: 100 points total, 50 per card.
 separations = unique_log_separations(NUM_GPUS * 50)
 
+# separations = [50000, 25000, 10000, 2500, 5000, 2500, 1000] .// 1
+
 # Run the 1 λ to 10 λ decade first, then everything else, both halves in
 # increasing separation. The round-robin split preserves this order per script.
 separations = vcat(filter(s -> 1 <= s <= 10, separations),
                    filter(s -> !(1 <= s <= 10), separations))
 
 # chi = 13.6 + 0.05im # "Silicon like"
-chi = 4.250 + 0.0342557im # Germanium with ζ = 1000
-# chi = 4.250 + 0.06854306950164653im # Germanium with ζ = 500
+chi = 17.06132654701751 + 0.29117345im # Germanium with ζ = 1000
+# chi = 17.057801847623292 + 0.5826160907639955im # Germanium with ζ = 500
 
 # The Ge ζ = 1000 production sweeps: rank 4000 at every size except 1/4 λ, whose
 # universe only has N_u = 3072 columns to give. Uncomment one, match PROJECT_NAME
@@ -1411,7 +1747,7 @@ experiments = sr_sweep(cells=(8, 8, 8), separations=separations, scale=1 // 32, 
 # experiments = sr_sweep(cells=(64, 32, 32), separations=separations, scale=-1 // 16, chi=chi, rank=800, oversamples=50, power_iters=14)
 
 # 4
-# experiments = sr_sweep(cells=(128, 32, 32), separations=separations, scale=-1 // 8, chi=chi, rank=4000, oversamples=50, power_iters=14)
+experiments = sr_sweep(cells=(128, 32, 32), separations=separations, scale=-1 // 8, chi=chi, rank=4000, oversamples=50, power_iters=6)
 # experiments = sr_sweep(cells=(128, 32, 32), separations=separations, scale=-1 // 8, chi=chi, rank=800, oversamples=50, power_iters=14)
 # experiments = sr_sweep(cells=(128, 32, 32), separations=separations, scale=-1 // 8, chi=chi, rank=400, oversamples=50, power_iters=14)
 

@@ -380,6 +380,27 @@ and `log_complete=0`, so the fit cannot tell the two apart but a reader can.
 `--jobid` fetches `MaxRSS` from `sacct`, since the process that would have read
 `/proc/self/status` is gone. It works on production `compute_bounds.jl` logs too.
 
+### Splitting a long bounds job across blocks
+
+A near-contact production point at `m ≈ 2000` is five to twelve hours as one job,
+and on a low-priority account that is mostly queue. The outer loop over channel
+indices is embarrassingly parallel, so it can be cut up:
+
+```bash
+# compute one slice of the loop; the front end still runs in full
+julia --project=. compute_bounds.jl <point flags> --outer-range 812:1043 --partial-suffix b7of14
+# once every block has finished, assemble <prefix>.jld from the partials
+julia --project=. bench/merge_bounds_blocks.jl --project <project dir> --prefix '<file_prefix>' --cleanup
+```
+
+`bench/size_bounds_jobs.jl` decides where the cuts go. Any point predicted over
+`--block-target-minutes` (default 60) is emitted as B block rows plus a merge row
+whose job must be submitted with `--dependency=afterok:` all of them; the blocks
+are equal in *time*, not in index count, since index `n` probes `k = n, …, m`.
+Points under the target are submitted as single jobs. The merged file is
+byte-compatible with a monolithic run's, which `test/bounds_blocks.jl` checks by
+running both and comparing.
+
 ### What the refit changes, and what it must not
 
 Three coefficient groups, and all three default to leaving the model exactly as it

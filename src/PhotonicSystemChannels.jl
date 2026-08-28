@@ -13,6 +13,11 @@ using .SMRSystems
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
 export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
 export load_green_function, fix_mask, file_prefix
+# Gap refinement: the mesh a near point is actually discretized on, and the
+# derivation behind it. Exported because test/gap_refinement.jl drives the
+# derivation directly and everything downstream sizes itself with `dof_length`.
+export GapRefinement, gap_refinement, refine_body, dof_length, mesh_tag, CmpBlkOprVac, AsyCmpBlkOprVac
+export mesh, sender_mesh, receiver_mesh, refinement, is_refined, MIN_GAP_CELLS
 
 include("common.jl")
 export residency_plan, resolve_seed, device_budget_bytes
@@ -23,6 +28,7 @@ export generate_green
 include("rsvd.jl")
 export generate_rsvd
 export use_dense_path, use_panel_path, gila_workspace_bytes, materialize_columns, ur_asym_vectors_path
+export asym_self
 export DENSE_EXACT_MAX_N_U, DENSE_EXACT_MAX_N_R
 
 include("bounds.jl")

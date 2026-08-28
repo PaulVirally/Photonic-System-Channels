@@ -137,7 +137,35 @@ end
 #     return 1/(2im) * (u_projector * G₀ * r_projector - r_projector * G₀' * u_projector)
 # end
 
-function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr::SMRSystem)
+"""
+    asym_self(G₀) -> LinearMap
+
+`Asym(G₀)` of a self operator, as a `LinearMap`.
+
+Gila's `AsyGlaOprVac` and `AsyGlaCmpOprVac`, and `AsyCmpBlkOprVac` for a refined
+pair's block assembly, fold the antisymmetrization into the Fourier coefficients
+and cost one Green apply instead of two. Where none of them has a method, this
+falls back to `(X - X')/2im`, which is the same operator at twice the cost.
+
+The folded form reads `Asym(G₀)` off as the entrywise imaginary part, which is the
+antisymmetrization only for a complex-symmetric `G₀`. That premise is what makes
+the operator having to be a self operator load bearing rather than cosmetic, and
+every `asym` above throws on an external or adjoint one rather than returning a
+wrong answer, so the `hasmethod` check is safe to dispatch on.
+
+The two forms are not the same matrix: they differ by the quadrature's complex
+symmetry defect, and the folded one is the better of the two. It keeps the
+positive semidefiniteness the continuum operator has, where the difference form
+turns that defect into a small negative eigenvalue that the bounds' pencil
+whitener is sensitive to.
+"""
+function asym_self(G₀)
+    hasmethod(GilaElectromagnetics.GilaOperators.asym, Tuple{typeof(G₀)}) &&
+        return LinearMap(GilaElectromagnetics.GilaOperators.asym(G₀))
+    return asym(LinearMap(G₀))
+end
+
+function asym_ur(G₀_rs::AbstractGlaOpr, G₀_rr::AbstractGlaOpr, smr::SMRSystem)
     # We want to compute the action of Asym(G⁰ᵣᵤ), but this operator is ambiguously defined. Here we write out it's definition.
     # Let ιᵣ be the inclusion of the receiver region into the universe, then define
     # Ĝ⁰ᵣᵤ = ιᵣ G⁰ᵣᵤ which is an operator that maps from the universe to the universe, but is zero outside of the receiver region:
@@ -145,11 +173,8 @@ function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr
     # We can now formally define Asym(G⁰ᵣᵤ) = Asym(Ĝ⁰ᵣᵤ) = (Ĝ⁰ᵣᵤ - Ĝ⁰ᵣᵤ')/(2im):
     # Asym(G⁰ᵣᵤ) = [0 -1/2im G⁰ᵣₛ'; 1/2im G⁰ᵣₛ Asym(G⁰ᵣᵣ)]
     # Here it is in code:
-    s = sender(smr)
-    r = receiver(smr)
-
-    sender_size = prod(s.cel)*3
-    receiver_size = prod(r.cel)*3
+    sender_size = dof_length(sender_mesh(smr))
+    receiver_size = dof_length(receiver_mesh(smr))
 
     # Define ιᵣ: the inclusion of the receiver region into the universe
     receiver_inclusion_action!(r_included_in_u::AbstractVector{ComplexF64}, r_only::AbstractVector{ComplexF64}) = begin
@@ -191,7 +216,7 @@ function asym_ur(G₀_rs::VacuumGreenOperator, G₀_rr::VacuumGreenOperator, smr
     Π_r = receiver_clip # Projects from universe to receiver
     ι_r = receiver_inclusion # Includes receiver into universe
 
-    asym_G₀_rr = LinearMap(AsymVacuumGreenOperator(G₀_rr)) # twice as efficient as (G₀_rr - G₀_rr')/(2im)
+    asym_G₀_rr = asym_self(G₀_rr) # half the cost of (G₀_rr - G₀_rr')/(2im) where Gila has the method
     asym_G₀_ru = -(asym(ι_r * G₀_rs * Π_s) + ι_r * asym_G₀_rr * Π_r) # minus sign becuase the paper uses (-G⁰ᵣᵤ)ᵃ everywhere instead of( G⁰ᵣᵤ)ᵃ
     positive_seeder = -asym(ι_r * G₀_rs * Π_s) # -1 for the same reason
     return asym_G₀_ru, positive_seeder
