@@ -1,69 +1,35 @@
-using CUDA
-
+# Builds every Green operator the later stages load, so that they only deserialize.
 function _generate_green_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
-    @info string(now()) * " [generate_green::_generate_green_sr] Generating Green functions for SR system"
-
-    # sender -> receiver
-    @info string(now()) * " [generate_green::_generate_green_sr] Generating sender -> receiver Green function"
-    load_green_function(compute_env, smr, Receiver, Sender)
-    run_gc() # relieve some memory pressure that CUDA sometimes introduces
-
-    # receiver -> receiver
-    @info string(now()) * " [generate_green::_generate_green_sr] Generating receiver -> receiver Green function"
-    load_green_function(compute_env, smr, Receiver, Receiver)
-    run_gc()
-
-    # universe -> universe
-    @info string(now()) * " [generate_green::_generate_green_sr] Generating universe -> universe Green function"
-    # load_green_function(compute_env, smr, Design, Design)
-    load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver]) # universe -> universe
-    run_gc()
-
-    @info string(now()) * " [generate_green::_generate_green_sr] Completed Green function generation"
+    for (what, load) in (("G⁰ᵣₛ", () -> load_green_function(compute_env, smr, Receiver, Sender)),
+                         ("G⁰ᵣᵣ", () -> load_green_function(compute_env, smr, Receiver, Receiver)),
+                         ("G⁰ᵤᵤ", () -> load_green_function(compute_env, smr, [Sender, Receiver], [Sender, Receiver])),
+                         # Asym(G⁰) of the self blocks, built from the volumes: these are what the RSVD and the bounds apply
+                         ("Asym(G⁰ᵣᵣ)", () -> load_asym_green_function(compute_env, smr, Receiver)),
+                         ("Asym(G⁰ᵤᵤ)", () -> load_asym_green_function(compute_env, smr, Design)))
+        @info string(now()) * " [generate_green] Generating $(what)"
+        load()
+        run_gc()
+    end
 end
 
 function _generate_green_smr(compute_env::ComputeEnvironment, smr::SMRSystem)
-    @info string(now()) * " [generate_green::_generate_green_smr] Generating Green functions for SMR system"
-
-    if prod(smr.mediator_volume.cel) != 0
-        # sender -> mediator
-        @info string(now()) * " [generate_green::_generate_green_smr] Generating sender -> mediator Green function"
-        load_green_function(compute_env, smr, Mediator, Sender)
-        run_gc() # relieve some memory pressure that CUDA sometimes introduces
-
-        # mediator -> mediator
-        @info string(now()) * " [generate_green::_generate_green_smr] Generating mediator -> mediator Green function"
-        load_green_function(compute_env, smr, Mediator, Mediator)
-        run_gc()
-
-        # mediator -> receiver
-        @info string(now()) * " [generate_green::_generate_green_smr] Generating mediator -> receiver Green function"
-        load_green_function(compute_env, smr, Receiver, Mediator)
+    pairs = [(Receiver, Sender)]
+    prod(mediator(smr).cel) != 0 &&
+        append!(pairs, [(Mediator, Sender), (Mediator, Mediator), (Receiver, Mediator)])
+    for (target, source) in pairs
+        @info string(now()) * " [generate_green] Generating $(source) -> $(target)"
+        load_green_function(compute_env, smr, target, source)
         run_gc()
     end
-
-    # sender -> receiver
-    @info string(now()) * " [generate_green::_generate_green_smr] Generating sender -> receiver Green function"
-    load_green_function(compute_env, smr, Receiver, Sender)
-    run_gc()
 end
 
 function generate_green()
-    @info string(now()) * " [generate_green::generate_green] Starting Green function generation"
-    compute_env, smr, _ = parse_args()
-
-    if use_gpu(compute_env)
-        @info string(now()) * " [generate_green::generate_green] Using GPU acceleration on device $(gpu_device(compute_env))"
-        if !haskey(ENV, "CC_CLUSTER") # This breaks on compute canada
-            CUDA.device!(gpu_device(compute_env))
-        end
+    args = parse_cli()
+    select_device(args.compute_env)
+    if isnothing(mediator(args.smr))
+        _generate_green_sr(args.compute_env, args.smr)
     else
-        @info string(now()) * " [generate_green::generate_green] Using CPU computation"
+        _generate_green_smr(args.compute_env, args.smr)
     end
-
-    if isnothing(mediator(smr))
-        _generate_green_sr(compute_env, smr)
-    else
-        _generate_green_smr(compute_env, smr)
-    end
+    @info string(now()) * " [generate_green] Done"
 end

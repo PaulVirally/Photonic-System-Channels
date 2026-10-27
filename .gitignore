@@ -68,3 +68,6 @@ bench/*.jld2
 jobs/
 projects/
 data analysis/
+
+# Site-specific Julia preferences (e.g. the local CUDA runtime on the Alliance clusters)
+LocalPreferences.toml

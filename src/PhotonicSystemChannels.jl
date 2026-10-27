@@ -11,52 +11,26 @@ include("SMRSystems.jl")
 using .SMRSystems
 
 export SMRVolumeSymbol, Sender, Mediator, Receiver, Design, char2volume_symbol, volume_symbol2char
-export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, χ, susceptibility, chi, design_regions, universe_regions, universe, design, volume_pairs
-export load_green_function, fix_mask, file_prefix
-# Gap refinement: the mesh a near point is actually discretized on, and the
-# derivation behind it. Exported because test/gap_refinement.jl drives the
-# derivation directly and everything downstream sizes itself with `dof_length`.
-export GapRefinement, gap_refinement, refine_body, dof_length, mesh_tag, CmpBlkOprVac, AsyCmpBlkOprVac
+export design_regions_from, design_string
+export SMRSystem, sender, mediator, receiver, ms_separation, rm_separation, rs_separation, volume, susceptibility, design_regions, design
+export load_green_function, load_asym_green_function, green_map, asym_green_map, universe_mesh, file_prefix
+export GapRefinement, gap_refinement, refine_body, dof_length, mesh_tag
 export mesh, sender_mesh, receiver_mesh, refinement, is_refined, MIN_GAP_CELLS
 
 include("common.jl")
-export residency_plan, resolve_seed, device_budget_bytes
+export parse_cli, residency_plan, resolve_seed, device_budget_bytes
 
 include("generate_green.jl")
 export generate_green
 
 include("rsvd.jl")
-export generate_rsvd
-export use_dense_path, use_panel_path, gila_workspace_bytes, materialize_columns, ur_asym_vectors_path
-export asym_self
-export DENSE_EXACT_MAX_N_U, DENSE_EXACT_MAX_N_R
+export generate_rsvd, asym_ur, rsvd_output_path, ur_asym_vectors_path
+export use_dense_path, use_panel_path, gila_workspace_bytes, DENSE_EXACT_MAX_N_U, DENSE_EXACT_MAX_N_R
 
 include("bounds.jl")
-export compute_bounds, load_bounds_inputs, bounds_from_spectrum
-# The block-parallel bounds path: where a `--partial-suffix` run writes. Exported
-# so test/bounds_blocks.jl names the files the same way the writer does;
-# bench/merge_bounds_blocks.jl deliberately re-derives the pattern instead, so
-# that a merge job starts in seconds without loading CUDA.
-export partial_bounds_path
-export use_panel_bounds, bounds_footprint_bytes
-export reverse_gram_schmidt!, blocked_reverse_gs_transform
-# The Asym(G⁰ᵤᵤ) augmentation of the projection basis. Exported because
-# bench/augmented_basis_experiment.jl and test/augmented_basis.jl drive these
-# directly -- the experiment is a thin driver over exactly this code, which is what
-# makes it evidence about production rather than about a second implementation.
-export augmented_basis, qr_thin_rdiag!
-export FactoredB, apply_factor, factored_diag, factored_pencil_eigen, factored_probe_duals
-export uu_eigenbasis, uu_residuals, plan_uu_solve
-export uu_sketch_bytes, augmented_footprint_bytes
-# The adaptive --k-uu clip. `max_k_uu_for_budget` is pure arithmetic on
-# (N_u, m, budget) and is mirrored by `augment_k_uu_cap` in bench/cost_model.jl;
-# test/augmented_basis.jl checks the two against each other, which is why it is
-# exported rather than internal.
-export max_k_uu_for_budget, clip_k_uu, K_UU_CLIP_FLOOR
-export DEFAULT_K_UU, DEFAULT_AUGMENT_THRESHOLD, DEFAULT_GAMMA_RTOL
-export AUG_QR_RTOL, AUG_BTOL, UU_OVERSAMPLES, UU_POWER_ITERS, UU_MIN_OVERSAMPLES
-
-include("verify_bounds.jl")
-export verify_bounds
+export compute_bounds, load_bounds_inputs, bounds_from_spectrum, bounds_path
+export reverse_gram_schmidt!, augmented_basis, FactoredB, factored_pencil_eigen, factored_probe_duals
+export psd_pencil_whitener, bracket_root, uu_eigenbasis, fit_augmentation
+export DEFAULT_K_UU, DEFAULT_GAMMA_RTOL
 
 end # module
