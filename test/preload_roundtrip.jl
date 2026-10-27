@@ -1,34 +1,14 @@
-## Narval pre-flight 3: does a Green operator written to the preload directory
+## Does a Green operator written to the preload directory
 ## still work when a *different* process reads it back?
 ##
 ## Run from the repo root:
 ##     julia --project=. test/preload_roundtrip.jl
 ##
-## Why a fresh process. Gila's custom Serialization methods are written against
-## `io::IO`:
-##
-##     Serialization.serialize(io::IO, opr::GlaOprVac) = serialize(io, opr.mem)
-##     Serialization.serialize(io::IO, opr::MulRegGlaOprVac) = serialize(io, opr.oprMat)
-##
-## The single-region path therefore round-trips through GlaVacOprMem's own
-## serializer, which stores only egoFur plus the volumes and rebuilds the FFTW
-## plans with glaOprPrp on load. The multi-region path hands a
-## `Matrix{GlaOprVac}` to the generic array serializer, and array elements are
-## written through an AbstractSerializer, not an IO, so the `io::IO` methods
-## never fire. Each GlaOprVac is then serialized field by field, FFTW plan
-## pointers included. Inside one process those raw pointers can still happen to
-## address a live plan, so an in-process reload looks fine. A fresh process is
-## the only place the breakage shows.
-##
-## The control is a single-region (R,R) round trip, which is expected to pass.
-##
-## The refined half of the file asks the same question of the composite operators
-## a near point is built from. Those go to disk through the generic serializer as
-## well (Gila has no typed deserializer for a composite operator yet) so they
-## have exactly as much to lose from a stale plan pointer as the multi-region one
-## did, and an in-process reload would hide it just as well.
-##
-## No GPU needed. Everything lands in a mktempdir. Exits nonzero on failure.
+## A fresh process is the only place a serializer that writes live state (FFT plan
+## pointers, device handles) shows up: inside the writing process those pointers
+## can still address something valid. The single-region (R,R) block is the control;
+## the universe and the refined composite blocks are the operators the bounds
+## stage actually reads back.
 
 using PhotonicSystemChannels
 const PSC = PhotonicSystemChannels
@@ -38,7 +18,6 @@ using LinearMaps
 using JLD2
 using Printf
 using Random
-using Serialization
 using GilaElectromagnetics
 
 const REPO = dirname(@__DIR__)
@@ -117,7 +96,7 @@ G = startswith(tag, "single") ? load_green_function(env, smr, Receiver, Receiver
                                 load_green_function(env, smr, [Sender, Receiver], [Sender, Receiver])
 println("[child \$tag] applying it")
 flush(stdout)
-y = PSC.asym(LinearMap(G)) * v
+y = (LinearMap(G)) * v
 println("[child \$tag] norm(y) = ", norm(y))
 flush(stdout)
 jldsave(joinpath(root, "child_\$(tag).jld2"); y=y)
@@ -148,11 +127,11 @@ end
 
 println("\n=== parent: building the operators and applying them")
 G_rr = load_green_function(ENVIRONMENT, SMR, Receiver, Receiver)
-y_single = PSC.asym(LinearMap(G_rr)) * V_SINGLE
+y_single = (LinearMap(G_rr)) * V_SINGLE
 @printf("single-region (R,R): N_r = %d, norm(y) = %.10e\n", N_R, norm(y_single))
 
 G_uu = load_green_function(ENVIRONMENT, SMR, [Sender, Receiver], [Sender, Receiver])
-y_multi = PSC.asym(LinearMap(G_uu)) * V_MULTI
+y_multi = (LinearMap(G_uu)) * V_MULTI
 @printf("multi-region [S,R]<-[S,R]: N_u = %d, norm(y) = %.10e\n", N_U, norm(y_multi))
 
 check("the refined bodies are meshed in three regions",
@@ -160,19 +139,19 @@ check("the refined bodies are meshed in three regions",
       string([Tuple(r.cel) for r in regions(receiver_mesh(SMR_REF))]))
 G_rr_ref = load_green_function(ENVIRONMENT, SMR_REF, Receiver, Receiver)
 check("the refined (R,R) block is a composite operator",
-      G_rr_ref isa GlaCmpOprVac, string(typeof(G_rr_ref)))
+      G_rr_ref isa CompositeVacuumGreenOperator, string(typeof(G_rr_ref)))
 check("its cross-scale contact blocks are built on a remeshed volume",
-      any(blk -> blk isa GilaElectromagnetics.GilaOperators.GlaSndOprVac, G_rr_ref.blkMat),
-      string(count(blk -> blk isa GilaElectromagnetics.GilaOperators.GlaSndOprVac, G_rr_ref.blkMat)) * " of " * string(length(G_rr_ref.blkMat)))
-y_single_ref = PSC.asym(LinearMap(G_rr_ref)) * V_SINGLE_REF
+      any(blk -> blk isa GilaElectromagnetics.GlaSndOprVac, G_rr_ref.blkMat),
+      string(count(blk -> blk isa GilaElectromagnetics.GlaSndOprVac, G_rr_ref.blkMat)) * " of " * string(length(G_rr_ref.blkMat)))
+y_single_ref = (LinearMap(G_rr_ref)) * V_SINGLE_REF
 @printf("refined (R,R): N_r = %d, norm(y) = %.10e\n", N_R_REF, norm(y_single_ref))
 
 G_uu_ref = load_green_function(ENVIRONMENT, SMR_REF, [Sender, Receiver], [Sender, Receiver])
-check("the refined universe is a block composite operator",
-      G_uu_ref isa CmpBlkOprVac, string(typeof(G_uu_ref)))
+check("the refined universe is a composite operator",
+      G_uu_ref isa CompositeVacuumGreenOperator, string(typeof(G_uu_ref)))
 check("the refined universe is [sender; receiver]", size(G_uu_ref) == (N_U_REF, N_U_REF),
       string(size(G_uu_ref)))
-y_multi_ref = PSC.asym(LinearMap(G_uu_ref)) * V_MULTI_REF
+y_multi_ref = (LinearMap(G_uu_ref)) * V_MULTI_REF
 @printf("refined [S,R]<-[S,R]: N_u = %d, norm(y) = %.10e\n", N_U_REF, norm(y_multi_ref))
 
 jldsave(joinpath(ROOT, "vectors.jld2");
@@ -220,24 +199,6 @@ if status_multi == :ok
     end
 else
     check("multi-region survives a fresh-process reload", false, string(status_multi))
-    println("""
-    KNOWN BUG: the multi-region ([Sender,Receiver] <- [Sender,Receiver]) Green
-    operator does not survive serialization. Gila serializes MulRegGlaOprVac by
-    handing its Matrix{GlaOprVac} to the generic array serializer, which walks
-    each GlaOprVac field by field instead of going through the `io::IO` method
-    that rebuilds the FFTW plans. The plan pointers written to disk are only
-    valid inside the writing process, so the child either dies or computes
-    garbage.
-
-    This must be fixed before any narval run reads a universe operator off disk.
-    Everything that calls load_green_function(env, smr, [Sender,Receiver],
-    [Sender,Receiver]) is affected: src/bounds.jl (_compute_bounds_sr) and
-    src/verify_bounds.jl. Under GLOST it is worse, since the greens stage exists
-    precisely to write these files for later jobs to read.
-
-    The fix is on the Gila side: give MulRegGlaOprVac a serializer that writes
-    each block through GlaVacOprMem's own serializer (and a matching
-    deserializer), the way the single-region path already does.""")
 end
 
 println("\n=== refined: composite (R,R) in a fresh process")
@@ -250,7 +211,7 @@ else
     check("refined (R,R) survives a fresh-process reload", false, string(status_single_ref))
 end
 
-println("\n=== refined: block composite [S,R]<-[S,R] in a fresh process")
+println("\n=== refined: composite [S,R]<-[S,R] in a fresh process")
 status_multi_ref, y_multi_ref_child = run_child("multi_refined")
 if status_multi_ref == :ok
     d = norm(y_multi_ref_child - y_multi_ref) / norm(y_multi_ref)
@@ -258,11 +219,6 @@ if status_multi_ref == :ok
           @sprintf("rel diff = %.3e", d))
 else
     check("refined universe survives a fresh-process reload", false, string(status_multi_ref))
-    println("""
-    The refined universe operator is serialized as its Matrix{GlaCmpOprVac} of
-    blocks and rebuilt on load. If this fails and the unrefined multi-region
-    control above passed, the composite blocks are the ones carrying live state
-    to disk, not the assembly around them.""")
 end
 
 println()

@@ -45,10 +45,9 @@ system(cells, sep, scale; refine=true, receiver_cells=cells) =
     SMRSystem(cells, (sep, 0//1, 0//1), receiver_cells, DESIGN, scale, CHI;
               refine_gap=refine)
 
-# The five production geometries, as (cells, scale) with `SMRSystem`'s convention
-# that a negative scale means anisotropic cells of (1//32, |scale|, |scale|).
+# The five production geometries, as (cells, scale); the two largest use anisotropic cells.
 const GEOMETRIES = (((8, 8, 8), 1//32), ((16, 16, 16), 1//32), ((32, 32, 32), 1//32),
-                    ((64, 32, 32), -1//16), ((128, 32, 32), -1//8))
+                    ((64, 32, 32), (1//32, 1//16, 1//16)), ((128, 32, 32), (1//32, 1//8, 1//8)))
 
 lwr_edge(vol::GlaVol) = Tuple(first.(vol.grd) .- (vol.scl .// 2))
 upr_edge(vol::GlaVol) = Tuple(last.(vol.grd) .+ (vol.scl .// 2))
@@ -155,10 +154,8 @@ for (cells, scale) in GEOMETRIES, g in 1:(MIN_GAP_CELLS - 1)
     check("$(cells) at g = $g with refine_gap=false is unrefined", !is_refined(off))
 end
 
-println("\n=== unrefined cache keys have not moved")
-# Hard-coded rather than re-derived: this is the check that a preload directory
-# full of far points stays valid, so the expected strings have to come from
-# outside the code that generates them.
+println("\n=== cache keys are the expected strings")
+# Hard-coded rather than re-derived, so a change to the naming shows up here
 const FAR = system((8, 8, 8), 1//4, 1//32)
 check("unrefined (R,R) key", PSC.SMRSystems.green_fname(FAR, Receiver, Receiver) ==
       "self/8x8x8_1ss32x1ss32x1ss32.glaG0",
@@ -169,20 +166,40 @@ check("unrefined (R,S) key", PSC.SMRSystems.green_fname(FAR, Receiver, Sender) =
 check("unrefined universe key", PSC.SMRSystems.green_fname(FAR, Design, Design) ==
       "self/24x8x8_1ss32x1ss32x1ss32.glaG0",
       PSC.SMRSystems.green_fname(FAR, Design, Design))
-check("unrefined scratch key", file_prefix(FAR) == "8x8x8__8x8x8__1ss4__SR",
+check("unrefined scratch key", file_prefix(FAR) == "8x8x8__8x8x8__1ss4__at1ss32__SR",
       file_prefix(FAR))
+
+# The same geometry under the region order production actually builds. `DESIGN`
+# above is the literal `[Sender, Receiver]` every check in this file uses, which
+# ends in `SR`; `src/common.jl` sorts the `--design` letters and gets `RS`. Both
+# are legitimate names for one geometry, which is what let a generator name every
+# bounds point one way while every job wrote the other. So the golden values are
+# pinned for both orders, and the Green function keys are pinned as *identical*
+# across them, because those depend on the volumes and not on the region order.
+const FAR_RS = SMRSystem((8, 8, 8), (1//4, 0//1, 0//1), (8, 8, 8),
+                         design_regions_from("rs"), 1//32, CHI)
+check("the production region order gives the RS scratch key",
+      file_prefix(FAR_RS) == "8x8x8__8x8x8__1ss4__at1ss32__RS", file_prefix(FAR_RS))
+check("the two orders are different names for the same geometry",
+      file_prefix(FAR_RS) != file_prefix(FAR) &&
+      PSC.SMRSystems.green_fname(FAR_RS, Design, Design) ==
+      PSC.SMRSystems.green_fname(FAR, Design, Design),
+      PSC.SMRSystems.green_fname(FAR_RS, Design, Design))
+check("design_string reads the order back out of the system",
+      design_string(FAR_RS) == "rs" && design_string(FAR) == "sr",
+      "$(design_string(FAR_RS)) and $(design_string(FAR))")
 # The two-argument spelling is what every pre-refinement caller used.
 check("the two-argument green_fname is unchanged",
       PSC.SMRSystems.green_fname(receiver(FAR), sender(FAR)) ==
       PSC.SMRSystems.green_fname(FAR, Receiver, Sender))
 
-const ANISO_FAR = system((64, 32, 32), 1//4, -1//16)
+const ANISO_FAR = system((64, 32, 32), 1//4, (1//32, 1//16, 1//16))
 check("unrefined anisotropic (R,R) key",
       PSC.SMRSystems.green_fname(ANISO_FAR, Receiver, Receiver) ==
       "self/64x32x32_1ss32x1ss16x1ss16.glaG0",
       PSC.SMRSystems.green_fname(ANISO_FAR, Receiver, Receiver))
 check("unrefined anisotropic scratch key",
-      file_prefix(ANISO_FAR) == "64x32x32__64x32x32__1ss4__SR", file_prefix(ANISO_FAR))
+      file_prefix(ANISO_FAR) == "64x32x32__64x32x32__1ss4__at1ss32x1ss16x1ss16__SR", file_prefix(ANISO_FAR))
 
 println("\n=== a shared cache key means a shared operator, and nothing else")
 # Two gaps that land on the same table entry give a body the same mesh, and a self
@@ -240,7 +257,11 @@ check("the sender and receiver self keys differ",
       PSC.SMRSystems.green_fname(NEAR, Receiver, Receiver),
       PSC.SMRSystems.green_fname(NEAR, Sender, Sender))
 check("a refined scratch key is tagged",
-      file_prefix(NEAR) == "8x8x8__8x8x8__1ss32__SR__refF6T6", file_prefix(NEAR))
+      file_prefix(NEAR) == "8x8x8__8x8x8__1ss32__at1ss32__SR__refF6T6", file_prefix(NEAR))
+check("and the refinement tag sits after the universe string in either order",
+      file_prefix(SMRSystem((8, 8, 8), (1//32, 0//1, 0//1), (8, 8, 8),
+                            design_regions_from("rs"), 1//32, CHI)) ==
+      "8x8x8__8x8x8__1ss32__at1ss32__RS__refF6T6")
 
 println("\n=== the refined operators are the operators they claim to be")
 const ROOT = mktempdir(; cleanup=true)
@@ -253,7 +274,7 @@ end
 # (2,2,2) at one cell of gap refines both bodies whole by six in x, so N_r = 144.
 const TINY = system((2, 2, 2), 1//32, 1//32)
 const G_RS = load_green_function(ENVIRONMENT, TINY, Receiver, Sender)
-check("the refined (R,S) block is a composite operator", G_RS isa GlaCmpOprVac,
+check("the refined (R,S) block is a composite operator", G_RS isa CompositeVacuumGreenOperator,
       string(typeof(G_RS)))
 check("the refined (R,S) block is sized by the meshes",
       size(G_RS) == (dof_length(receiver_mesh(TINY)), dof_length(sender_mesh(TINY))),
@@ -282,8 +303,8 @@ check("the two systems have the same cache keys",
       PSC.SMRSystems.green_fname(FAR_OFF, Receiver, Sender))
 
 function ur_spectrum(smr)
-    A, _ = PSC.asym_ur(load_green_function(ENVIRONMENT, smr, Receiver, Sender),
-                       load_green_function(ENVIRONMENT, smr, Receiver, Receiver), smr)
+    A = PSC.asym_ur(load_green_function(ENVIRONMENT, smr, Receiver, Sender),
+                    load_asym_green_function(ENVIRONMENT, smr, Receiver), smr)
     n = size(A, 1)
     M = zeros(ComplexF64, n, n)
     e = zeros(ComplexF64, n)
@@ -299,6 +320,35 @@ let on = ur_spectrum(FAR_ON), off = ur_spectrum(FAR_OFF),
     d = maximum(abs.(on .- off)) / maximum(abs.(off))
     check("Asym(G⁰ᵤᵣ) spectra agree with refinement on and off", d < 1e-12,
           @sprintf("max rel diff = %.3e", d))
+end
+
+
+println("\n--- a two-scale mesh is Hermitian once its unknowns are L²-normalised")
+## (4,4,4) bodies four cells apart: a factor-2 slab against a coarse layer, so the
+## universe has cross-scale blocks, which Gila applies to cell-average densities.
+function dense(L)
+    n = size(L, 2)
+    M = zeros(ComplexF64, size(L, 1), n)
+    e = zeros(ComplexF64, n)
+    for j in 1:n
+        e[j] = 1
+        M[:, j] .= L * e
+        e[j] = 0
+    end
+    return M
+end
+const TWO_SCALE = system((4, 4, 4), 1//8, 1//32)
+check("the bodies carry two cell sizes", length(unique(r.scl for r in regions(universe_mesh(TWO_SCALE)))) == 2)
+const A_UU = dense(asym_green_map(ENVIRONMENT, TWO_SCALE, Design))
+let d = norm(A_UU - A_UU') / norm(A_UU), λ = eigvals(Hermitian(A_UU))
+    check("Asym(G⁰ᵤᵤ) is Hermitian", d < 1e-10, @sprintf("rel asymmetry = %.3e", d))
+    check("Asym(G⁰ᵤᵤ) is positive semidefinite", minimum(λ) > -1e-10 * maximum(λ),
+          @sprintf("λmin / λmax = %.3e", minimum(λ) / maximum(λ)))
+end
+let A = dense(PSC.asym_ur(green_map(ENVIRONMENT, TWO_SCALE, Receiver, Sender),
+                          asym_green_map(ENVIRONMENT, TWO_SCALE, Receiver), TWO_SCALE)),
+    d = norm(A - A') / norm(A)
+    check("Asym(G⁰ᵤᵣ) is Hermitian", d < 1e-10, @sprintf("rel asymmetry = %.3e", d))
 end
 
 println()

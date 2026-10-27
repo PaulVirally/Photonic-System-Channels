@@ -1,4 +1,4 @@
-## Narval pre-flight 2: the three _save_ur_asym branches (dense-exact, in-memory
+## The three _save_ur_asym branches (dense-exact, in-memory
 ## RSVD, panel RSVD) and _run_rsvdvals, on a tiny CPU-only SR system.
 ##
 ## Run from the repo root:
@@ -166,8 +166,8 @@ Funicular.free!(loaded)
 # directly: this is what says the h5 columns really are the eigenvectors of the
 # eigenvalues sitting next to them in the jld.
 G_rs = load_green_function(env("dense"), SMR, Receiver, Sender)
-G_rr = load_green_function(env("dense"), SMR, Receiver, Receiver)
-A_op, _ = PSC.asym_ur(G_rs, G_rr, SMR)
+G_rr = load_asym_green_function(env("dense"), SMR, Receiver)
+A_op = PSC.asym_ur(G_rs, G_rr, SMR)
 A = PSC._dense_matrix(A_op, false)
 resid(V, D) = norm(A * V - V * Diagonal(D)) / norm(A * V)
 # The tail of an RSVD's positive prefix is the part the sketch resolved worst, so

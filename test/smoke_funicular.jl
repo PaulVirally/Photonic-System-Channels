@@ -1,4 +1,4 @@
-## Narval pre-flight 1: the dependency stack loads and the CPU-backend panel path
+## The dependency stack loads and the CPU-backend panel path
 ## of reigen_hermitian agrees with a dense eigen.
 ##
 ## Run from the repo root:

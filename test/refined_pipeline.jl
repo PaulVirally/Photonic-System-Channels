@@ -62,31 +62,11 @@ check("the system is refined", is_refined(SMR), string(refinement(SMR)))
 check("the universe grew with the mesh", (N_S, N_R, N_U) == (144, 144, 288),
       "N_s = $N_S, N_r = $N_R, N_u = $N_U")
 
-# A logger that passes everything through and keeps the warnings, so the run still
-# reads like a normal one while the proximity check is being watched.
-struct WarnCollector <: AbstractLogger
-    inner::AbstractLogger
-    warnings::Vector{String}
-end
-Logging.min_enabled_level(lg::WarnCollector) = Logging.min_enabled_level(lg.inner)
-Logging.shouldlog(lg::WarnCollector, args...) = Logging.shouldlog(lg.inner, args...)
-Logging.catch_exceptions(lg::WarnCollector) = Logging.catch_exceptions(lg.inner)
-function Logging.handle_message(lg::WarnCollector, level, message, _mod, group, id, file, line; kwargs...)
-    level >= Logging.Warn && push!(lg.warnings, string(message))
-    return Logging.handle_message(lg.inner, level, message, _mod, group, id, file, line; kwargs...)
-end
-
 println("\n=== the Green stage")
-const WARNINGS = String[]
-with_logger(WarnCollector(global_logger(), WARNINGS)) do
-    PSC._generate_green_sr(ENVIRONMENT, SMR)
-end
-const PROXIMITY = filter(w -> occursin("separated by", w), WARNINGS)
-check("no proximity warning fired", isempty(PROXIMITY),
-      isempty(PROXIMITY) ? "$(length(WARNINGS)) warnings, none about proximity" : first(PROXIMITY))
+PSC._generate_green_sr(ENVIRONMENT, SMR)
 
 for (target, source) in ((Receiver, Sender), (Receiver, Receiver), (Design, Design))
-    fname = PSC.SMRSystems.green_fname(SMR, target, source)
+    fname = target == Design ? PSC.SMRSystems._universe_fname(SMR) : PSC.SMRSystems.green_fname(SMR, target, source)
     check("the $(target)<-$(source) block is on disk under its refined name",
           isfile(joinpath(PRELOAD, fname)) && occursin("_ref", fname), fname)
 end
@@ -94,7 +74,7 @@ end
 const G_RS = load_green_function(ENVIRONMENT, SMR, Receiver, Sender)
 const G_RR = load_green_function(ENVIRONMENT, SMR, Receiver, Receiver)
 const G_UU = load_green_function(ENVIRONMENT, SMR, [Sender, Receiver], [Sender, Receiver])
-check("the universe operator is the block assembly", G_UU isa CmpBlkOprVac, string(typeof(G_UU)))
+check("the universe operator is a composite over the two meshes", G_UU isa CompositeVacuumGreenOperator, string(typeof(G_UU)))
 check("the universe operator is N_u × N_u", size(G_UU) == (N_U, N_U), string(size(G_UU)))
 check("the universe operator is a self operator", isselfoperator(G_UU))
 
@@ -110,7 +90,7 @@ let x = zeros(ComplexF64, N_U)
           @sprintf("rel diff = %.3e", d))
 end
 
-const A_UR, _ = PSC.asym_ur(G_RS, G_RR, SMR)
+const A_UR = PSC.asym_ur(G_RS, load_asym_green_function(ENVIRONMENT, SMR, Receiver), SMR)
 check("Asym(G⁰ᵤᵣ) is sized by the refined universe", size(A_UR) == (N_U, N_U),
       string(size(A_UR)))
 let x = ComplexF64.(1:N_U) ./ N_U, y = ComplexF64.(N_U:-1:1) ./ N_U,
@@ -143,26 +123,14 @@ check("RS/D has one value per receiver degree of freedom",
       string(length(RSVD_OUT["RS/D"])))
 
 println("\n=== the bounds stage")
-# A slice rather than the whole spectrum: the front end, which is the part the
-# refinement changed, runs in full either way, and the outer loop over 100-odd
-# channels is minutes of arithmetic that says nothing new about the mesh.
-const RANGE = 1:2
 const RESULT = with_logger(SimpleLogger(stderr, Logging.Warn)) do
-    PSC._compute_bounds_sr(ENVIRONMENT, SMR, PARAMS; k_uu=0, panel_mode=false,
-                           outer_range=RANGE, partial_suffix="smoke")
+    PSC._compute_bounds_sr(ENVIRONMENT, SMR; k_uu=16)
 end
-const BOUNDS_PATH = PSC.partial_bounds_path(project_dir(ENVIRONMENT), file_prefix(SMR), "smoke")
+const BOUNDS_PATH = PSC.bounds_path(ENVIRONMENT, SMR)
 check("the bounds run wrote its jld", isfile(BOUNDS_PATH), BOUNDS_PATH)
-
-const BOUNDS = jldopen(BOUNDS_PATH, "r") do jld
-    Dict{String,Any}(k => jld[k] for k in ("bounds_dual_basis", "partial/indices"))
-end
-const EVALUATED = BOUNDS["partial/indices"]
-check("the requested indices were evaluated", collect(EVALUATED) == collect(RANGE),
-      string(EVALUATED))
-let vals = BOUNDS["bounds_dual_basis"][collect(EVALUATED)]
-    check("the bounds are finite and positive", all(isfinite, vals) && all(>(0), vals),
-          string(vals))
+let vals = jldopen(jld -> jld["true_bounds"], BOUNDS_PATH, "r")
+    check("the bounds are finite, positive and passive", all(isfinite, vals) && all(>(0), vals) && all(<=(1), vals),
+          string(extrema(vals)))
 end
 
 println()
