@@ -31,13 +31,21 @@ julia --project=. compute_bounds.jl  $ARGS --gpu 0
 with refined slabs at the facing surfaces unless `--no-refine` is passed. `--k-uu`
 (default 512) is the number of Asym(G⁰ᵤᵤ) eigenvectors added to the projection basis,
 and `--gamma-rtol` (default 1e-12) cuts the RSVD noise floor off the Asym(G⁰ᵤᵣ)
-spectrum. A system with a mediator (`--mediator`, `--sm-sep`, `--mr-sep`) runs the
-first two stages; its bounds are not implemented yet.
+spectrum (both signs: the bound uses the negative-Γ eigenvectors too). A system with a
+mediator (`--mediator`, `--sm-sep`, `--mr-sep`) runs the first two stages; its bounds
+are not implemented yet.
+
+The RSVD stage stores every Asym(G⁰ᵤᵣ) eigenvector it computes, not only the
+positive-Γ ones, so its scratch output is about twice what a positive-only run needed
+(tens of GB per point at 4 λ with 4000 components). Outputs of older runs hold only the
+positive block; `generate_rsvd.jl` recomputes them. The bounds stage checkpoints to
+`<project>/<prefix>.jld.ckpt.*` as it goes, so a killed run resumes where it stopped.
 
 ## Output
 
 `<project>/<prefix>.jld` holds, per channel n, `true_bounds[n]`: the minimum of the
-projected dual (`bounds_dual_basis`) and the two passivity bounds
+system-design dual of Eq. (37) (`bounds_dual_basis`, with its minimisers
+`opt_taus` and `opt_mu_p`) and the two passivity bounds
 (`old_analytical_bounds`, `new_analytical_bounds`), with `which_bounds` naming the
 winner (1, 2, 3). Φ = Σₙ σₙ² is `sum(abs2, true_bounds)`. The `augment/` group records
 the basis the dual was solved in.
@@ -46,7 +54,7 @@ the basis the dual was solved in.
 
 - `src/SMRSystems.jl`, `src/refinement.jl`: geometry, gap refinement, Green operator cache.
 - `src/rsvd.jl`: Asym(G⁰ᵤᵣ) and the RSVDs, dense-exact, in memory, or in Funicular panels when the sketch outgrows the GPU.
-- `src/bounds.jl`: the augmented basis, the τ family of constraints and the dual.
+- `src/bounds.jl`: the augmented basis and the Eq. (37) dual, minimised over μₚ and τ.
 - `src/common.jl`: command line, device selection, memory budgets.
 
 ## Sweeps

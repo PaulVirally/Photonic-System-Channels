@@ -99,7 +99,7 @@ for (tag, group) in (("dense", dense), ("memory", mem), ("panel", pan))
     check("$tag: num_pos::Int in 1:length(D)",
           group["num_pos"] isa Int && 1 <= group["num_pos"] <= length(group["D"]),
           "num_pos = $(group["num_pos"]) of $(length(group["D"]))")
-    check("$tag: legacy full V key is gone", !has(tag, "V"))
+    check("$tag: the positive-only V_pos key is gone", !has(tag, "V_pos") && !has(tag, "vectors_file"))
 end
 check("dense: exact == true", dense["exact"] === true)
 check("memory: exact == false", mem["exact"] === false)
@@ -112,17 +112,17 @@ check("panel: D holds rank(params) = $(PSC.rank(PARAMS)) values",
       length(pan["D"]) == PSC.rank(PARAMS), string(length(pan["D"])))
 
 for tag in ("dense", "memory")
-    V = get_key(tag, "V_pos")
-    m = read_group(tag)["num_pos"]
-    check("$tag: V_pos is a host Matrix{ComplexF64} of $(N_U)×$m",
-          V isa Matrix{ComplexF64} && size(V) == (N_U, m), string(typeof(V), size(V)))
+    V = get_key(tag, "V")
+    c = length(read_group(tag)["D"])
+    check("$tag: V is a host Matrix{ComplexF64} of $(N_U)×$c (one column per D)",
+          V isa Matrix{ComplexF64} && size(V) == (N_U, c), string(typeof(V), size(V)))
 end
-check("panel: V_pos is NOT inline in the jld", !has("panel", "V_pos"))
-check("panel: vectors_file recorded", has("panel", "vectors_file"),
-      has("panel", "vectors_file") ? get_key("panel", "vectors_file") : "")
+check("panel: V is NOT inline in the jld", !has("panel", "V"))
+check("panel: V_file recorded", has("panel", "V_file"),
+      has("panel", "V_file") ? get_key("panel", "V_file") : "")
 vectors_path = PSC.ur_asym_vectors_path(env("panel"), SMR)
-check("panel: vectors_file names the h5 next to the jld",
-      has("panel", "vectors_file") && get_key("panel", "vectors_file") == basename(vectors_path) && isfile(vectors_path),
+check("panel: V_file names the h5 next to the jld",
+      has("panel", "V_file") && get_key("panel", "V_file") == basename(vectors_path) && isfile(vectors_path),
       vectors_path)
 
 # --- descending order and the positive prefix
@@ -156,8 +156,8 @@ check("panel vs memory: top $top eigenvalues to 1e-8",
 # --- the h5 round trip
 loaded = Funicular.load(PanelMatrix, vectors_path; plan=CPU_PLAN)
 Vp = Matrix(loaded)
-check("panel: h5 round-trips to a $(N_U)×$(mp) ComplexF64 matrix",
-      size(Vp) == (N_U, mp) && eltype(Vp) == ComplexF64, string(eltype(Vp), size(Vp)))
+check("panel: h5 round-trips to a $(N_U)×$(length(Dp)) ComplexF64 matrix",
+      size(Vp) == (N_U, length(Dp)) && eltype(Vp) == ComplexF64, string(eltype(Vp), size(Vp)))
 check("panel: h5 columns are orthonormal", opnorm(Vp' * Vp - I) < 1e-10,
       @sprintf("|V'V - I| = %.3e", opnorm(Vp' * Vp - I)))
 Funicular.free!(loaded)
@@ -174,20 +174,27 @@ resid(V, D) = norm(A * V - V * Diagonal(D)) / norm(A * V)
 # the eigen relation is only tight over the converged block. Both RSVD paths are
 # held to the same bar over the leading columns, and the tail residual is printed
 # rather than asserted: it is the method's error, not the plumbing's.
-Vm = get_key("memory", "V_pos")
-Vd = get_key("dense", "V_pos")
+Vm = get_key("memory", "V")
+Vd = get_key("dense", "V")
 r_pan = resid(Vp[:, 1:top], Dp[1:top])
 r_mem = resid(Vm[:, 1:top], Dm[1:top])
-check("panel: A V_pos ≈ V_pos diag(Γ) over the leading $top (h5)", r_pan < 1e-8,
+check("panel: A V ≈ V diag(Γ) over the leading $top (h5)", r_pan < 1e-8,
       @sprintf("rel residual = %.3e", r_pan))
-check("memory: A V_pos ≈ V_pos diag(Γ) over the leading $top", r_mem < 1e-8,
+check("memory: A V ≈ V diag(Γ) over the leading $top", r_mem < 1e-8,
       @sprintf("rel residual = %.3e", r_mem))
-check("panel matches memory's accuracy over the whole prefix",
-      abs(resid(Vp, Dp[1:mp]) - resid(Vm, Dm[1:mm])) < 1e-2,
+# The most negative Γ of a short sketch sit near its truncation edge, so like the tail of
+# the positive prefix they carry the RSVD's error: printed, and only the two paths compared.
+lastcols(X) = X[:, end-top+1:end]
+r_pan_neg, r_mem_neg = resid(lastcols(Vp), Dp[end-top+1:end]), resid(lastcols(Vm), Dm[end-top+1:end])
+@printf("%-58s      panel = %.3e, memory = %.3e (Γ = %.3e … %.3e)\n", "A V ≈ V diag(Γ) over the $top most negative:",
+        r_pan_neg, r_mem_neg, Dp[end-top+1], Dp[end])
+check("panel matches memory's accuracy over the $top most negative", abs(r_pan_neg - r_mem_neg) < 1e-2)
+check("panel matches memory's accuracy over the whole positive prefix",
+      abs(resid(Vp[:, 1:mp], Dp[1:mp]) - resid(Vm[:, 1:mm], Dm[1:mm])) < 1e-2,
       @sprintf("panel = %.3e, memory = %.3e (RSVD error, not fp)",
-               resid(Vp, Dp[1:mp]), resid(Vm, Dm[1:mm])))
-r_dense = resid(Vd, Dd[1:md])
-check("dense: A V_pos ≈ V_pos diag(Γ) over all $md", r_dense < 1e-10, @sprintf("rel residual = %.3e", r_dense))
+               resid(Vp[:, 1:mp], Dp[1:mp]), resid(Vm[:, 1:mm], Dm[1:mm])))
+r_dense = resid(Vd, Dd)
+check("dense: A V ≈ V diag(Γ) over all $(length(Dd))", r_dense < 1e-10, @sprintf("rel residual = %.3e", r_dense))
 
 # Eigenvectors are phase (and, in a degenerate block, rotation) ambiguous, so the
 # two runs are compared as subspaces: the principal angles between the leading

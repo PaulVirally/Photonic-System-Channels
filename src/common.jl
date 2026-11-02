@@ -127,7 +127,7 @@ function parse_cli()
             arg_type = Int
             default = 0
         "--gamma-rtol"
-            help = "Bounds: keep only the positive Asym(G⁰ᵤᵣ) eigenvalues Γ ≥ gamma-rtol · Γ₁ (0 keeps all)"
+            help = "Bounds: keep only the Asym(G⁰ᵤᵣ) eigenpairs with |Γ| ≥ gamma-rtol · Γ₁ (0 keeps all nonzero)"
             arg_type = Float64
             default = DEFAULT_GAMMA_RTOL
         "--k-uu"

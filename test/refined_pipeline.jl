@@ -107,16 +107,16 @@ check("the RSVD wrote its jld", isfile(JLD_PATH))
 
 const RSVD_OUT = jldopen(JLD_PATH, "r") do jld
     Dict{String,Any}(k => jld[k] for k in ("UR_asym/D", "UR_asym/num_pos",
-                                           "UR_asym/exact", "UR_asym/V_pos", "RS/D"))
+                                           "UR_asym/exact", "UR_asym/V", "RS/D"))
 end
 const NUM_POS = RSVD_OUT["UR_asym/num_pos"]
 check("the spectrum spans the refined universe", length(RSVD_OUT["UR_asym/D"]) == N_U,
       string(length(RSVD_OUT["UR_asym/D"])))
-check("the basis is N_u × num_pos", size(RSVD_OUT["UR_asym/V_pos"]) == (N_U, NUM_POS),
-      string(size(RSVD_OUT["UR_asym/V_pos"])))
+check("the eigenvectors are N_u × N_u (dense-exact)", size(RSVD_OUT["UR_asym/V"]) == (N_U, N_U),
+      string(size(RSVD_OUT["UR_asym/V"])))
 check("the positive block is nonempty and everything is finite",
       NUM_POS > 0 && all(isfinite, RSVD_OUT["UR_asym/D"]) &&
-      all(isfinite, RSVD_OUT["UR_asym/V_pos"]),
+      all(isfinite, RSVD_OUT["UR_asym/V"]),
       "num_pos = $(NUM_POS) of $(N_U)")
 check("RS/D has one value per receiver degree of freedom",
       length(RSVD_OUT["RS/D"]) == N_R && all(isfinite, RSVD_OUT["RS/D"]),

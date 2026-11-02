@@ -29,8 +29,7 @@ export use_dense_path, use_panel_path, gila_workspace_bytes, DENSE_EXACT_MAX_N_U
 
 include("bounds.jl")
 export compute_bounds, load_bounds_inputs, bounds_from_spectrum, bounds_path
-export reverse_gram_schmidt!, augmented_basis, FactoredB, factored_pencil_eigen, factored_probe_duals
-export psd_pencil_whitener, bracket_root, uu_eigenbasis, fit_augmentation
+export augmented_basis, uu_eigenbasis, fit_augmentation, tau_prep, system_dual
 export DEFAULT_K_UU, DEFAULT_GAMMA_RTOL
 
 end # module

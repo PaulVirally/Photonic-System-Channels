@@ -15,7 +15,6 @@ Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 MatrixFreeRandomizedLinearAlgebra = "a69accfa-5557-4533-9d8b-afe141969680"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-Roots = "f2b01f46-fcfa-551c-844a-d8ac1e96c665"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 
 [sources]

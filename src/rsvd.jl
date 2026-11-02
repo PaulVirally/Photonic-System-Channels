@@ -80,19 +80,20 @@ end
 rsvd_output_path(compute_env::ComputeEnvironment, smr::SMRSystem) =
     joinpath(scratch_dir(compute_env), "$(file_prefix(smr)).jld")
 
-"Where the panel path streams the positive-Γ eigenvectors, next to the JLD that names it."
+"Where the panel path streams the eigenvectors, next to the JLD that names it."
 ur_asym_vectors_path(compute_env::ComputeEnvironment, smr::SMRSystem) =
-    joinpath(scratch_dir(compute_env), "$(file_prefix(smr))_UR_asym_Vpos.h5")
+    joinpath(scratch_dir(compute_env), "$(file_prefix(smr))_UR_asym_V.h5")
 
-# Complete means `D` and `num_pos` are present and the positive vectors are reachable,
-# inline in the JLD or in the h5 file the JLD names.
+# Complete means `D` and `num_pos` are present and the vectors are reachable, inline in
+# the JLD or in the h5 file the JLD names. The positive-only `V_pos`/`vectors_file` of
+# older runs do not count: the bounds need the negative-Γ eigenvectors too.
 function _ur_asym_is_complete(jld_path::String, vectors_path::String)
     isfile(jld_path) || return false
     return jldopen(jld_path, "r") do jld
         (haskey(jld, "UR_asym/D") && haskey(jld, "UR_asym/num_pos")) || return false
-        haskey(jld, "UR_asym/V_pos") && return true
-        haskey(jld, "UR_asym/vectors_file") &&
-            isfile(joinpath(dirname(vectors_path), jld["UR_asym/vectors_file"]))
+        haskey(jld, "UR_asym/V") && return true
+        haskey(jld, "UR_asym/V_file") &&
+            isfile(joinpath(dirname(vectors_path), jld["UR_asym/V_file"]))
     end
 end
 
@@ -185,8 +186,8 @@ end
     _save_ur_asym(compute_env, smr, rsvd_params; plan_override=nothing, max_dense_N_u=DENSE_EXACT_MAX_N_U)
 
 The Asym(G⁰ᵤᵣ) eigendecomposition, written to `UR_asym/` in the point's JLD: every
-eigenvalue (`D`), the positive count (`num_pos`), and the positive eigenvector block,
-inline (`V_pos`) or streamed to an h5 file (`vectors_file`). `plan_override` and
+eigenvalue (`D`), the positive count (`num_pos`), and one eigenvector per eigenvalue in
+the same descending order, inline (`V`) or streamed to an h5 file (`V_file`). `plan_override` and
 `max_dense_N_u` let tests force a path.
 """
 function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams;
@@ -209,7 +210,7 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
         idxs = sortperm(F.values, rev=true)
         evals = F.values[idxs]
         m = _num_positive(evals)
-        _save_ur_asym_components(jld_path, evals, m, seed(rsvd_params), true; V_pos=F.vectors[:, idxs[1:m]])
+        _save_ur_asym_components(jld_path, evals, m, seed(rsvd_params), true; V=F.vectors[:, idxs])
         return
     end
 
@@ -222,7 +223,7 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
                                num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
         evals = Array(out.values)
         m = _num_positive(evals)
-        _save_ur_asym_components(jld_path, evals, m, seed(rsvd_params), false; V_pos=view(out.vectors, :, 1:m))
+        _save_ur_asym_components(jld_path, evals, m, seed(rsvd_params), false; V=out.vectors)
         return
     end
 
@@ -235,27 +236,26 @@ function _save_ur_asym(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
     evals = Array(out.values)
     m = _num_positive(evals)
     m > 0 || error("Asym(G⁰ᵤᵣ) has no positive eigenvalue, so the bounds have no basis to run on")
-    # `factored=true` left Q * rotation unevaluated, so only the positive prefix is formed.
-    V_pos = materialize_columns(out.vectors, 1:m)
+    V = materialize_columns(out.vectors, 1:length(evals))
     try
-        Funicular.save(V_pos, vectors_path)
+        Funicular.save(V, vectors_path)
     finally
-        Funicular.free!(V_pos)
+        Funicular.free!(V)
         Funicular.free!(out.vectors.Q)
     end
     # The panel matrices hold the plan; drop them so `reclaim_host_pools!` can collect it.
-    V_pos = out = plan = nothing
-    _save_ur_asym_components(jld_path, evals, m, seed(rsvd_params), false; vectors_file=basename(vectors_path))
+    V = out = plan = nothing
+    _save_ur_asym_components(jld_path, evals, m, seed(rsvd_params), false; V_file=basename(vectors_path))
 end
 
 # Writes `UR_asym/` from scratch: a group left by a run that died part way through
 # could pair new eigenvalues with old vectors.
 function _save_ur_asym_components(jld_path::String, evals::AbstractVector, num_pos::Int,
-                                  seed_value::Int, exact::Bool; V_pos=nothing, vectors_file=nothing)
+                                  seed_value::Int, exact::Bool; V=nothing, V_file=nothing)
     jldopen(jld_path, "a+") do jld
         haskey(jld, "UR_asym") && delete!(jld, "UR_asym")
-        isnothing(V_pos) || (jld["UR_asym/V_pos"] = Array(V_pos))
-        isnothing(vectors_file) || (jld["UR_asym/vectors_file"] = vectors_file)
+        isnothing(V) || (jld["UR_asym/V"] = Array(V))
+        isnothing(V_file) || (jld["UR_asym/V_file"] = V_file)
         jld["UR_asym/seed"] = seed_value
         jld["UR_asym/exact"] = exact
         jld["UR_asym/D"] = Array(evals)
