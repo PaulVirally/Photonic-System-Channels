@@ -68,12 +68,13 @@ for (name, P) in (("full basis", P_FULL), ("partial basis", P_PART))
     check("$name: μₙ(μₚ, τ) matches the dense build", worst < 1e-10, @sprintf("max rel diff %.2e", worst))
 
     println("--- feasibility edge ($name)")
-    edge_ok = true
+    edge_ok = guard_ok = true
     upper_seen = false
     for τ in (0.0, 0.5, 0.95), n in (1, K)
-        _, μ_lo, μ_hi = PSC.dual_curve(front, tau_prep(front, τ), n)
+        μₙ, μ_lo, μ_hi = PSC.dual_curve(front, tau_prep(front, τ), n)
         edge_ok &= isposdef(dense_operator(P, n, τ, μ_lo * (1 + 1e-6))) &&
                    !isposdef(dense_operator(P, n, τ, μ_lo * (1 - 1e-6)))
+        guard_ok &= μₙ(μ_lo * (1 - 1e-6)) == Inf && (!isfinite(μ_hi) || μₙ(μ_hi * (1 + 1e-6)) == Inf)
         if isfinite(μ_hi)
             upper_seen = true
             edge_ok &= isposdef(dense_operator(P, n, τ, μ_hi * (1 - 1e-6))) &&
@@ -81,6 +82,7 @@ for (name, P) in (("full basis", P_FULL), ("partial basis", P_PART))
         end
     end
     check("$name: 𝟙(τ) − H ≻ 0 exactly on (μ_lo, μ_hi)", edge_ok, upper_seen ? "both edges seen" : "no finite μ_hi")
+    check("$name: μₙ is Inf outside (μ_lo, μ_hi)", guard_ok)
 end
 
 println("\n=== augmentation")

@@ -316,7 +316,9 @@ function dual_curve(front, prep, n::Int)
     s_lo = ν_min < 0 ? max(0.0, τ + 1 / ν_min) : 0.0
     Z = prep.FQmh * upper_solve(U, E.vectors, 'N')
     function μₙ(μ_p)
-        λ = maximum(Array(eigvals(Hermitian(sandwich(Z, 1 ./ (1 .- (1 / μ_p - τ) .* ν)) .- prep.C₀))))
+        d = 1 .- (1 / μ_p - τ) .* ν
+        minimum(Array(d)) > 0 || return Inf # outside (μ_lo, μ_hi), 𝟙(τ) − H is not ≻ 0: no bound
+        λ = maximum(Array(eigvals(Hermitian(sandwich(Z, 1 ./ d) .- prep.C₀))))
         return μ_p * (front.sender_spanned ? 1 + λ : max(1, 1 + λ))
     end
     return μₙ, 1 / s_hi, s_lo > 0 ? 1 / s_lo : Inf
@@ -326,15 +328,20 @@ end
     system_dual(front, prep, n; log_tol=MU_P_LOG_TOL) -> (μ, μ_p, μ_lo)
 
 `min over μₚ of μₙ(μₚ, τ)` at `prep.τ`. μₙ is convex in μₚ on its feasible interval
-(μ_lo, μ_hi), and μₙ ≥ μₚ, so the minimiser lies below any value seen: golden section on
-log μₚ over (μ_lo, min(μ_hi, μₙ(start))), starting from the interior point μₚ = 1/τ.
+(μ_lo, μ_hi). Golden section on log μₚ, starting from the interior point μₚ = 1/τ. When
+sender directions lie outside the basis, μₙ ≥ μₚ, so the minimiser lies below any value
+seen and the bracket is (μ_lo, min(μ_hi, μₙ(start))). A basis spanning the sender can give
+σ₁ < 1, so there the bracket is widened past the start point instead.
 """
 function system_dual(front, prep, n::Int; log_tol::Real=MU_P_LOG_TOL)
     μₙ, μ_lo, μ_hi = dual_curve(front, prep, n)
     best = (μ=Inf, μ_p=NaN)
     f(log_μ_p) = (μ_p = exp(log_μ_p); μ = μₙ(μ_p); μ < best.μ && (best = (μ=μ, μ_p=μ_p)); μ)
-    f(log(prep.τ > 0 ? 1 / prep.τ : 2μ_lo))
-    golden_section(f, log(μ_lo), log(min(μ_hi, best.μ)), log_tol)
+    μ_start = prep.τ > 0 ? 1 / prep.τ : 2μ_lo
+    f(log(μ_start))
+    # shortcut: the 1e3 widening is a heuristic, not a proof; raise it if opt_mu_p sits at the cap.
+    cap = front.sender_spanned ? 1e3 * max(best.μ, μ_start) : best.μ
+    golden_section(f, log(μ_lo), log(min(μ_hi, cap)), log_tol)
     return (μ=best.μ, μ_p=best.μ_p, μ_lo=μ_lo)
 end
 
@@ -508,7 +515,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     new_analytical_bounds[new_analytical_bounds .<= 0] .= NaN
     ks = 1:min(length(old_analytical_bounds), length(new_analytical_bounds), num_pos)
     candidates(k) = (old_analytical_bounds[k], new_analytical_bounds[k], bounds_dual_basis[k])
-    which_bounds = [argmin(candidates(k)) for k in ks]
+    # argmin returns a NaN if one is present; a NaN candidate is "no bound", so it must lose.
+    which_bounds = [argmin(replace(collect(candidates(k)), NaN => Inf)) for k in ks]
     true_bounds = [candidates(k)[which_bounds[k]] for k in ks]
 
     return (num_pos=num_pos, m_kept=m_kept, bounds_dual_basis=bounds_dual_basis,
