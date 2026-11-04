@@ -242,6 +242,7 @@ function top_eigpair(M::AbstractMatrix)
     E = eigen(Hermitian(M), size(M, 1):size(M, 1))
     return E.values[1], E.vectors[:, 1]
 end
+bottom_eigval(M::AbstractMatrix) = M isa CuMatrix ? minimum(Array(eigvals(Hermitian(M)))) : eigvals(Hermitian(M), 1:1)[1]
 
 upper_solve(U, X, t::Char) =
     (X isa CuArray ? CUDA.CUBLAS.trsm! : BLAS.trsm!)('L', 'U', t, 'N', one(eltype(X)), U, copy(X))
@@ -311,13 +312,13 @@ function golden_section(f, lo::Real, hi::Real, tol::Real)
     end
 end
 
-# Pattern search in τ from the previous channel's optimum: probe ±δ, step downhill while
+# Pattern search (in u = log(1 − τ)) from the previous channel's optimum: probe ±δ, step downhill while
 # that improves, then golden section on the last bracket. Returns the number of steps.
-function local_tau_search(dual_at, τ₀::Real, δ::Real, τ_min::Real, τ_max::Real)
-    c = clamp(Float64(τ₀), τ_min, τ_max)
+function local_tau_search(dual_at, x₀::Real, δ::Real, lo::Real, hi::Real)
+    c = clamp(Float64(x₀), lo, hi)
     fc = dual_at(c)
     for step in 0:TAU_MAX_STEPS
-        l, r = max(c - δ, τ_min), min(c + δ, τ_max)
+        l, r = max(c - δ, lo), min(c + δ, hi)
         fl = l < c ? dual_at(l) : Inf
         fr = r > c ? dual_at(r) : Inf
         if fc <= min(fl, fr)
@@ -350,8 +351,9 @@ At `prep.τ` and index `n`, the function μₚ ↦ (μₙ(μₚ, τ), dμₙ/dlo
 μₙ = μₚ σ₁(Πₛ(𝟙(τ) − H)⁻¹Πₛ), and the interval (μ_lo, μ_hi) of μₚ where 𝟙(τ) ≻ H. In the Q^½-whitened basis, 𝟙(τ) − H is
 R(s) = 1 + ζQ^½(τA + G − sA⁽ⁿ⁾)Q^½ with s = 1/μₚ. At s = τ this is
 R₀ = 1 + ζQ^½(τ(A − A⁽ⁿ⁾) + G)Q^½ ⪰ 1, since A − A⁽ⁿ⁾ is the top n−1 (positive)
-components, so R₀ = LLᴴ whitens every τ ≥ 0. For τ < 0, R₀ may be indefinite, and `nothing`
-is returned when it is or when the feasible s lie at or below 0. With L⁻¹ζQ^½A⁽ⁿ⁾Q^½L⁻ᴴ = V diag(ν) Vᴴ,
+components, so R₀ = LLᴴ whitens every τ ≥ 0. For τ < 0, R₀ may be indefinite; then R(s₀)
+at the s₀ > 0 maximising λ_min(R(s)) whitens instead (s − τ becomes s − s₀ below), and
+`nothing` is returned when no s > 0 is feasible. With L⁻¹ζQ^½A⁽ⁿ⁾Q^½L⁻ᴴ = V diag(ν) Vᴴ,
 
     R(s)⁻¹ = L⁻ᴴ V diag(1/(1 − (s − τ)ν)) Vᴴ L⁻¹,   feasible iff 1 − (s − τ)νₖ > 0 ∀k.
 
@@ -361,28 +363,35 @@ contribute the eigenvalue 1 unless `front.sender_spanned`.
 """
 function dual_curve(front, prep, n::Int)
     ζ, τ = front.ζ, prep.τ
-    R₀ = n > 1 ? prep.B .+ (ζ * τ) .* sandwich(prep.Xq[:, 1:n-1], front.Γ[1:n-1]) : prep.B
+    Rτ = n > 1 ? prep.B .+ (ζ * τ) .* sandwich(prep.Xq[:, 1:n-1], front.Γ[1:n-1]) : prep.B
+    s₀ = τ # the whitening point: R(s₀) = LLᴴ ≻ 0, and R(s) = R(s₀) − (s − s₀)ζQ^½A⁽ⁿ⁾Q^½
     U = try
-        chol_upper(R₀)
+        chol_upper(Rτ)
     catch err
-        # shortcut: skips τ < 0 where R₀ is indefinite but some R(s), s > 0, may be ≻ 0; search s for a whitening point if opt_taus pile up there.
         err isa PosDefException && τ < 0 || rethrow()
-        return nothing
+        nothing
+    end
+    if isnothing(U)
+        rest = ζ .* sandwich(prep.Xq[:, n:end], front.Γ[n:end])
+        w = whitening_point(Rτ, rest, τ)
+        w.λ > 0 || return nothing # no s > 0 makes R(s) ≻ 0: no bound at this τ
+        s₀ = w.s
+        U = chol_upper(Rτ .- (s₀ - τ) .* rest)
     end
     Xn = upper_solve(U, prep.Xq[:, n:end], 'C')
     E = eigen(Hermitian(ζ .* sandwich(Xn, front.Γ[n:end])))
     ν = E.values
     ν_min, ν_max = extrema(Array(ν))
     ν_max > 0 || error("dual_curve: Ñ has no positive eigenvalue at n = $n, so A⁽ⁿ⁾ has no positive part left")
-    s_hi = τ + 1 / ν_max
+    s_hi = s₀ + 1 / ν_max
     s_hi > 0 || return nothing # τ < 0 only: every feasible s is ≤ 0, i.e. no μₚ > 0
-    s_lo = ν_min < 0 ? max(0.0, τ + 1 / ν_min) : 0.0
+    s_lo = ν_min < 0 ? max(0.0, s₀ + 1 / ν_min) : 0.0
     Z = prep.FQmh * upper_solve(U, E.vectors, 'N')
     # With λ, v the top eigenpair of Z diag(1/d) Zᴴ − C₀, Hellmann–Feynman gives
     # dλ/ds = Σₖ |(Zᴴv)ₖ|² νₖ/dₖ², so the slope in log μₚ costs one extra product.
     function μₙ(μ_p)
         s = 1 / μ_p
-        d = 1 .- (s - τ) .* ν
+        d = 1 .- (s - s₀) .* ν
         minimum(Array(d)) > 0 || return (Inf, NaN) # outside (μ_lo, μ_hi), 𝟙(τ) − H is not ≻ 0: no bound
         λ, v = top_eigpair(sandwich(Z, 1 ./ d) .- prep.C₀)
         !front.sender_spanned && λ < 0 && return (μ_p, μ_p) # the leftover sender directions' 1 wins
@@ -390,6 +399,16 @@ function dual_curve(front, prep, n::Int)
         return (μ_p * (1 + λ), μ_p * (1 + λ - s * dλ_ds))
     end
     return μₙ, 1 / s_hi, s_lo > 0 ? 1 / s_lo : Inf
+end
+
+# R(s) is affine in s, so λ_min(R(s)) is concave in s and unimodal in log s: golden section on
+# log s finds the most positive definite R(s), s > 0, to whiten by when R(τ) is not (τ < 0).
+# shortcut: a feasible window narrower than the 0.25 log-s tolerance can be missed (no bound, never a wrong one).
+function whitening_point(Rτ, rest, τ)
+    best = (λ=-Inf, s=NaN)
+    f(x) = (λ = bottom_eigval(Rτ .- (exp(x) - τ) .* rest); λ > best.λ && (best = (λ=λ, s=exp(x))); -λ)
+    golden_section(f, log(1e-12), log(1e16), 0.25)
+    return best
 end
 
 """
@@ -414,7 +433,7 @@ function system_dual(front, prep, n::Int; μ_start=nothing, log_tol::Real=MU_P_L
         return isfinite(μ) ? (g, μ) : (inward, μ)
     end
     lo, hi = log(μ_lo), log(μ_hi)
-    default = prep.τ > 0 ? 1 / prep.τ : 2μ_lo
+    default = prep.τ > 0 ? 1 / prep.τ : isfinite(μ_hi) ? sqrt(μ_lo * μ_hi) : 2μ_lo # all feasible
     x = log(!isnothing(μ_start) && μ_lo < μ_start < μ_hi ? μ_start : default)
     g, μ = slope(x, NaN)
     isfinite(g) || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, best, log_tol)
@@ -456,7 +475,7 @@ end
 function golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, best, log_tol)
     @warn string(now()) * " [bounds::system_dual] n=$n τ=$(prep.τ): no slope sign change found, golden section instead"
     f(x) = (μ = μₙ(exp(x))[1]; μ < best.μ && (best = (μ=μ, μ_p=exp(x))); μ)
-    μ_start = prep.τ > 0 ? 1 / prep.τ : 2μ_lo
+    μ_start = prep.τ > 0 ? 1 / prep.τ : isfinite(μ_hi) ? sqrt(μ_lo * μ_hi) : 2μ_lo
     f(log(μ_start))
     # shortcut: the 1e3 widening is a heuristic, not a proof; raise it if opt_mu_p sits at the cap.
     cap = front.sender_spanned ? 1e3 * max(best.μ, μ_start) : best.μ
@@ -524,7 +543,7 @@ The σₙ(Pᵣₛ) bounds from a loaded Asym(G⁰ᵤᵣ) spectrum: `Γ` every ei
 
 The dual runs on `channels` (default `dual_channels(num_pos)`). The first, and any channel
 whose warm start goes wrong, minimises over μₚ at each τ of the grid `τs` (τ = 1 is
-skipped) and refines by golden-section search in τ down to `τ_refine_tol`. The others
+skipped) and refines by golden-section search in u = log(1 − τ) down to `τ_refine_tol`. The others
 search locally from the previous channel's τ and μₚ (`local_tau_search`). `nothing` keeps
 the grid minimum at every channel. Every evaluation is a valid bound, and the running
 minimum is kept. A channel between samples takes the bound of the sample below it.
@@ -542,7 +561,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γ::AbstractVector, V, Γrs::AbstractVector;
                               kept::AbstractVector{<:Integer}=eachindex(Γ),
                               k_uu::Int=DEFAULT_K_UU,
-                              τs::AbstractVector{<:Real}=range(-1.0, 1.0, length=9),
+                              τs::AbstractVector{<:Real}=1 .- exp2.(10:-1:-4),
                               τ_refine_tol::Union{Nothing,Real}=0.05,
                               G₀_uu=nothing,
                               channels=nothing,
@@ -586,7 +605,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     usable = [i for i in eachindex(τs) if τs[i] < 1]
     preps = Dict{Float64,Any}()
     prep_at(τ) = (length(preps) >= TAU_PREP_CACHE && empty!(preps); get!(() -> tau_prep(front, τ), preps, Float64(τ)))
-    τ_max = 1 - TAU_EDGE
+    # τ is searched in u = log(1 − τ): steps are relative in 1 − τ, which spans 1e-3 to 1e3.
+    u_of(τ) = log1p(-τ)
+    u_lo, u_hi = log(TAU_EDGE), u_of(first(τs))
 
     bounds_dual_basis = fill(Inf, num_pos)
     bounds_dual_by_tau = fill(NaN, num_pos, length(τs))
@@ -623,16 +644,16 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
             bounds_dual_by_tau[n, usable] .= sqrt.(grid_μ)
             i = usable[argmin(grid_μ)]
             if !isnothing(τ_refine_tol) && length(τs) > 1
-                golden_section(dual_at, Float64(τs[max(i - 1, firstindex(τs))]),
-                               min(Float64(τs[min(i + 1, lastindex(τs))]), τ_max), τ_refine_tol)
+                golden_section(u -> dual_at(-expm1(u)), max(u_of(τs[min(i + 1, lastindex(τs))]), u_lo),
+                               u_of(τs[max(i - 1, firstindex(τs))]), τ_refine_tol)
             end
         end
         swept = isnothing(prev) || isnothing(τ_refine_tol) || length(τs) == 1
         if swept
             grid_sweep()
         else
-            # shortcut: τ never goes below τs[1] (−1 by default); widen the grid if opt_taus sit at τs[1].
-            walked = local_tau_search(dual_at, prev.τ, τ_refine_tol, first(τs), τ_max)
+            # shortcut: τ never goes below τs[1] (−1023 by default); widen the grid if opt_taus sit at τs[1].
+            walked = local_tau_search(u -> dual_at(-expm1(u)), u_of(prev.τ), τ_refine_tol, u_lo, u_hi)
             # A long walk or a value well above the previous channel's says the warm start lost the optimum.
             if walked > TAU_MAX_STEPS || best.μ > (1 + TAU_RESWEEP_RTOL) * prev.μ
                 grid_sweep()
