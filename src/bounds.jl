@@ -436,7 +436,7 @@ function system_dual(front, prep, n::Int; μ_start=nothing, log_tol::Real=MU_P_L
     default = prep.τ > 0 ? 1 / prep.τ : isfinite(μ_hi) ? sqrt(μ_lo * μ_hi) : 2μ_lo # all feasible
     x = log(!isnothing(μ_start) && μ_lo < μ_start < μ_hi ? μ_start : default)
     g, μ = slope(x, NaN)
-    isfinite(g) || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, best, log_tol)
+    isfinite(g) || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, default, best, log_tol)
     dir = g > 0 ? -1 : 1
     a = b = x
     ga = gb = g
@@ -451,7 +451,7 @@ function system_dual(front, prep, n::Int; μ_start=nothing, log_tol::Real=MU_P_L
         end
         x, g, h = y, gy, 2h
     end
-    ga < 0 < gb || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, best, log_tol)
+    ga < 0 < gb || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, default, best, log_tol)
     side = 0
     while b - a > log_tol
         t = isfinite(ga) && isfinite(gb) ? (a * gb - b * ga) / (gb - ga) : (a + b) / 2
@@ -472,10 +472,9 @@ end
 
 # Golden section on log μₚ over the whole feasible interval: the slower search the slope
 # search falls back to. μₙ ≥ μₚ unless the basis spans the sender, which caps the bracket.
-function golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, best, log_tol)
+function golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, μ_start, best, log_tol)
     @warn string(now()) * " [bounds::system_dual] n=$n τ=$(prep.τ): no slope sign change found, golden section instead"
     f(x) = (μ = μₙ(exp(x))[1]; μ < best.μ && (best = (μ=μ, μ_p=exp(x))); μ)
-    μ_start = prep.τ > 0 ? 1 / prep.τ : isfinite(μ_hi) ? sqrt(μ_lo * μ_hi) : 2μ_lo
     f(log(μ_start))
     # shortcut: the 1e3 widening is a heuristic, not a proof; raise it if opt_mu_p sits at the cap.
     cap = front.sender_spanned ? 1e3 * max(best.μ, μ_start) : best.μ
@@ -536,7 +535,7 @@ function load_front_checkpoint(path, key)
 end
 
 """
-    bounds_from_spectrum(compute_env, smr, Γ, V, Γrs; kept, k_uu, τs, τ_refine_tol, G₀_uu, checkpoint)
+    bounds_from_spectrum(compute_env, smr, Γ, V, Γrs; kept, k_uu, τs, τ_refine_tol, G₀_uu, channels, checkpoint)
 
 The σₙ(Pᵣₛ) bounds from a loaded Asym(G⁰ᵤᵣ) spectrum: `Γ` every eigenvalue (descending),
 `V` the eigenvectors of `Γ[kept]`, column for column.
@@ -641,7 +640,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         end
         function grid_sweep()
             grid_μ = [dual_at(τs[i]) for i in usable]
-            bounds_dual_by_tau[n, usable] .= sqrt.(grid_μ)
+            bounds_dual_by_tau[n, usable] .= sqrt.(grid_μ) # NaN on channels the warm start handled
             i = usable[argmin(grid_μ)]
             if !isnothing(τ_refine_tol) && length(τs) > 1
                 golden_section(u -> dual_at(-expm1(u)), max(u_of(τs[min(i + 1, lastindex(τs))]), u_lo),

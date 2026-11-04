@@ -119,6 +119,12 @@ for (name, P, Γ) in (("full basis", P_FULL, Γ), ("partial basis", P_PART, Γ),
     check("$name: μₙ is Inf outside (μ_lo, μ_hi)", guard_ok)
 end
 
+# τ = −1, R(s) = R(τ) − (s − τ)·rest = diag(s, 2 − s): ≻ 0 only on 0 < s < 2, best at s = 1.
+let w = PSC.whitening_point(Matrix(Diagonal([-1.0, 3.0])), Matrix(Diagonal([-1.0, 1.0])), -1.0)
+    check("whitening_point finds the most positive definite R(s) when R(τ) is indefinite",
+          abs(w.s - 1) < 0.15 && abs(w.λ - 1) < 0.15, @sprintf("s₀ = %.3f, λ_min = %.3f", w.s, w.λ))
+end
+
 println("\n=== augmentation")
 let U = randn(ComplexF64, N_U, 5)
     aug = augmented_basis(V, hcat(U, V[:, 1])) # the last column is already in span(g)
