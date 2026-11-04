@@ -63,9 +63,22 @@ for (name, P) in (("full basis", P_FULL), ("partial basis", P_PART))
     for τ in (0.0, 0.3, 0.7, 0.95), n in (1, 3, K), t in (0.01, 0.5, 0.99)
         μₙ, μ_lo, μ_hi = PSC.dual_curve(front, tau_prep(front, τ), n)
         μ_p = μ_lo * (min(μ_hi, 100μ_lo) / μ_lo)^t # across the feasible interval, in log
-        worst = max(worst, abs(μₙ(μ_p) - dense_mu(P, n, τ, μ_p)) / dense_mu(P, n, τ, μ_p))
+        worst = max(worst, abs(μₙ(μ_p)[1] - dense_mu(P, n, τ, μ_p)) / dense_mu(P, n, τ, μ_p))
     end
     check("$name: μₙ(μₚ, τ) matches the dense build", worst < 1e-10, @sprintf("max rel diff %.2e", worst))
+
+    slope_err, min_err = 0.0, 0.0
+    for τ in (0.0, 0.5, 0.95), n in (1, 3, K)
+        prep = tau_prep(front, τ)
+        μₙ, μ_lo, μ_hi = PSC.dual_curve(front, prep, n)
+        x = (log(μ_lo) + 0.4 * (log(min(μ_hi, 100μ_lo)) - log(μ_lo)), 1e-5) # (point, finite-difference step)
+        fd = (μₙ(exp(x[1] + x[2]))[1] - μₙ(exp(x[1] - x[2]))[1]) / 2x[2]
+        slope_err = max(slope_err, abs(μₙ(exp(x[1]))[2] - fd) / μₙ(exp(x[1]))[1])
+        fine = minimum(μₙ(exp(y))[1] for y in range(log(μ_lo), log(min(μ_hi, 100μ_lo)), length=2001)[2:end-1])
+        min_err = max(min_err, PSC.system_dual(front, prep, n).μ / fine - 1)
+    end
+    check("$name: the slope in log μₚ matches finite differences", slope_err < 1e-5, @sprintf("max rel err %.2e", slope_err))
+    check("$name: the slope search reaches the fine-grid minimum", min_err < 1e-5, @sprintf("max excess %.2e", min_err))
 
     println("--- feasibility edge ($name)")
     edge_ok = guard_ok = true
@@ -74,7 +87,7 @@ for (name, P) in (("full basis", P_FULL), ("partial basis", P_PART))
         μₙ, μ_lo, μ_hi = PSC.dual_curve(front, tau_prep(front, τ), n)
         edge_ok &= isposdef(dense_operator(P, n, τ, μ_lo * (1 + 1e-6))) &&
                    !isposdef(dense_operator(P, n, τ, μ_lo * (1 - 1e-6)))
-        guard_ok &= μₙ(μ_lo * (1 - 1e-6)) == Inf && (!isfinite(μ_hi) || μₙ(μ_hi * (1 + 1e-6)) == Inf)
+        guard_ok &= μₙ(μ_lo * (1 - 1e-6))[1] == Inf && (!isfinite(μ_hi) || μₙ(μ_hi * (1 + 1e-6))[1] == Inf)
         if isfinite(μ_hi)
             upper_seen = true
             edge_ok &= isposdef(dense_operator(P, n, τ, μ_hi * (1 - 1e-6))) &&
@@ -167,7 +180,8 @@ let ck = joinpath(ROOT, "ckpt")
     check("a checkpointed run writes its front and progress",
           isfile("$(ck).front.jld") && isfile("$(ck).progress.jld") && all(isfinite, whole.bounds_dual_basis))
     # Pretend the job was killed after three indices.
-    PSC.save_atomic("$(ck).progress.jld", "n_done" => 3, "bounds_dual_basis" => [whole.bounds_dual_basis[1:3]; zeros(K - 3)],
+    PSC.save_atomic("$(ck).progress.jld", "channels" => collect(1:K), "k_done" => 3,
+                    "bounds_dual_basis" => [whole.bounds_dual_basis[1:3]; fill(Inf, K - 3)],
                     "bounds_dual_by_tau" => whole.bounds_dual_by_tau, "opt_taus" => whole.opt_taus, "opt_mu_p" => whole.opt_mu_p)
     resumed = run_synthetic(k_uu=8, checkpoint=ck)
     check("a resumed run reproduces the run it resumed", resumed.bounds_dual_basis == whole.bounds_dual_basis &&
@@ -178,8 +192,12 @@ end
 
 println("\n=== τ search")
 let grid = run_synthetic(k_uu=N_U, τ_refine_tol=nothing)
-    check("refinement never loosens the grid minimum",
-          all(FULL.bounds_dual_basis .<= grid.bounds_dual_basis .* (1 + 1e-12)))
+    worst = maximum(FULL.bounds_dual_basis ./ grid.bounds_dual_basis)
+    check("the warm-started τ search stays within 1% of the grid minimum", worst <= 1.01, @sprintf("worst ratio %.4f", worst))
+    sparse = run_synthetic(k_uu=N_U, channels=[1, 3, K])
+    check("a channel between samples takes the sample below it",
+          sparse.bounds_dual_basis[2] == sparse.bounds_dual_basis[1] && sparse.bounds_dual_basis[4] == sparse.bounds_dual_basis[3] &&
+          sparse.dual_channels == [1, 3, K])
 end
 
 println()

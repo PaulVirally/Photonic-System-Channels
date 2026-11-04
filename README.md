@@ -47,7 +47,9 @@ positive block; `generate_rsvd.jl` recomputes them. The bounds stage checkpoints
 system-design dual of Eq. (37) (`bounds_dual_basis`, with its minimisers
 `opt_taus` and `opt_mu_p`) and the two passivity bounds
 (`old_analytical_bounds`, `new_analytical_bounds`), with `which_bounds` naming the
-winner (1, 2, 3). Φ = Σₙ σₙ² is `sum(abs2, true_bounds)`. The `augment/` group records
+winner (1, 2, 3). The dual runs on the channels in `dual_channels` (all up to 50, then a
+geometric ladder); the others take the bound of the sampled channel below them, which is
+valid since σₙ ≤ σₘ for m < n. Φ = Σₙ σₙ² is `sum(abs2, true_bounds)`. The `augment/` group records
 the basis the dual was solved in.
 
 ## Code
