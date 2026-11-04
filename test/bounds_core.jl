@@ -60,17 +60,24 @@ for (name, P) in (("full basis", P_FULL), ("partial basis", P_PART))
     front = front_for(P)
     check("$name: sender_spanned = $(size(P, 2) >= N_S)", front.sender_spanned == (size(P, 2) >= N_S))
     worst = 0.0
-    for τ in (0.0, 0.3, 0.7, 0.95), n in (1, 3, K), t in (0.01, 0.5, 0.99)
-        μₙ, μ_lo, μ_hi = PSC.dual_curve(front, tau_prep(front, τ), n)
+    negative_seen = 0
+    for τ in (-1.0, -0.3, 0.0, 0.3, 0.7, 0.95), n in (1, 3, K), t in (0.01, 0.5, 0.99)
+        curve = PSC.dual_curve(front, tau_prep(front, τ), n)
+        isnothing(curve) && (τ < 0 || error("dual_curve refused τ = $τ ≥ 0"); continue)
+        τ < 0 && (negative_seen += 1)
+        μₙ, μ_lo, μ_hi = curve
         μ_p = μ_lo * (min(μ_hi, 100μ_lo) / μ_lo)^t # across the feasible interval, in log
         worst = max(worst, abs(μₙ(μ_p)[1] - dense_mu(P, n, τ, μ_p)) / dense_mu(P, n, τ, μ_p))
     end
     check("$name: μₙ(μₚ, τ) matches the dense build", worst < 1e-10, @sprintf("max rel diff %.2e", worst))
+    check("$name: some τ < 0 is feasible and checked", negative_seen > 0, "$(negative_seen) τ < 0 evaluations")
 
     slope_err, min_err = 0.0, 0.0
-    for τ in (0.0, 0.5, 0.95), n in (1, 3, K)
+    for τ in (-0.3, 0.0, 0.5, 0.95), n in (1, 3, K)
         prep = tau_prep(front, τ)
-        μₙ, μ_lo, μ_hi = PSC.dual_curve(front, prep, n)
+        curve = PSC.dual_curve(front, prep, n)
+        isnothing(curve) && continue
+        μₙ, μ_lo, μ_hi = curve
         x = (log(μ_lo) + 0.4 * (log(min(μ_hi, 100μ_lo)) - log(μ_lo)), 1e-5) # (point, finite-difference step)
         fd = (μₙ(exp(x[1] + x[2]))[1] - μₙ(exp(x[1] - x[2]))[1]) / 2x[2]
         slope_err = max(slope_err, abs(μₙ(exp(x[1]))[2] - fd) / μₙ(exp(x[1]))[1])
@@ -83,8 +90,10 @@ for (name, P) in (("full basis", P_FULL), ("partial basis", P_PART))
     println("--- feasibility edge ($name)")
     edge_ok = guard_ok = true
     upper_seen = false
-    for τ in (0.0, 0.5, 0.95), n in (1, K)
-        μₙ, μ_lo, μ_hi = PSC.dual_curve(front, tau_prep(front, τ), n)
+    for τ in (-1.0, -0.3, 0.0, 0.5, 0.95), n in (1, K)
+        curve = PSC.dual_curve(front, tau_prep(front, τ), n)
+        isnothing(curve) && continue
+        μₙ, μ_lo, μ_hi = curve
         edge_ok &= isposdef(dense_operator(P, n, τ, μ_lo * (1 + 1e-6))) &&
                    !isposdef(dense_operator(P, n, τ, μ_lo * (1 - 1e-6)))
         guard_ok &= μₙ(μ_lo * (1 - 1e-6))[1] == Inf && (!isfinite(μ_hi) || μₙ(μ_hi * (1 + 1e-6))[1] == Inf)
@@ -124,7 +133,7 @@ let N = 100_000, budget = 1000 * 16 * N
 end
 
 quiet(f) = with_logger(f, SimpleLogger(stderr, Logging.Error))
-const TAUS = range(0.0, 1.0, length=11)
+const TAUS = range(-1.0, 1.0, length=21)
 
 # (a) ≤ 1, (b) non-increasing in n, (c) σₙ² ≤ Eq. (36) = new_analytical_bounds². For a
 # saturated channel (2κ̃ ≥ 1, Eq. (36) = 1) the infimum is the τ → 1 limit, which the τ

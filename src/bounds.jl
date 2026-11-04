@@ -9,10 +9,11 @@ import Funicular
 # ---------------------------------------------------------------------------
 # The system-design bound on σₙ(Pᵣₛ), Eq. (37) of the paper
 #
-#     σₙ² ≤ min over μₚ > 0, 0 ≤ τ < 1 of μₙ(μₚ, τ) = μₚ σ₁(Πₛ (𝟙(τ) − H)⁻¹ Πₛ),   𝟙(τ) ≻ H,
+#     σₙ² ≤ min over μₚ > 0, τ < 1 of μₙ(μₚ, τ) = μₚ σ₁(Πₛ (𝟙(τ) − H)⁻¹ Πₛ),   𝟙(τ) ≻ H,
 #
 # with 𝟙(τ) = 1 − τΠᵣ, H = ζ(A⁽ⁿ⁾/μₚ − τA − G), A = (−G⁰ᵣᵤ)ᵃ (both signs), G = (G⁰ᵤᵤ)ᵃ and
-# A⁽ⁿ⁾ = A without its n−1 largest eigencomponents. Any feasible (μₚ, τ) is a bound.
+# A⁽ⁿ⁾ = A without its n−1 largest eigencomponents. Any feasible (μₚ, τ) is a bound. τ < 0 is
+# allowed: τ weights the identity ζ⁻¹Πᵣ = (−G⁰ᵣᵤ)ᵃ on t (Eq. (24)), an equality, so any sign works.
 #
 # H is represented in an orthonormal `basis` P: the kept eigenvectors g of A (all signs,
 # `m_kept` columns), augmented with the top `k_uu` eigenvectors of Asym(G⁰ᵤᵤ). The
@@ -22,7 +23,7 @@ import Funicular
 # In the basis, with W = Pᴴg, S = PₛᴴPₛ, Q(τ) = Pᴴ𝟙(τ)⁻¹P = S + (1−τ)⁻¹(1 − S) and h the
 # projected H, Woodbury gives Πₛ(𝟙(τ) − PhPᴴ)⁻¹Πₛ = Πₛ + PₛKPₛᴴ with K = h(1 − Qh)⁻¹.
 # Whitening by Q^½ and by R₀ = 1 + ζQ^½(τ(A − A⁽ⁿ⁾)_P + G_P)Q^½ = LLᴴ ⪰ 1 (the operator at
-# μₚ = 1/τ) leaves one Cholesky and one eigenproblem per (n, τ),
+# μₚ = 1/τ; for τ < 0 it can be indefinite) leaves one Cholesky and one eigenproblem per (n, τ),
 #
 #     L⁻¹ζQ^½A⁽ⁿ⁾_P Q^½L⁻ᴴ = V diag(ν) Vᴴ,   K(μₚ) = Y diag(1/(1 − (1/μₚ − τ)νₖ)) Yᴴ − Q⁻¹,
 #
@@ -282,8 +283,8 @@ The matrices of the dual that depend on τ only, shared by every n: `B = 1 + ζQ
 `bounds_front_end`'s output plus `ζ`.
 """
 function tau_prep(front, τ::Real)
-    0 <= τ < 1 || throw(ArgumentError("τ must lie in [0, 1), got $τ"))
-    q = front.s .+ (1 .- front.s) ./ (1 - τ) # the eigenvalues of Q(τ), all ≥ 1
+    τ < 1 || throw(ArgumentError("τ must be below 1, got $τ"))
+    q = front.s .+ (1 .- front.s) ./ (1 - τ) # the eigenvalues of Q(τ), all > 0
     Qh = sandwich(front.U, sqrt.(q))
     B = front.ζ .* (Qh * front.G_P * Qh)
     view(B, diagind(B)) .+= 1
@@ -312,11 +313,11 @@ end
 
 # Pattern search in τ from the previous channel's optimum: probe ±δ, step downhill while
 # that improves, then golden section on the last bracket. Returns the number of steps.
-function local_tau_search(dual_at, τ₀::Real, δ::Real, τ_max::Real)
-    c = clamp(Float64(τ₀), 0.0, τ_max)
+function local_tau_search(dual_at, τ₀::Real, δ::Real, τ_min::Real, τ_max::Real)
+    c = clamp(Float64(τ₀), τ_min, τ_max)
     fc = dual_at(c)
     for step in 0:TAU_MAX_STEPS
-        l, r = max(c - δ, 0.0), min(c + δ, τ_max)
+        l, r = max(c - δ, τ_min), min(c + δ, τ_max)
         fl = l < c ? dual_at(l) : Inf
         fr = r > c ? dual_at(r) : Inf
         if fc <= min(fl, fr)
@@ -343,13 +344,14 @@ function dual_channels(num_pos::Integer)
 end
 
 """
-    dual_curve(front, prep, n) -> (μₙ, μ_lo, μ_hi)
+    dual_curve(front, prep, n) -> (μₙ, μ_lo, μ_hi), or `nothing` when no μₚ is known to be feasible
 
 At `prep.τ` and index `n`, the function μₚ ↦ (μₙ(μₚ, τ), dμₙ/dlog μₚ), with
 μₙ = μₚ σ₁(Πₛ(𝟙(τ) − H)⁻¹Πₛ), and the interval (μ_lo, μ_hi) of μₚ where 𝟙(τ) ≻ H. In the Q^½-whitened basis, 𝟙(τ) − H is
 R(s) = 1 + ζQ^½(τA + G − sA⁽ⁿ⁾)Q^½ with s = 1/μₚ. At s = τ this is
 R₀ = 1 + ζQ^½(τ(A − A⁽ⁿ⁾) + G)Q^½ ⪰ 1, since A − A⁽ⁿ⁾ is the top n−1 (positive)
-components, so R₀ = LLᴴ whitens every τ, and with L⁻¹ζQ^½A⁽ⁿ⁾Q^½L⁻ᴴ = V diag(ν) Vᴴ,
+components, so R₀ = LLᴴ whitens every τ ≥ 0. For τ < 0, R₀ may be indefinite, and `nothing`
+is returned when it is or when the feasible s lie at or below 0. With L⁻¹ζQ^½A⁽ⁿ⁾Q^½L⁻ᴴ = V diag(ν) Vᴴ,
 
     R(s)⁻¹ = L⁻ᴴ V diag(1/(1 − (s − τ)ν)) Vᴴ L⁻¹,   feasible iff 1 − (s − τ)νₖ > 0 ∀k.
 
@@ -360,13 +362,20 @@ contribute the eigenvalue 1 unless `front.sender_spanned`.
 function dual_curve(front, prep, n::Int)
     ζ, τ = front.ζ, prep.τ
     R₀ = n > 1 ? prep.B .+ (ζ * τ) .* sandwich(prep.Xq[:, 1:n-1], front.Γ[1:n-1]) : prep.B
-    U = chol_upper(R₀)
+    U = try
+        chol_upper(R₀)
+    catch err
+        # shortcut: skips τ < 0 where R₀ is indefinite but some R(s), s > 0, may be ≻ 0; search s for a whitening point if opt_taus pile up there.
+        err isa PosDefException && τ < 0 || rethrow()
+        return nothing
+    end
     Xn = upper_solve(U, prep.Xq[:, n:end], 'C')
     E = eigen(Hermitian(ζ .* sandwich(Xn, front.Γ[n:end])))
     ν = E.values
     ν_min, ν_max = extrema(Array(ν))
     ν_max > 0 || error("dual_curve: Ñ has no positive eigenvalue at n = $n, so A⁽ⁿ⁾ has no positive part left")
     s_hi = τ + 1 / ν_max
+    s_hi > 0 || return nothing # τ < 0 only: every feasible s is ≤ 0, i.e. no μₚ > 0
     s_lo = ν_min < 0 ? max(0.0, τ + 1 / ν_min) : 0.0
     Z = prep.FQmh * upper_solve(U, E.vectors, 'N')
     # With λ, v the top eigenpair of Z diag(1/d) Zᴴ − C₀, Hellmann–Feynman gives
@@ -395,7 +404,9 @@ feasible interval counts as a slope pointing back inside. Every evaluation is a 
 bound and the smallest is kept. If no sign change is found, golden section takes over.
 """
 function system_dual(front, prep, n::Int; μ_start=nothing, log_tol::Real=MU_P_LOG_TOL)
-    μₙ, μ_lo, μ_hi = dual_curve(front, prep, n)
+    curve = dual_curve(front, prep, n)
+    isnothing(curve) && return (μ=Inf, μ_p=NaN, μ_lo=NaN) # τ < 0 with no feasible μₚ: no bound
+    μₙ, μ_lo, μ_hi = curve
     best = (μ=Inf, μ_p=NaN)
     function slope(x, inward)
         μ, g = μₙ(exp(x))
@@ -531,13 +542,13 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γ::AbstractVector, V, Γrs::AbstractVector;
                               kept::AbstractVector{<:Integer}=eachindex(Γ),
                               k_uu::Int=DEFAULT_K_UU,
-                              τs::AbstractVector{<:Real}=range(0.0, 1.0, length=5),
+                              τs::AbstractVector{<:Real}=range(-1.0, 1.0, length=9),
                               τ_refine_tol::Union{Nothing,Real}=0.05,
                               G₀_uu=nothing,
                               channels=nothing,
                               checkpoint::Union{Nothing,AbstractString}=nothing)
     isempty(τs) && throw(ArgumentError("τs must contain at least one grid point"))
-    all(τ -> 0 <= τ <= 1, τs) && issorted(τs) || throw(ArgumentError("τs must be sorted and lie in [0, 1], got $(τs)"))
+    all(<=(1), τs) && issorted(τs) || throw(ArgumentError("τs must be sorted and ≤ 1, got $(τs)"))
     isnothing(τ_refine_tol) || τ_refine_tol > 0 || throw(ArgumentError("τ_refine_tol must be positive or nothing"))
     k_uu >= 0 || throw(ArgumentError("k_uu must be non-negative, got $k_uu"))
     Γ_kept = Float64.(Γ[kept])
@@ -620,7 +631,8 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         if swept
             grid_sweep()
         else
-            walked = local_tau_search(dual_at, prev.τ, τ_refine_tol, τ_max)
+            # shortcut: τ never goes below τs[1] (−1 by default); widen the grid if opt_taus sit at τs[1].
+            walked = local_tau_search(dual_at, prev.τ, τ_refine_tol, first(τs), τ_max)
             # A long walk or a value well above the previous channel's says the warm start lost the optimum.
             if walked > TAU_MAX_STEPS || best.μ > (1 + TAU_RESWEEP_RTOL) * prev.μ
                 grid_sweep()
