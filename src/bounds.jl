@@ -9,10 +9,11 @@ import Funicular
 # ---------------------------------------------------------------------------
 # The system-design bound on σₙ(Pᵣₛ), Eq. (37) of the paper
 #
-#     σₙ² ≤ min over μₚ > 0, 0 ≤ τ < 1 of μₙ(μₚ, τ) = μₚ σ₁(Πₛ (𝟙(τ) − H)⁻¹ Πₛ),   𝟙(τ) ≻ H,
+#     σₙ² ≤ min over μₚ > 0, τ < 1 of μₙ(μₚ, τ) = μₚ σ₁(Πₛ (𝟙(τ) − H)⁻¹ Πₛ),   𝟙(τ) ≻ H,
 #
 # with 𝟙(τ) = 1 − τΠᵣ, H = ζ(A⁽ⁿ⁾/μₚ − τA − G), A = (−G⁰ᵣᵤ)ᵃ (both signs), G = (G⁰ᵤᵤ)ᵃ and
-# A⁽ⁿ⁾ = A without its n−1 largest eigencomponents. Any feasible (μₚ, τ) is a bound.
+# A⁽ⁿ⁾ = A without its n−1 largest eigencomponents. Any feasible (μₚ, τ) is a bound. τ < 0 is
+# allowed: τ weights the identity ζ⁻¹Πᵣ = (−G⁰ᵣᵤ)ᵃ on t (Eq. (24)), an equality, so any sign works.
 #
 # H is represented in an orthonormal `basis` P: the kept eigenvectors g of A (all signs,
 # `m_kept` columns), augmented with the top `k_uu` eigenvectors of Asym(G⁰ᵤᵤ). The
@@ -22,7 +23,7 @@ import Funicular
 # In the basis, with W = Pᴴg, S = PₛᴴPₛ, Q(τ) = Pᴴ𝟙(τ)⁻¹P = S + (1−τ)⁻¹(1 − S) and h the
 # projected H, Woodbury gives Πₛ(𝟙(τ) − PhPᴴ)⁻¹Πₛ = Πₛ + PₛKPₛᴴ with K = h(1 − Qh)⁻¹.
 # Whitening by Q^½ and by R₀ = 1 + ζQ^½(τ(A − A⁽ⁿ⁾)_P + G_P)Q^½ = LLᴴ ⪰ 1 (the operator at
-# μₚ = 1/τ) leaves one Cholesky and one eigenproblem per (n, τ),
+# μₚ = 1/τ; for τ < 0 it can be indefinite) leaves one Cholesky and one eigenproblem per (n, τ),
 #
 #     L⁻¹ζQ^½A⁽ⁿ⁾_P Q^½L⁻ᴴ = V diag(ν) Vᴴ,   K(μₚ) = Y diag(1/(1 − (1/μₚ − τ)νₖ)) Yᴴ − Q⁻¹,
 #
@@ -46,6 +47,17 @@ const AUG_QR_RTOL = 1e-10
 # Width of the final log μₚ bracket. μₙ is flat at its minimum, so the value is
 # converged to about the square of this.
 const MU_P_LOG_TOL = 1e-3
+# The dual runs on every channel up to DUAL_DENSE_CHANNELS, then on a geometric ladder of
+# ratio DUAL_CHANNEL_RATIO; the channels in between take the bound of the sample below them.
+const DUAL_DENSE_CHANNELS = 50
+const DUAL_CHANNEL_RATIO = 1.1
+# τ warm start: walk at most TAU_MAX_STEPS steps from the previous channel's τ, and sweep the
+# whole grid instead if the result is more than TAU_RESWEEP_RTOL above the previous channel's.
+const TAU_MAX_STEPS = 3
+const TAU_RESWEEP_RTOL = 0.01
+# τ stays below 1 − TAU_EDGE, where 𝟙(τ) is still comfortably invertible.
+const TAU_EDGE = 1e-3
+const TAU_PREP_CACHE = 8
 # How often the per-n progress is written to the checkpoint, so short (backfilled) jobs lose little.
 const CHECKPOINT_SECONDS = 120
 
@@ -220,6 +232,18 @@ function chol_upper(R::AbstractMatrix)
     info == 0 || throw(PosDefException(Int(info)))
     return U
 end
+# The largest eigenpair of a Hermitian M. On the CPU, LAPACK's range driver skips the other
+# eigenvectors; CUSOLVER has no such driver here, so the GPU takes the full decomposition.
+function top_eigpair(M::AbstractMatrix)
+    if M isa CuMatrix
+        E = eigen(Hermitian(M))
+        return Array(E.values)[end], E.vectors[:, end]
+    end
+    E = eigen(Hermitian(M), size(M, 1):size(M, 1))
+    return E.values[1], E.vectors[:, 1]
+end
+bottom_eigval(M::AbstractMatrix) = M isa CuMatrix ? minimum(Array(eigvals(Hermitian(M)))) : eigvals(Hermitian(M), 1:1)[1]
+
 upper_solve(U, X, t::Char) =
     (X isa CuArray ? CUDA.CUBLAS.trsm! : BLAS.trsm!)('L', 'U', t, 'N', one(eltype(X)), U, copy(X))
 
@@ -260,8 +284,8 @@ The matrices of the dual that depend on τ only, shared by every n: `B = 1 + ζQ
 `bounds_front_end`'s output plus `ζ`.
 """
 function tau_prep(front, τ::Real)
-    0 <= τ < 1 || throw(ArgumentError("τ must lie in [0, 1), got $τ"))
-    q = front.s .+ (1 .- front.s) ./ (1 - τ) # the eigenvalues of Q(τ), all ≥ 1
+    τ < 1 || throw(ArgumentError("τ must be below 1, got $τ"))
+    q = front.s .+ (1 .- front.s) ./ (1 - τ) # the eigenvalues of Q(τ), all > 0
     Qh = sandwich(front.U, sqrt.(q))
     B = front.ζ .* (Qh * front.G_P * Qh)
     view(B, diagind(B)) .+= 1
@@ -288,14 +312,48 @@ function golden_section(f, lo::Real, hi::Real, tol::Real)
     end
 end
 
-"""
-    dual_curve(front, prep, n) -> (μₙ, μ_lo, μ_hi)
+# Pattern search (in u = log(1 − τ)) from the previous channel's optimum: probe ±δ, step downhill while
+# that improves, then golden section on the last bracket. Returns the number of steps.
+function local_tau_search(dual_at, x₀::Real, δ::Real, lo::Real, hi::Real)
+    c = clamp(Float64(x₀), lo, hi)
+    fc = dual_at(c)
+    for step in 0:TAU_MAX_STEPS
+        l, r = max(c - δ, lo), min(c + δ, hi)
+        fl = l < c ? dual_at(l) : Inf
+        fr = r > c ? dual_at(r) : Inf
+        if fc <= min(fl, fr)
+            golden_section(dual_at, l, r, δ)
+            return step
+        end
+        c, fc = fl < fr ? (l, fl) : (r, fr)
+    end
+    return TAU_MAX_STEPS + 1
+end
 
-At `prep.τ` and index `n`, the function μₚ ↦ μₙ(μₚ, τ) = μₚ σ₁(Πₛ(𝟙(τ) − H)⁻¹Πₛ) and the
-interval (μ_lo, μ_hi) of μₚ where 𝟙(τ) ≻ H. In the Q^½-whitened basis, 𝟙(τ) − H is
+"""
+    dual_channels(num_pos) -> Vector{Int}
+
+The channels the dual runs on: 1…DUAL_DENSE_CHANNELS, then each about DUAL_CHANNEL_RATIO
+times the last, ending at `num_pos`.
+"""
+function dual_channels(num_pos::Integer)
+    ns = collect(1:min(DUAL_DENSE_CHANNELS, num_pos))
+    while last(ns) < num_pos
+        push!(ns, min(num_pos, max(last(ns) + 1, round(Int, last(ns) * DUAL_CHANNEL_RATIO))))
+    end
+    return ns
+end
+
+"""
+    dual_curve(front, prep, n) -> (μₙ, μ_lo, μ_hi), or `nothing` when no μₚ is known to be feasible
+
+At `prep.τ` and index `n`, the function μₚ ↦ (μₙ(μₚ, τ), dμₙ/dlog μₚ), with
+μₙ = μₚ σ₁(Πₛ(𝟙(τ) − H)⁻¹Πₛ), and the interval (μ_lo, μ_hi) of μₚ where 𝟙(τ) ≻ H. In the Q^½-whitened basis, 𝟙(τ) − H is
 R(s) = 1 + ζQ^½(τA + G − sA⁽ⁿ⁾)Q^½ with s = 1/μₚ. At s = τ this is
 R₀ = 1 + ζQ^½(τ(A − A⁽ⁿ⁾) + G)Q^½ ⪰ 1, since A − A⁽ⁿ⁾ is the top n−1 (positive)
-components, so R₀ = LLᴴ whitens every τ, and with L⁻¹ζQ^½A⁽ⁿ⁾Q^½L⁻ᴴ = V diag(ν) Vᴴ,
+components, so R₀ = LLᴴ whitens every τ ≥ 0. For τ < 0, R₀ may be indefinite; then R(s₀)
+at the s₀ > 0 maximising λ_min(R(s)) whitens instead (s − τ becomes s − s₀ below), and
+`nothing` is returned when no s > 0 is feasible. With L⁻¹ζQ^½A⁽ⁿ⁾Q^½L⁻ᴴ = V diag(ν) Vᴴ,
 
     R(s)⁻¹ = L⁻ᴴ V diag(1/(1 − (s − τ)ν)) Vᴴ L⁻¹,   feasible iff 1 − (s − τ)νₖ > 0 ∀k.
 
@@ -305,36 +363,122 @@ contribute the eigenvalue 1 unless `front.sender_spanned`.
 """
 function dual_curve(front, prep, n::Int)
     ζ, τ = front.ζ, prep.τ
-    R₀ = n > 1 ? prep.B .+ (ζ * τ) .* sandwich(prep.Xq[:, 1:n-1], front.Γ[1:n-1]) : prep.B
-    U = chol_upper(R₀)
+    Rτ = n > 1 ? prep.B .+ (ζ * τ) .* sandwich(prep.Xq[:, 1:n-1], front.Γ[1:n-1]) : prep.B
+    s₀ = τ # the whitening point: R(s₀) = LLᴴ ≻ 0, and R(s) = R(s₀) − (s − s₀)ζQ^½A⁽ⁿ⁾Q^½
+    U = try
+        chol_upper(Rτ)
+    catch err
+        err isa PosDefException && τ < 0 || rethrow()
+        nothing
+    end
+    if isnothing(U)
+        rest = ζ .* sandwich(prep.Xq[:, n:end], front.Γ[n:end])
+        w = whitening_point(Rτ, rest, τ)
+        w.λ > 0 || return nothing # no s > 0 makes R(s) ≻ 0: no bound at this τ
+        s₀ = w.s
+        U = chol_upper(Rτ .- (s₀ - τ) .* rest)
+    end
     Xn = upper_solve(U, prep.Xq[:, n:end], 'C')
     E = eigen(Hermitian(ζ .* sandwich(Xn, front.Γ[n:end])))
     ν = E.values
     ν_min, ν_max = extrema(Array(ν))
     ν_max > 0 || error("dual_curve: Ñ has no positive eigenvalue at n = $n, so A⁽ⁿ⁾ has no positive part left")
-    s_hi = τ + 1 / ν_max
-    s_lo = ν_min < 0 ? max(0.0, τ + 1 / ν_min) : 0.0
+    s_hi = s₀ + 1 / ν_max
+    s_hi > 0 || return nothing # τ < 0 only: every feasible s is ≤ 0, i.e. no μₚ > 0
+    s_lo = ν_min < 0 ? max(0.0, s₀ + 1 / ν_min) : 0.0
     Z = prep.FQmh * upper_solve(U, E.vectors, 'N')
+    # With λ, v the top eigenpair of Z diag(1/d) Zᴴ − C₀, Hellmann–Feynman gives
+    # dλ/ds = Σₖ |(Zᴴv)ₖ|² νₖ/dₖ², so the slope in log μₚ costs one extra product.
     function μₙ(μ_p)
-        λ = maximum(Array(eigvals(Hermitian(sandwich(Z, 1 ./ (1 .- (1 / μ_p - τ) .* ν)) .- prep.C₀))))
-        return μ_p * (front.sender_spanned ? 1 + λ : max(1, 1 + λ))
+        s = 1 / μ_p
+        d = 1 .- (s - s₀) .* ν
+        minimum(Array(d)) > 0 || return (Inf, NaN) # outside (μ_lo, μ_hi), 𝟙(τ) − H is not ≻ 0: no bound
+        λ, v = top_eigpair(sandwich(Z, 1 ./ d) .- prep.C₀)
+        !front.sender_spanned && λ < 0 && return (μ_p, μ_p) # the leftover sender directions' 1 wins
+        dλ_ds = sum(Array(abs2.(Z' * v) .* ν ./ d .^ 2))
+        return (μ_p * (1 + λ), μ_p * (1 + λ - s * dλ_ds))
     end
     return μₙ, 1 / s_hi, s_lo > 0 ? 1 / s_lo : Inf
 end
 
+# R(s) is affine in s, so λ_min(R(s)) is concave in s and unimodal in log s: golden section on
+# log s finds the most positive definite R(s), s > 0, to whiten by when R(τ) is not (τ < 0).
+# shortcut: a feasible window narrower than the 0.25 log-s tolerance can be missed (no bound, never a wrong one).
+function whitening_point(Rτ, rest, τ)
+    best = (λ=-Inf, s=NaN)
+    f(x) = (λ = bottom_eigval(Rτ .- (exp(x) - τ) .* rest); λ > best.λ && (best = (λ=λ, s=exp(x))); -λ)
+    golden_section(f, log(1e-12), log(1e30), 0.25)
+    return best
+end
+
 """
-    system_dual(front, prep, n; log_tol=MU_P_LOG_TOL) -> (μ, μ_p, μ_lo)
+    system_dual(front, prep, n; μ_start=nothing, log_tol=MU_P_LOG_TOL) -> (μ, μ_p, μ_lo)
 
 `min over μₚ of μₙ(μₚ, τ)` at `prep.τ`. μₙ is convex in μₚ on its feasible interval
-(μ_lo, μ_hi), and μₙ ≥ μₚ, so the minimiser lies below any value seen: golden section on
-log μₚ over (μ_lo, min(μ_hi, μₙ(start))), starting from the interior point μₚ = 1/τ.
+(μ_lo, μ_hi), so its slope in x = log μₚ changes sign once. From `μ_start` (the previous
+channel's μₚ, if feasible) or 1/τ, the search walks downhill in doubling steps until the
+slope changes sign, then closes the bracket by Illinois regula falsi on the slope, until
+|dμₙ/dx| ≤ log_tol · μₙ or the bracket is narrower than log_tol. An evaluation outside the
+feasible interval counts as a slope pointing back inside. Every evaluation is a valid
+bound and the smallest is kept. If no sign change is found, golden section takes over.
 """
-function system_dual(front, prep, n::Int; log_tol::Real=MU_P_LOG_TOL)
-    μₙ, μ_lo, μ_hi = dual_curve(front, prep, n)
+function system_dual(front, prep, n::Int; μ_start=nothing, log_tol::Real=MU_P_LOG_TOL)
+    curve = dual_curve(front, prep, n)
+    isnothing(curve) && return (μ=Inf, μ_p=NaN, μ_lo=NaN) # τ < 0 with no feasible μₚ: no bound
+    μₙ, μ_lo, μ_hi = curve
     best = (μ=Inf, μ_p=NaN)
-    f(log_μ_p) = (μ_p = exp(log_μ_p); μ = μₙ(μ_p); μ < best.μ && (best = (μ=μ, μ_p=μ_p)); μ)
-    f(log(prep.τ > 0 ? 1 / prep.τ : 2μ_lo))
-    golden_section(f, log(μ_lo), log(min(μ_hi, best.μ)), log_tol)
+    function slope(x, inward)
+        μ, g = μₙ(exp(x))
+        μ < best.μ && (best = (μ=μ, μ_p=exp(x)))
+        return isfinite(μ) ? (g, μ) : (inward, μ)
+    end
+    lo, hi = log(μ_lo), log(μ_hi)
+    default = prep.τ > 0 ? 1 / prep.τ : isfinite(μ_hi) ? sqrt(μ_lo * μ_hi) : 2μ_lo # all feasible
+    x = log(!isnothing(μ_start) && μ_lo < μ_start < μ_hi ? μ_start : default)
+    g, μ = slope(x, NaN)
+    isfinite(g) || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, default, best, log_tol)
+    dir = g > 0 ? -1 : 1
+    a = b = x
+    ga = gb = g
+    h = 0.25
+    for _ in 1:60
+        abs(g) <= log_tol * μ && return (μ=best.μ, μ_p=best.μ_p, μ_lo=μ_lo)
+        y = dir > 0 ? min(x + h, (x + hi) / 2) : max(x - h, (x + lo) / 2) # never step past an edge
+        gy, μ = slope(y, dir > 0 ? Inf : -Inf)
+        if sign(gy) == dir # the slope changed sign between x and y
+            (a, ga, b, gb) = dir > 0 ? (x, g, y, gy) : (y, gy, x, g)
+            break
+        end
+        x, g, h = y, gy, 2h
+    end
+    ga < 0 < gb || return golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, default, best, log_tol)
+    side = 0
+    while b - a > log_tol
+        t = isfinite(ga) && isfinite(gb) ? (a * gb - b * ga) / (gb - ga) : (a + b) / 2
+        gt, μ = slope(t, NaN)
+        (!isfinite(gt) || abs(gt) <= log_tol * μ) && break
+        if gt < 0
+            a, ga = t, gt
+            side == -1 && (gb /= 2) # Illinois: halve the stale end so the bracket closes from both sides
+            side = -1
+        else
+            b, gb = t, gt
+            side == 1 && (ga /= 2)
+            side = 1
+        end
+    end
+    return (μ=best.μ, μ_p=best.μ_p, μ_lo=μ_lo)
+end
+
+# Golden section on log μₚ over the whole feasible interval: the slower search the slope
+# search falls back to. μₙ ≥ μₚ unless the basis spans the sender, which caps the bracket.
+function golden_fallback(front, prep, n, μₙ, μ_lo, μ_hi, μ_start, best, log_tol)
+    @warn string(now()) * " [bounds::system_dual] n=$n τ=$(prep.τ): no slope sign change found, golden section instead"
+    f(x) = (μ = μₙ(exp(x))[1]; μ < best.μ && (best = (μ=μ, μ_p=exp(x))); μ)
+    f(log(μ_start))
+    # shortcut: the 1e3 widening is a heuristic, not a proof; raise it if opt_mu_p sits at the cap.
+    cap = front.sender_spanned ? 1e3 * max(best.μ, μ_start) : best.μ
+    golden_section(f, log(μ_lo), log(min(μ_hi, cap)), log_tol)
     return (μ=best.μ, μ_p=best.μ_p, μ_lo=μ_lo)
 end
 
@@ -391,35 +535,38 @@ function load_front_checkpoint(path, key)
 end
 
 """
-    bounds_from_spectrum(compute_env, smr, Γ, V, Γrs; kept, k_uu, τs, τ_refine_tol, G₀_uu, checkpoint)
+    bounds_from_spectrum(compute_env, smr, Γ, V, Γrs; kept, k_uu, τs, τ_refine_tol, G₀_uu, channels, checkpoint)
 
 The σₙ(Pᵣₛ) bounds from a loaded Asym(G⁰ᵤᵣ) spectrum: `Γ` every eigenvalue (descending),
 `V` the eigenvectors of `Γ[kept]`, column for column.
 
-For each n, the dual is minimised over μₚ at each τ of the grid `τs` (τ = 1 is
-skipped) and refined by golden-section search in τ down to `τ_refine_tol` (`nothing`
-keeps the grid minimum). Every evaluation is a valid bound, and the running minimum
-is kept, so refinement can only tighten.
+The dual runs on `channels` (default `dual_channels(num_pos)`). The first, and any channel
+whose warm start goes wrong, minimises over μₚ at each τ of the grid `τs` (τ = 1 is
+skipped) and refines by golden-section search in u = log(1 − τ) down to `τ_refine_tol`. The others
+search locally from the previous channel's τ and μₚ (`local_tau_search`). `nothing` keeps
+the grid minimum at every channel. Every evaluation is a valid bound, and the running
+minimum is kept. A channel between samples takes the bound of the sample below it.
 
 The result is `min(dual, two passivity bounds)` per index: `old` from `Γrs` and `new`
 from `Γ`, with `which_bounds` saying which one won (1, 2, 3 = dual).
 
 `checkpoint` (a path prefix, or `nothing`) makes the run resumable: the projected
-matrices are saved once to `<checkpoint>.front.jld`, and the finished indices every
+matrices are saved once to `<checkpoint>.front.jld`, and the finished channels every
 `CHECKPOINT_SECONDS` to `<checkpoint>.progress.jld`. A rerun on the same inputs skips
 the augmentation and the projection, reuses the same basis, and resumes after the
-last saved n. The files are left for the caller to delete.
+last saved channel. The files are left for the caller to delete.
 """
 function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γ::AbstractVector, V, Γrs::AbstractVector;
                               kept::AbstractVector{<:Integer}=eachindex(Γ),
                               k_uu::Int=DEFAULT_K_UU,
-                              τs::AbstractVector{<:Real}=range(0.0, 1.0, length=5),
+                              τs::AbstractVector{<:Real}=1 .- exp2.(24:-1:-4),
                               τ_refine_tol::Union{Nothing,Real}=0.05,
                               G₀_uu=nothing,
+                              channels=nothing,
                               checkpoint::Union{Nothing,AbstractString}=nothing)
     isempty(τs) && throw(ArgumentError("τs must contain at least one grid point"))
-    all(τ -> 0 <= τ <= 1, τs) && issorted(τs) || throw(ArgumentError("τs must be sorted and lie in [0, 1], got $(τs)"))
+    all(<=(1), τs) && issorted(τs) || throw(ArgumentError("τs must be sorted and ≤ 1, got $(τs)"))
     isnothing(τ_refine_tol) || τ_refine_tol > 0 || throw(ArgumentError("τ_refine_tol must be positive or nothing"))
     k_uu >= 0 || throw(ArgumentError("k_uu must be non-negative, got $k_uu"))
     Γ_kept = Float64.(Γ[kept])
@@ -427,6 +574,9 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     issorted(Γ_kept, rev=true) || throw(ArgumentError("the kept Γ must be descending"))
     num_pos = count(>(0), Γ_kept)
     num_pos >= 1 || throw(ArgumentError("no kept Γ is positive"))
+    channels = isnothing(channels) ? dual_channels(num_pos) : collect(Int, channels)
+    issorted(channels) && allunique(channels) && first(channels) == 1 && last(channels) <= num_pos ||
+        throw(ArgumentError("channels must be increasing, start at 1 and stay ≤ $(num_pos)"))
     m_kept = length(kept)
 
     sender_size = dof_length(sender_mesh(smr))
@@ -452,52 +602,77 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     end
 
     usable = [i for i in eachindex(τs) if τs[i] < 1]
-    preps = Dict(i => tau_prep(front, τs[i]) for i in usable)
+    preps = Dict{Float64,Any}()
+    prep_at(τ) = (length(preps) >= TAU_PREP_CACHE && empty!(preps); get!(() -> tau_prep(front, τ), preps, Float64(τ)))
+    # τ is searched in u = log(1 − τ): steps are relative in 1 − τ, which spans 1e-3 to 1e3.
+    u_of(τ) = log1p(-τ)
+    u_lo, u_hi = log(TAU_EDGE), u_of(first(τs))
 
-    bounds_dual_basis = zeros(Float64, num_pos)
+    bounds_dual_basis = fill(Inf, num_pos)
     bounds_dual_by_tau = fill(NaN, num_pos, length(τs))
     opt_taus = fill(NaN, num_pos)
     opt_mu_p = fill(NaN, num_pos)
-    n_done = 0
+    k_done = 0
     if !isnothing(saved) && isfile(progress_path)
         jldopen(progress_path) do f
-            n_done = f["n_done"]
-            for (dst, k) in ((bounds_dual_basis, "bounds_dual_basis"), (bounds_dual_by_tau, "bounds_dual_by_tau"),
-                             (opt_taus, "opt_taus"), (opt_mu_p, "opt_mu_p"))
-                copyto!(dst, f[k])
+            if haskey(f, "channels") && f["channels"] == channels
+                k_done = f["k_done"]
+                for (dst, k) in ((bounds_dual_basis, "bounds_dual_basis"), (bounds_dual_by_tau, "bounds_dual_by_tau"),
+                                 (opt_taus, "opt_taus"), (opt_mu_p, "opt_mu_p"))
+                    copyto!(dst, f[k])
+                end
             end
         end
-        @info string(now()) * " [bounds::bounds_from_spectrum] $(n_done) of $(num_pos) indices already done"
+        @info string(now()) * " [bounds::bounds_from_spectrum] $(k_done) of $(length(channels)) channels already done"
     end
     last_save = time()
-    for n in (n_done + 1):num_pos
+    for k in (k_done + 1):length(channels)
+        n = channels[k]
+        prev = k > 1 ? (μ=bounds_dual_basis[channels[k-1]]^2, τ=opt_taus[channels[k-1]], μ_p=opt_mu_p[channels[k-1]]) : nothing
         best = (μ=Inf, τ=NaN, μ_p=NaN)
-        dual_at(prep) = try
-            d = system_dual(front, prep, n)
-            d.μ < best.μ && (best = (μ=d.μ, τ=prep.τ, μ_p=d.μ_p))
+        dual_at(τ) = try
+            d = system_dual(front, prep_at(τ), n; μ_start=isnothing(prev) ? nothing : prev.μ_p)
+            d.μ < best.μ && (best = (μ=d.μ, τ=Float64(τ), μ_p=d.μ_p))
             d.μ
         catch err
-            @warn string(now()) * " [bounds::bounds_from_spectrum] [$n/$(num_pos)] τ=$(prep.τ) failed; dropping it" exception = err
+            @warn string(now()) * " [bounds::bounds_from_spectrum] [$n/$(num_pos)] τ=$(τ) failed; dropping it" exception = err
             Inf
         end
-        grid_μ = [dual_at(preps[i]) for i in usable]
-        bounds_dual_by_tau[n, usable] .= sqrt.(grid_μ)
-        isfinite(best.μ) || error("every τ in the grid failed at n=$n")
-        i = usable[argmin(grid_μ)]
-        if !isnothing(τ_refine_tol) && length(τs) > 1
-            golden_section(τ -> dual_at(tau_prep(front, τ)), Float64(τs[max(i - 1, firstindex(τs))]),
-                           Float64(τs[min(i + 1, lastindex(τs))]), τ_refine_tol)
+        function grid_sweep()
+            grid_μ = [dual_at(τs[i]) for i in usable]
+            bounds_dual_by_tau[n, usable] .= sqrt.(grid_μ) # NaN on channels the warm start handled
+            i = usable[argmin(grid_μ)]
+            if !isnothing(τ_refine_tol) && length(τs) > 1
+                golden_section(u -> dual_at(-expm1(u)), max(u_of(τs[min(i + 1, lastindex(τs))]), u_lo),
+                               u_of(τs[max(i - 1, firstindex(τs))]), τ_refine_tol)
+            end
         end
-        @info string(now()) * " [bounds::bounds_from_spectrum] [$n/$(num_pos)] bound $(sqrt(best.μ)) on σₙ(Pᵣₛ) at τ = $(best.τ), μₚ = $(best.μ_p)"
+        swept = isnothing(prev) || isnothing(τ_refine_tol) || length(τs) == 1
+        if swept
+            grid_sweep()
+        else
+            # shortcut: τ never goes below τs[1] (≈ −1.7e7 by default); widen the grid if opt_taus sit at τs[1].
+            walked = local_tau_search(u -> dual_at(-expm1(u)), u_of(prev.τ), τ_refine_tol, u_lo, u_hi)
+            # A long walk or a value well above the previous channel's says the warm start lost the optimum.
+            if walked > TAU_MAX_STEPS || best.μ > (1 + TAU_RESWEEP_RTOL) * prev.μ
+                grid_sweep()
+                swept = true
+            end
+        end
+        isfinite(best.μ) || error("every τ tried failed at n=$n")
+        @info string(now()) * " [bounds::bounds_from_spectrum] [$n/$(num_pos)] bound $(sqrt(best.μ)) on σₙ(Pᵣₛ) at τ = $(best.τ), μₚ = $(best.μ_p)$(swept ? " (grid)" : "")"
         bounds_dual_basis[n] = sqrt(best.μ)
         opt_taus[n] = best.τ
         opt_mu_p[n] = best.μ_p
-        if !isnothing(progress_path) && (time() - last_save > CHECKPOINT_SECONDS || n == num_pos)
-            save_atomic(progress_path, "n_done" => n, "bounds_dual_basis" => bounds_dual_basis,
+        if !isnothing(progress_path) && (time() - last_save > CHECKPOINT_SECONDS || k == length(channels))
+            save_atomic(progress_path, "channels" => channels, "k_done" => k, "bounds_dual_basis" => bounds_dual_basis,
                         "bounds_dual_by_tau" => bounds_dual_by_tau, "opt_taus" => opt_taus, "opt_mu_p" => opt_mu_p)
             last_save = time()
         end
     end
+    # σₙ ≤ σₘ for m < n, so a channel takes the smallest dual at or below it: this fills the
+    # channels between samples and keeps the bound non-increasing.
+    accumulate!(min, bounds_dual_basis, bounds_dual_basis)
 
     # Passivity bounds: from κ = ζ²Γrs² (old form) and κ̃ = ζΓ (new form, Eq. (19)).
     old_form(κ) = κ >= 1 ? 1.0 : sqrt(4κ) / (1 + κ)
@@ -508,10 +683,11 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
     new_analytical_bounds[new_analytical_bounds .<= 0] .= NaN
     ks = 1:min(length(old_analytical_bounds), length(new_analytical_bounds), num_pos)
     candidates(k) = (old_analytical_bounds[k], new_analytical_bounds[k], bounds_dual_basis[k])
-    which_bounds = [argmin(candidates(k)) for k in ks]
+    # argmin returns a NaN if one is present; a NaN candidate is "no bound", so it must lose.
+    which_bounds = [argmin(replace(collect(candidates(k)), NaN => Inf)) for k in ks]
     true_bounds = [candidates(k)[which_bounds[k]] for k in ks]
 
-    return (num_pos=num_pos, m_kept=m_kept, bounds_dual_basis=bounds_dual_basis,
+    return (num_pos=num_pos, m_kept=m_kept, bounds_dual_basis=bounds_dual_basis, dual_channels=channels,
             tau_grid=collect(Float64, τs), opt_taus=opt_taus, opt_mu_p=opt_mu_p, bounds_dual_by_tau=bounds_dual_by_tau,
             old_analytical_bounds=old_analytical_bounds, new_analytical_bounds=new_analytical_bounds,
             true_bounds=true_bounds, which_bounds=which_bounds, m_aug=m_aug, augmentation=augmentation)
@@ -539,7 +715,7 @@ function _compute_bounds_sr(compute_env::ComputeEnvironment, smr::SMRSystem;
         jld["Γ"] = Array(inputs.Γ)
         jld["Γrs"] = Array(inputs.Γrs)
         jld["ordering_idxs"] = inputs.sorted_idxs
-        for key in (:bounds_dual_basis, :tau_grid, :opt_taus, :opt_mu_p, :bounds_dual_by_tau,
+        for key in (:bounds_dual_basis, :dual_channels, :tau_grid, :opt_taus, :opt_mu_p, :bounds_dual_by_tau,
                     :old_analytical_bounds, :new_analytical_bounds, :which_bounds, :true_bounds)
             jld[String(key)] = getfield(result, key)
         end
