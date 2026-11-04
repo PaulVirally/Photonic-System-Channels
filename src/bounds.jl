@@ -407,7 +407,7 @@ end
 function whitening_point(Rτ, rest, τ)
     best = (λ=-Inf, s=NaN)
     f(x) = (λ = bottom_eigval(Rτ .- (exp(x) - τ) .* rest); λ > best.λ && (best = (λ=λ, s=exp(x))); -λ)
-    golden_section(f, log(1e-12), log(1e16), 0.25)
+    golden_section(f, log(1e-12), log(1e30), 0.25)
     return best
 end
 
@@ -561,7 +561,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
                               Γ::AbstractVector, V, Γrs::AbstractVector;
                               kept::AbstractVector{<:Integer}=eachindex(Γ),
                               k_uu::Int=DEFAULT_K_UU,
-                              τs::AbstractVector{<:Real}=1 .- exp2.(10:-1:-4),
+                              τs::AbstractVector{<:Real}=1 .- exp2.(24:-1:-4),
                               τ_refine_tol::Union{Nothing,Real}=0.05,
                               G₀_uu=nothing,
                               channels=nothing,
@@ -652,7 +652,7 @@ function bounds_from_spectrum(compute_env::ComputeEnvironment, smr::SMRSystem,
         if swept
             grid_sweep()
         else
-            # shortcut: τ never goes below τs[1] (−1023 by default); widen the grid if opt_taus sit at τs[1].
+            # shortcut: τ never goes below τs[1] (≈ −1.7e7 by default); widen the grid if opt_taus sit at τs[1].
             walked = local_tau_search(u -> dual_at(-expm1(u)), u_of(prev.τ), τ_refine_tol, u_lo, u_hi)
             # A long walk or a value well above the previous channel's says the warm start lost the optimum.
             if walked > TAU_MAX_STEPS || best.μ > (1 + TAU_RESWEEP_RTOL) * prev.μ
