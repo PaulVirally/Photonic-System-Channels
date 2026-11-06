@@ -45,7 +45,7 @@ end
 # `c_i = ((l-i)/l)·t_i + (i/l)·t_{i-l}`, with `t_{i-l}` the kernel at `l-i` signed by `PARITY`.
 function chan(c)
     for (ax, l) in enumerate(size(c)[1:3])
-        w = copyto!(similar(c, Float64, ntuple(d -> d == ax ? l : 1, 4)), (l:-1:1) ./ l)
+        w = copyto!(similar(c, Float64, ntuple(d -> d == ax ? l : 1, 4)), collect((l:-1:1) ./ l))
         sgn = copyto!(similar(c, Float64, (1, 1, 1, 6)), [p[ax] for p in PARITY])
         refl = circshift(reverse(c; dims=ax), ntuple(d -> d == ax ? 1 : 0, 4))   # i ↦ l - i
         c = w .* c .+ (1 .- w) .* sgn .* refl
