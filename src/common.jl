@@ -29,32 +29,26 @@ ArgParse.parse_item(::Type{NTuple{3, Int}}, s::AbstractString) = parse_3tuple(s,
 ArgParse.parse_item(::Type{NTuple{3, Rational{Int}}}, s::AbstractString) = parse_3tuple(s, parse_rational)
 parse_scale(s::AbstractString) = startswith(strip(s), "(") ? parse_3tuple(s, parse_rational) : parse_rational(s)
 
-# Default directories: the group server (MOLERING), an Alliance cluster (CC_CLUSTER), or a laptop.
+# Default directories: the group server (MOLERING), or ./data.
 function _default_dirs(project_name::AbstractString)
-    user = ENV["USER"]
     if haskey(ENV, "MOLERING")
+        user = get(ENV, "USER", "user")
         return (preload=joinpath(ENV["MOLERING"], "fatmole", "greens_functions"),
                 project=joinpath("/home", user, "Sender-Mediator-Receiver SVD Bounds", "projects", project_name),
                 scratch=joinpath(ENV["MOLERING"], "fatmole", user, "SMR-Bounds", project_name))
-    elseif haskey(ENV, "CC_CLUSTER")
-        # Not ~/scratch/preload: those files were serialized by older Gila versions.
-        return (preload=joinpath("/home", user, "scratch", "preload_gila"),
-                project=joinpath("/home", user, "projects", "def-smolesky", user, project_name),
-                scratch=joinpath("/home", user, "scratch", project_name))
     end
-    desktop = joinpath("/Users", user, "Desktop")
-    return (preload=joinpath(desktop, "preload"),
-            project=joinpath(desktop, project_name),
-            scratch=joinpath(desktop, project_name, "scratch"))
+    return (preload=joinpath("data", "preload"),
+            project=joinpath("data", "project", project_name),
+            scratch=joinpath("data", "scratch", project_name))
 end
 
-_default_gpu() = (haskey(ENV, "MOLERING") || haskey(ENV, "CC_CLUSTER")) ? GPUChoice(true, 0) : GPUChoice(false, -1)
+_default_gpu() = haskey(ENV, "MOLERING") ? GPUChoice(true, 0) : GPUChoice(false, -1)
 
 """
     parse_cli() -> NamedTuple
 
 Parse the command line shared by `generate_green`, `generate_rsvd` and
-`compute_bounds`. Returns `(compute_env, smr, rsvd_params, gamma_rtol, k_uu)`;
+`compute_bounds`. Returns `(compute_env, smr, rsvd_params, gamma_rtol, k_uu, channels)`;
 each stage reads the fields it needs.
 """
 function parse_cli()
@@ -131,9 +125,21 @@ function parse_cli()
             arg_type = Float64
             default = DEFAULT_GAMMA_RTOL
         "--k-uu"
-            help = "Bounds: number of Asym(G⁰ᵤᵤ) eigenvectors added to the projection basis (0 disables)"
+            help = "Bounds: number of Asym(G⁰ᵤᵤ) eigenvectors added to the projection basis (0 disables); with a mediator, the Asym(G⁰ₘₘ) eigenvectors preconditioning B"
             arg_type = Int
             default = DEFAULT_K_UU
+        "--channels"
+            help = "Bounds with a mediator: number of channels n to bound"
+            arg_type = Int
+            default = 100
+        "--tails"
+            help = "Bounds with a mediator: RSVD tails inside the dual (dual), the paper's a-posteriori ball (paper), or dropped at the full loss, not a bound (none)"
+            range_tester = in(("dual", "paper", "none"))
+            default = "dual"
+        "--loss-share"
+            help = "Bounds with a mediator, tails dual: share f of the material loss set aside for the RSVD tails"
+            arg_type = Float64
+            default = DEFAULT_LOSS_SHARE
         "--no-refine"
             help = "Mesh the sender and receiver uniformly even when their gap is under $(MIN_GAP_CELLS) cells"
             action = :store_true
@@ -167,7 +173,7 @@ function parse_cli()
                              resolve_seed(args["seed"], project_name))
     @info string(now()) * " [common::parse_cli] RSVD parameters" rsvd_params args["gamma-rtol"] args["k-uu"]
     return (compute_env=compute_env, smr=smr, rsvd_params=rsvd_params,
-            gamma_rtol=args["gamma-rtol"], k_uu=args["k-uu"])
+            gamma_rtol=args["gamma-rtol"], k_uu=args["k-uu"], channels=args["channels"], tails=args["tails"], loss_share=args["loss-share"])
 end
 
 """
@@ -186,36 +192,18 @@ function select_device(compute_env::ComputeEnvironment)
         return
     end
     @info string(now()) * " [common::select_device] Using GPU $(gpu_device(compute_env))"
-    # Slurm already restricts the visible devices on the Alliance clusters, and selecting one there fails.
-    haskey(ENV, "CC_CLUSTER") || CUDA.device!(gpu_device(compute_env))
+    CUDA.device!(gpu_device(compute_env))
 end
 
 # Host memory kept back from the panel tier for the runtime, the operator's host side and
-# the page cache the positive-block h5 write dirties (Slurm charges it to the job). 8 GB is
-# the measured shortfall of a 1 λ panel job that was OOM-killed with 6 GB.
+# the page cache the positive-block h5 write dirties. 8 GB is the measured shortfall of a
+# 1 λ panel run that was OOM-killed with 6 GB.
 const HOST_OVERHEAD_RESERVE_BYTES = 8 * 2^30
 const HOST_BUDGET_FLOOR_BYTES = 2^30
 # The rest of the card absorbs the driver and the memory pool's cached blocks.
 const DEVICE_BUDGET_FRACTION = 0.9
 
 device_budget_bytes() = floor(Int, DEVICE_BUDGET_FRACTION * CUDA.total_memory())
-
-# What Slurm granted, in bytes; the machine's memory off a cluster.
-function _slurm_host_bytes()
-    units = Dict('K' => 2^10, 'M' => 2^20, 'G' => 2^30, 'T' => 2^40)
-    mem_bytes(raw) = begin
-        isempty(raw) && return nothing
-        unit = get(units, uppercase(last(raw)), nothing)
-        value = tryparse(Int, isnothing(unit) ? raw : raw[1:end-1])
-        isnothing(value) ? nothing : value * something(unit, 2^20) # bare numbers are MB
-    end
-    node = mem_bytes(strip(get(ENV, "SLURM_MEM_PER_NODE", "")))
-    isnothing(node) || return node
-    per_cpu = mem_bytes(strip(get(ENV, "SLURM_MEM_PER_CPU", "")))
-    cpus = tryparse(Int, get(ENV, "SLURM_CPUS_PER_TASK", ""))
-    (isnothing(per_cpu) || isnothing(cpus)) || return per_cpu * cpus
-    return Int(Sys.total_memory())
-end
 
 #=
 A Funicular host pool never gives its pinned slabs back to the OS: they go only when the
@@ -247,23 +235,22 @@ end
 """
     residency_plan(compute_env; workspace_bytes=0) -> Funicular.ResidencyPlan or nothing
 
-The plan the panel path streams through, sized from the job's allocation: 90% of the
-card, and the Slurm memory request less a reserve and less what earlier plans still
-hold. Spills to node-local `\$SLURM_TMPDIR` when there is one. `nothing` on a CPU run.
+The plan the panel path streams through: 90% of the card, and the host memory less a
+reserve and less what earlier plans still hold. `nothing` on a CPU run.
 `workspace_bytes` is the operator's own device footprint (see `gila_workspace_bytes`).
 """
 function residency_plan(compute_env::ComputeEnvironment; workspace_bytes::Int=0)
     use_gpu(compute_env) || return nothing
     already_pinned = live_pool_host_bytes()
-    host_budget = max(_slurm_host_bytes() - HOST_OVERHEAD_RESERVE_BYTES - already_pinned,
-                      HOST_BUDGET_FLOOR_BYTES)
-    scratch = haskey(ENV, "SLURM_TMPDIR") ? mkpath(joinpath(ENV["SLURM_TMPDIR"], "funicular")) : nothing
-    @info string(now()) * " [common::residency_plan] Building a residency plan" device_budget=device_budget_bytes() host_budget workspace_bytes scratch already_pinned
+    # the pool's pinned slabs never shrink, so leave room for Gila, h5 staging and the Julia heap
+    host_bytes = Int(Sys.total_memory())
+    reserve = max(HOST_OVERHEAD_RESERVE_BYTES, 2 * host_bytes ÷ 5) # 20% still OOMed at N = 4.3M
+    host_budget = max(host_bytes - reserve - already_pinned, HOST_BUDGET_FLOOR_BYTES)
+    @info string(now()) * " [common::residency_plan] Building a residency plan" device_budget=device_budget_bytes() host_budget workspace_bytes already_pinned
     plan = Funicular.ResidencyPlan(backend=Funicular.cuda_backend(),
                                    device_budget=device_budget_bytes(),
                                    host_budget=host_budget,
-                                   workspace_bytes=workspace_bytes,
-                                   scratch_dir=scratch)
+                                   workspace_bytes=workspace_bytes)
     push!(LIVE_RESIDENCY_PLANS, WeakRef(plan))
     return plan
 end
@@ -273,3 +260,34 @@ function run_gc()
     GC.gc()
     GC.gc()
 end
+
+"""
+    golden_min(f, lo, hi; iters=60) -> (fmin, xmin)
+
+Minimise a unimodal `f` on [lo, hi] by golden section: `iters` reductions of the
+bracket, each by 1/φ ≈ 0.618. `f` may return Inf; the smallest value seen is returned.
+"""
+function golden_min(f, lo::Real, hi::Real; iters::Integer=60)
+    invφ = (sqrt(5.0) - 1) / 2
+    x₁, x₂ = hi - invφ * (hi - lo), lo + invφ * (hi - lo)
+    f₁, f₂ = f(x₁), f(x₂)
+    best = f₁ <= f₂ ? (f₁, x₁) : (f₂, x₂)
+    for _ in 1:iters
+        if f₁ <= f₂
+            hi, x₂, f₂ = x₂, x₁, f₁
+            x₁ = hi - invφ * (hi - lo)
+            f₁ = f(x₁)
+            f₁ < best[1] && (best = (f₁, x₁))
+        else
+            lo, x₁, f₁ = x₁, x₂, f₂
+            x₂ = lo + invφ * (hi - lo)
+            f₂ = f(x₂)
+            f₂ < best[1] && (best = (f₂, x₂))
+        end
+    end
+    return best
+end
+
+# The iteration count at which golden section shrinks [lo, hi] to width `tol`.
+golden_iters(lo::Real, hi::Real, tol::Real) =
+    hi - lo > tol ? ceil(Int, log(tol / (hi - lo)) / log((sqrt(5.0) - 1) / 2)) : 0

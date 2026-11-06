@@ -13,12 +13,12 @@ function _generate_green_sr(compute_env::ComputeEnvironment, smr::SMRSystem)
 end
 
 function _generate_green_smr(compute_env::ComputeEnvironment, smr::SMRSystem)
-    pairs = [(Receiver, Sender)]
-    prod(mediator(smr).cel) != 0 &&
-        append!(pairs, [(Mediator, Sender), (Mediator, Mediator), (Receiver, Mediator)])
-    for (target, source) in pairs
-        @info string(now()) * " [generate_green] Generating $(source) -> $(target)"
-        load_green_function(compute_env, smr, target, source)
+    for (what, load) in (("G⁰ᵣₛ", () -> load_green_function(compute_env, smr, Receiver, Sender)),
+                         ("G⁰ₘₛ", () -> load_green_function(compute_env, smr, Mediator, Sender)),
+                         ("G⁰ᵣ←[s;m]", () -> load_green_function(compute_env, smr, [Receiver], [Sender, Mediator])),
+                         ("Asym(G⁰ₘₘ)", () -> load_asym_green_function(compute_env, smr, Mediator)))
+        @info string(now()) * " [generate_green] Generating $(what)"
+        load()
         run_gc()
     end
 end

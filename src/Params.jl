@@ -21,8 +21,6 @@ A structure to hold parameters for Randomized Singular Value Decomposition (RSVD
   panel path has no stored test matrix to seed and takes an integer instead, so
   the seed is carried here and written into the output alongside the spectrum.
   The in-memory path draws from the global RNG and ignores it.
-
-The three-argument constructor leaves `seed` at 0.
 """
 struct RSVDParams
     rank::Int
@@ -31,15 +29,13 @@ struct RSVDParams
     seed::Int
 end
 
-RSVDParams(rank::Int, oversamples::Int, power_iter::Int) = RSVDParams(rank, oversamples, power_iter, 0)
-
 rank(params::RSVDParams) = params.rank
 oversamples(params::RSVDParams) = params.oversamples
 power_iter(params::RSVDParams) = params.power_iter
 seed(params::RSVDParams) = params.seed
 
 """
-    ComputeEnvironment(preload_dir::String, project_dir::String, scratch_dir::String, use_gpu::Bool)
+    ComputeEnvironment(preload_dir::String, project_dir::String, scratch_dir::String, gpu_choice::GPUChoice)
 
 A struct to hold paths and settings for the compute environment.
 
@@ -47,7 +43,7 @@ A struct to hold paths and settings for the compute environment.
 - `preload_dir::String`: Directory path for preloaded data.
 - `project_dir::String`: Directory path for the project.
 - `scratch_dir::String`: Directory path for scratch data.
-- `use_gpu::Bool`: Flag indicating whether to use GPU acceleration.
+- `gpu_choice::GPUChoice`: Whether to use a GPU, and which device (`use_gpu`, `gpu_device`).
 """
 struct ComputeEnvironment
     preload_dir::String

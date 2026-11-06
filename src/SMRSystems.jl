@@ -180,34 +180,37 @@ function rs_separation(system::SMRSystem)
     return center_to_center .- half_extents
 end
 
-function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3, Rational{Int}}, mediator_num_cells::NTuple{3, Int}, mr_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64)
-    sender_center_wl = (0//1, 0//1, 0//1)
-    sender_size_wl = sender_num_cells .* scale
-    sm_dir = (1, 0, 0) # Assume separation along x-axis
+# Body centres along x: the first at the origin, each next one `gaps[i]` past the far
+# face of the one before it (negative gaps are silently taken as positive).
+function _centres_along_x(sizes_wl, gaps_wl)
+    centres = [(0//1, 0//1, 0//1)]
+    for (i, gap) in enumerate(gaps_wl)
+        push!(centres, centres[end] .+ ((sizes_wl[i] .+ sizes_wl[i+1]) .// 2) .* (1, 0, 0) .+ abs.(gap))
+    end
+    return centres
+end
 
-    mediator_size_wl = mediator_num_cells .* scale
-    mediator_center_wl = sender_center_wl .+ (sender_size_wl .// 2) .* sm_dir .+ abs.(sm_separation_wl) .+ (mediator_size_wl .// 2) .* sm_dir # Silently ignore negative separations
-
-    mr_dir = (1, 0, 0) # Assume separation along x-axis
-    receiver_center_wl = mediator_center_wl .+ (mediator_size_wl .// 2) .* mr_dir .+ abs.(mr_separation_wl) .+ (receiver_num_cells .* scale .// 2) .* mr_dir # Silently ignore negative separations
-
-    sender_volume = GlaVol(sender_num_cells, (scale, scale, scale), sender_center_wl)
-    mediator_volume = GlaVol(mediator_num_cells, (scale, scale, scale), mediator_center_wl)
-    receiver_volume = GlaVol(receiver_num_cells, (scale, scale, scale), receiver_center_wl)
-
-    isempty(design_regions) && throw(ArgumentError("Design regions cannot be empty. You must specify at least one of Sender, Mediator, or Receiver for the design region."))
-    design_volumes = GlaVol[]
+# The union of the volumes `design_regions` names out of `volumes` (a region => volume Dict).
+function _design_volume(design_regions::AbstractVector{SMRVolumeSymbol}, volumes::Dict)
+    picked = GlaVol[]
     for region in design_regions
-        if region == Sender
-            push!(design_volumes, sender_volume)
-        elseif region == Mediator
-            push!(design_volumes, mediator_volume)
-        elseif region == Receiver
-            push!(design_volumes, receiver_volume)
+        if haskey(volumes, region)
+            push!(picked, volumes[region])
+        else
+            @warn "Region $region is not a body of this system; ignoring it for the design volume."
         end
     end
-    design_volume = union(design_volumes...)
+    isempty(picked) && throw(ArgumentError("The design regions $(design_regions) name no body of this system ($(join(keys(volumes), ", ")))."))
+    return union(picked...)
+end
 
+function SMRSystem(sender_num_cells::NTuple{3, Int}, sm_separation_wl::NTuple{3, Rational{Int}}, mediator_num_cells::NTuple{3, Int}, mr_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Rational{Int}, χ::ComplexF64)
+    scales = (scale, scale, scale)
+    cells = (sender_num_cells, mediator_num_cells, receiver_num_cells)
+    centres = _centres_along_x([c .* scales for c in cells], (sm_separation_wl, mr_separation_wl))
+    sender_volume, mediator_volume, receiver_volume = (GlaVol(c, scales, o) for (c, o) in zip(cells, centres))
+    design_volume = _design_volume(design_regions, Dict(Sender => sender_volume, Mediator => mediator_volume,
+                                                        Receiver => receiver_volume))
     return SMRSystem(sender_volume, mediator_volume, receiver_volume, design_volume, design_regions, χ)
 end
 
@@ -216,29 +219,10 @@ end
 function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3, Rational{Int}}, receiver_num_cells::NTuple{3, Int}, design_regions::AbstractVector{SMRVolumeSymbol}, scale::Union{Rational{Int}, NTuple{3, Rational{Int}}}, χ::ComplexF64; refine_gap::Bool=true)
     scale isa Rational && (scale = (scale, scale, scale))
     all(>(0), scale) || throw(ArgumentError("The mesh scale must be positive, got $(scale)"))
-
-    sender_center_wl = (0//1, 0//1, 0//1)
-    sender_size_wl = sender_num_cells .* scale
-    rs_dir = (1, 0, 0) # Assume separation along x-axis
-
-    receiver_size_wl = receiver_num_cells .* scale
-    receiver_center_wl = sender_center_wl .+ (sender_size_wl .// 2) .* rs_dir .+ abs.(rs_separation_wl) .+ (receiver_size_wl .// 2) .* rs_dir # Silently ignore negative separations
-
-    sender_volume = GlaVol(sender_num_cells, scale, sender_center_wl)
-    receiver_volume = GlaVol(receiver_num_cells, scale, receiver_center_wl)
-
-    isempty(design_regions) && throw(ArgumentError("Design regions cannot be empty. You must specify at least one of Sender or Receiver for the design region."))
-    design_volumes = GlaVol[]
-    for region in design_regions
-        if region == Sender
-            push!(design_volumes, sender_volume)
-        elseif region == Receiver
-            push!(design_volumes, receiver_volume)
-        else
-            @warn "Region $region cannot be part of the design because there is only a sender and receiver (no mediator) in this system. Ignoring region $region for design volume."
-        end
-    end
-    design_volume = union(design_volumes...)
+    cells = (sender_num_cells, receiver_num_cells)
+    centres = _centres_along_x([c .* scale for c in cells], (rs_separation_wl,))
+    sender_volume, receiver_volume = (GlaVol(c, scale, o) for (c, o) in zip(cells, centres))
+    design_volume = _design_volume(design_regions, Dict(Sender => sender_volume, Receiver => receiver_volume))
 
     ref = refine_gap ? gap_refinement(abs(rs_separation_wl[1]), scale[1]) : nothing
     if isnothing(ref)
@@ -252,28 +236,30 @@ function SMRSystem(sender_num_cells::NTuple{3, Int}, rs_separation_wl::NTuple{3,
                      refine_body(receiver_volume, ref, :low), ref)
 end
 
+# A rational as a file-name fragment: 3//32 → "3ss32".
+_rstr(r) = string(numerator(r), "ss", denominator(r))
+
 # Generate the filename for the Green's function between the target and source volumes.
 # `target_tag` and `source_tag` name each side's refinement and are empty for a
 # plain volume, so an unrefined system keys its blocks where a finished sweep's
 # preload directory already has them.
 function green_fname(target_volume::GlaVol, source_volume::GlaVol,
                      target_tag::AbstractString="", source_tag::AbstractString="")
-    rational2str(r::Rational) = string(numerator(r), "ss", denominator(r))
     if target_volume == source_volume && target_tag == source_tag
          # Self green function
          which = "self"
          size = join(target_volume.cel, "x")
-         scale = join(map(rational2str, target_volume.scl), "x")
+         scale = join(map(_rstr, target_volume.scl), "x")
          return "$(which)/$(size)_$(scale)$(target_tag).glaG0"
     end
     # External green's function
     which = "ext"
     size_source = join(source_volume.cel, "x")
-    scale_source = join(map(rational2str, source_volume.scl), "x")
-    pos_source = join(map(rational2str, source_volume.org), "x")
+    scale_source = join(map(_rstr, source_volume.scl), "x")
+    pos_source = join(map(_rstr, source_volume.org), "x")
     size_target = join(target_volume.cel, "x")
-    scale_target = join(map(rational2str, target_volume.scl), "x")
-    pos_target = join(map(rational2str, target_volume.org), "x")
+    scale_target = join(map(_rstr, target_volume.scl), "x")
+    pos_target = join(map(_rstr, target_volume.org), "x")
     return "$(which)/$(size_source)_$(scale_source)@$(pos_source)$(source_tag)_to_$(size_target)_$(scale_target)@$(pos_target)$(target_tag).glaG0"
 end
 
@@ -315,7 +301,7 @@ end
 Serialize `obj` to `fpath` via a process-unique temporary file plus a rename.
 
 Green function filenames depend only on the geometry, so a self operator is
-shared by every separation in a sweep. Launching N jobs at once means N
+shared by every separation in a sweep. Running N points at once means N
 processes serializing to the same path. This function ensures that only one
 process writes to the final path at a time, and that the file is not corrupted
 if multiple processes try to write at once.
@@ -418,8 +404,11 @@ the tiling and the flat layout is `[sender; receiver]`, the convention `asym_ur`
 and the bounds' sender projector are written against. An unrefined body is a
 tiling of one region, so refined and unrefined systems take the same path.
 """
-universe_mesh(system::SMRSystem) =
-    GlaCmpVol(vcat(regions(sender_mesh(system)), regions(receiver_mesh(system))))
+universe_mesh(system::SMRSystem) = bodies_mesh(system, [Sender, Receiver])
+
+"The bodies as one tiling, their regions in the order given."
+bodies_mesh(system::SMRSystem, bodies::Vector{SMRVolumeSymbol}) =
+    GlaCmpVol(reduce(vcat, [regions(mesh(system, b)) for b in bodies]))
 
 # Where the universe operator lives in the preload directory. Named after the
 # bounding volume as before, with `uni_` in front so that a file of the old
@@ -434,12 +423,18 @@ function load_green_function(environment::ComputeEnvironment, system::SMRSystem,
     length(targets) == 1 && length(source) == 1 &&
         return load_green_function(environment, system, targets[1], source[1];
                                    force_generate=force_generate, save_to_disk=save_to_disk)
-    (sort(targets) == [Sender, Receiver] && sort(source) == [Sender, Receiver]) ||
-        throw(ArgumentError("only the universe [Sender, Receiver] is supported as a multi-body operator, got $(targets) <- $(source)"))
-    cvol = universe_mesh(system)
-    fpath = joinpath(preload_dir(environment), _universe_fname(system))
-    return _load_or_build(environment, fpath, "universe G₀"; force_generate=force_generate, save_to_disk=save_to_disk) do
-        CompositeVacuumGreenOperator{GILA_PREC}(cvol, cvol)
+    if sort(targets) == [Sender, Receiver] && sort(source) == [Sender, Receiver]
+        cvol = universe_mesh(system)
+        fpath = joinpath(preload_dir(environment), _universe_fname(system))
+        return _load_or_build(environment, fpath, "universe G₀"; force_generate=force_generate, save_to_disk=save_to_disk) do
+            CompositeVacuumGreenOperator{GILA_PREC}(cvol, cvol)
+        end
+    end
+    letters(bodies) = String(volume_symbol2char.(bodies))
+    fpath = joinpath(preload_dir(environment), "ext",
+                     "multi_$(letters(targets))_from_$(letters(source))__$(file_prefix(system)).glaG0")
+    return _load_or_build(environment, fpath, "G₀ $(letters(targets)) ← $(letters(source))"; force_generate=force_generate, save_to_disk=save_to_disk) do
+        CompositeVacuumGreenOperator{GILA_PREC}(bodies_mesh(system, targets), bodies_mesh(system, source))
     end
 end
 
@@ -480,7 +475,7 @@ cell size the bare operator is not Hermitian in the plain inner product that eve
 eigensolve and projection here assumes. On a uniform mesh the weights cancel and
 this is `LinearMap(op)`. `Design` is the universe, sender then receiver.
 """
-green_map(environment::ComputeEnvironment, system::SMRSystem, target::SMRVolumeSymbol, source::SMRVolumeSymbol) =
+green_map(environment::ComputeEnvironment, system::SMRSystem, target, source) =
     _l2_map(load_green_function(environment, system, target, source),
             _cell_mesh(system, target), _cell_mesh(system, source), use_gpu(environment))
 
@@ -489,6 +484,7 @@ asym_green_map(environment::ComputeEnvironment, system::SMRSystem, which::SMRVol
             _cell_mesh(system, which), _cell_mesh(system, which), use_gpu(environment))
 
 _cell_mesh(system::SMRSystem, symbol::SMRVolumeSymbol) = symbol == Design ? universe_mesh(system) : mesh(system, symbol)
+_cell_mesh(system::SMRSystem, bodies::Vector{SMRVolumeSymbol}) = bodies_mesh(system, bodies)
 
 function _l2_map(op, trg::GlaCmpVol, src::GlaCmpVol, on_gpu::Bool)
     wt, ws = cellvolumes(trg), cellvolumes(src)
@@ -503,17 +499,17 @@ function _l2_map(op, trg::GlaCmpVol, src::GlaCmpVol, on_gpu::Bool)
 end
 
 # Names a point's RSVD and bounds files: cell counts, the gap to the first body after the
-# sender, the cell size, the design regions, and the gap refinement if any.
+# sender (and on to the receiver, with a mediator), the cell size, the design regions, and the gap refinement if any.
 function file_prefix(system::SMRSystem)
     snd, med, rcv = sender(system), mediator(system), receiver(system)
-    next = isnothing(med) ? rcv : med
-    gap = (2 * (next.org[1] - snd.org[1]) - next.cel[1] * next.scl[1] - snd.cel[1] * snd.scl[1]) // 2
-    rstr(r) = "$(numerator(r))ss$(denominator(r))"
+    gap_between(a, b) = (2 * (b.org[1] - a.org[1]) - b.cel[1] * b.scl[1] - a.cel[1] * a.scl[1]) // 2
+    gaps = isnothing(med) ? _rstr(gap_between(snd, rcv)) :
+                            "$(_rstr(gap_between(snd, med)))__$(_rstr(gap_between(med, rcv)))"
     sizes = join((join(v.cel, "x") for v in (snd, med, rcv) if !isnothing(v)), "__")
-    scale = allequal(snd.scl) ? rstr(snd.scl[1]) : join(rstr.(snd.scl), "x")
+    scale = allequal(snd.scl) ? _rstr(snd.scl[1]) : join(_rstr.(snd.scl), "x")
     ref = refinement(system)
     refinement_string = isnothing(ref) ? "" : "__refF$(ref.factor)T$(ref.thickness)"
-    return "$(sizes)__$(rstr(gap))__at$(scale)__$(prod(volume_symbol2char.(design_regions(system))))$(refinement_string)"
+    return "$(sizes)__$(gaps)__at$(scale)__$(prod(volume_symbol2char.(design_regions(system))))$(refinement_string)"
 end
 
 end # module

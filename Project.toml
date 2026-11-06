@@ -1,10 +1,13 @@
 name = "PhotonicSystemChannels"
+uuid = "f526c605-bdfd-46c1-8643-4c3ff7556be3"
 authors = ["Paul Virally <pvirally@gmail.com>"]
+version = "0.1.0"
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 Funicular = "7ea9c160-9439-4cfe-a32a-3debd616a773"
 GilaElectromagnetics = "d021e48d-d5bb-41e2-b1a9-c560019218de"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
@@ -16,8 +19,19 @@ MatrixFreeRandomizedLinearAlgebra = "a69accfa-5557-4533-9d8b-afe141969680"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [sources]
 Funicular = {url = "https://github.com/PaulVirally/Funicular.jl", rev = "b7c2046af936828bf2167451c14de1f3c795e70f"}
 GilaElectromagnetics = {url = "https://github.com/moleskySean/GilaElectromagnetics.jl", rev = "736f7f3249d40a625687dac64a81b1b6b23a5b4b"}
 MatrixFreeRandomizedLinearAlgebra = {url = "https://github.com/PaulVirally/MatrixFreeRandomizedLinearAlgebra.jl", rev = "2aa57f19db18c5ec2c9a84a94f6c6eff11fe5e3f"}
+
+[compat]
+ArgParse = "1.2"
+CUDA = "5.11"
+FFTW = "1.10"
+HDF5 = "0.17"
+JLD2 = "0.6"
+LinearMaps = "3.11"
+StaticArrays = "1.9"
+julia = "1.11"

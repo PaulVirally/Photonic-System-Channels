@@ -28,9 +28,9 @@ const FFT_WORKSPACE_BYTES = 512 * 2^20
 use_dense_path(N_u::Integer; max_N_u::Integer=DENSE_EXACT_MAX_N_U) = N_u <= max_N_u
 
 "Whether the `reigen_hermitian` sketch has outgrown the device, so the tall matrices go to Funicular panels."
-function use_panel_path(N_u::Integer, c::Integer, compute_env::ComputeEnvironment)
+function use_panel_path(N_u::Integer, c::Integer, compute_env::ComputeEnvironment; n_mats::Integer=3)
     use_gpu(compute_env) || return false
-    return RSVD_PEAK_FUDGE * 3 * Int(N_u) * Int(c) * 16 > device_budget_bytes()
+    return RSVD_PEAK_FUDGE * n_mats * Int(N_u) * Int(c) * 16 > device_budget_bytes()
 end
 
 "Estimated device memory the Green operator needs for itself while it is applied."
@@ -270,11 +270,15 @@ function _generate_rsvd_sr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd
     _run_rsvdvals(compute_env, smr, rsvd_params, "RS/")
 end
 
+# The blocks the mediator bound reads: G⁰ᵣ←[s;m] and G⁰ₘₛ with their vectors, and the
+# vacuum G⁰ᵣₛ singular values the bound is compared with.
 function _generate_rsvd_smr(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams)
-    for jld_key in ("RS/", "SM/", "MR/")
-        _run_rsvd(compute_env, smr, rsvd_params, jld_key)
-    end
-    _run_rsvdvals(compute_env, smr, rsvd_params, "MM/")
+    _run_rsvd_vectors(compute_env, smr, rsvd_params, "RU/",
+                      () -> green_map(compute_env, smr, [Receiver], [Sender, Mediator]))
+    reclaim_host_pools!()
+    _run_rsvd_vectors(compute_env, smr, rsvd_params, "MS/", () -> green_map(compute_env, smr, Mediator, Sender))
+    reclaim_host_pools!()
+    _run_rsvdvals(compute_env, smr, rsvd_params, "RS/")
 end
 
 _has_key(jld_path, key) = isfile(jld_path) && jldopen(jld -> haskey(jld, key), jld_path, "r")
@@ -283,36 +287,134 @@ _has_key(jld_path, key) = isfile(jld_path) && jldopen(jld -> haskey(jld, key), j
 _key_operator(compute_env, smr, jld_key) =
     green_map(compute_env, smr, char2volume_symbol(jld_key[1]), char2volume_symbol(jld_key[2]))
 
-# Full randomized SVD of one Green block, in memory (the SMR pipeline).
-function _run_rsvd(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, jld_key::String)
+const STORE_COLUMNS = 256
+
+"A tall matrix (host, device, or a Funicular `PanelMatrix`) to an h5 store at `path`."
+save_tall(V::Funicular.PanelMatrix, path::AbstractString) = Funicular.save(V, path)
+function save_tall(V::AbstractMatrix, path::AbstractString)
+    store = Funicular.open_store(path, "w"; N=size(V, 1), k=size(V, 2), w=min(STORE_COLUMNS, size(V, 2)))
+    try
+        for J in Iterators.partition(axes(V, 2), STORE_COLUMNS)
+            Funicular.write_panel!(Funicular.DiskHome(store, first(J):last(J)), Array(view(V, :, J)))
+        end
+    finally
+        Funicular.close_store!(store)
+    end
+    return path
+end
+
+"Columns `J` (a unit range) of the tall matrix in the h5 store at `path`, on the host."
+function read_columns(path::AbstractString, J::UnitRange{Int})
+    store = Funicular.open_store(path, "r")
+    try
+        staged = Matrix{store.stored}(undef, store.N, length(J))
+        Funicular.read_panel!(Funicular.DiskHome(store, J), staged)
+        return staged isa Matrix{ComplexF64} ? staged : Matrix{ComplexF64}(staged)
+    finally
+        Funicular.close_store!(store)
+    end
+end
+
+store_size(path::AbstractString) = (s = Funicular.open_store(path, "r"); try (s.N, s.k) finally Funicular.close_store!(s) end)
+
+# Gaussian probes of the residual. Halko, Martinsson & Tropp (2011), Eq. (4.3): for any B,
+# ‖B‖ ≤ 10√(2/π) maxᵢ ‖Bωᵢ‖ fails with probability at most 10⁻ʳ. Applied to B = (EEᴴ)^q E,
+# whose norm is ‖E‖^(2q+1), the factor shrinks to its (2q+1)-th root and the probes see
+# the top of the tail rather than its Frobenius mass.
+const RESIDUAL_PROBES = 10
+const RESIDUAL_POWER = 3
+
+"""
+    residual_bound(G, U_path, on_gpu; q=RESIDUAL_POWER) -> Float64
+
+A bound on ‖E‖ = ‖(1 − UUᴴ)G‖ that holds with probability 1 − 10⁻¹⁰, `U` the orthonormal
+left vectors in the store at `U_path`. For an RSVD, U diag(S) Vᴴ = UUᴴG, so E is the
+residual of the decomposition. Costs `RESIDUAL_PROBES · (2q + 1)` applies of G or Gᴴ.
+"""
+function residual_bound(G, U_path::AbstractString, on_gpu::Bool; q::Int=RESIDUAL_POWER)
+    k = store_size(U_path)[2]
+    function project!(Y)
+        for J in Iterators.partition(1:k, STORE_COLUMNS)
+            UJ = read_columns(U_path, first(J):last(J))
+            on_gpu && (UJ = CuArray(UJ))
+            Y .-= UJ * (UJ' * Y)
+        end
+        return Y
+    end
+    Ω = randn(ComplexF64, size(G, 2), RESIDUAL_PROBES)
+    Y = project!(opmat(G, on_gpu ? CuArray(Ω) : Ω))
+    for _ in 1:q
+        Y = project!(opmat(G, opmat(G', Y)))
+    end
+    return (10 * sqrt(2 / π) * maximum(norm.(eachcol(Array(Y)))))^(1 / (2q + 1))
+end
+
+"""
+    _run_rsvd_vectors(compute_env, smr, rsvd_params, jld_key, operator)
+
+Full RSVD of the block `operator()` builds, in memory or in Funicular panels: `D` in the
+point's JLD, the left and right vectors in h5 stores beside it (`U_file`, `V_file`), and
+`eps`, the [`residual_bound`](@ref) of the decomposition.
+"""
+function _run_rsvd_vectors(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams,
+                           jld_key::String, operator)
     jld_path = rsvd_output_path(compute_env, smr)
-    if _has_key(jld_path, jld_key * "V")
-        @info string(now()) * " [rsvd::_run_rsvd] $(jld_key) already exists at $(jld_path): skipping"
+    if _has_key(jld_path, jld_key * "eps")
+        @info string(now()) * " [rsvd::_run_rsvd_vectors] $(jld_key) already exists at $(jld_path): skipping"
         return
     end
-    G₀_ab = _key_operator(compute_env, smr, jld_key)
-    sample_vec = use_gpu(compute_env) ? CuArray(zeros(ComplexF64, 0)) : zeros(ComplexF64, 0)
-    c = min(rank(rsvd_params), minimum(size(G₀_ab)))
-    @info string(now()) * " [rsvd::_run_rsvd] $(c) components of $(jld_key) ($(size(G₀_ab)))"
-    out = rsvd(G₀_ab, c; num_oversamples=oversamples(rsvd_params),
-               num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
-    jldopen(jld_path, "a+") do jld
-        jld[jld_key * "U"] = Array(out.U)
-        jld[jld_key * "D"] = Array(out.S)
-        jld[jld_key * "V"] = Array(out.Vt') # last: the skip above keys on it
+    G = operator()
+    dims = size(G)
+    c = min(rank(rsvd_params), minimum(dims))
+    stem = joinpath(scratch_dir(compute_env), "$(file_prefix(smr))_$(rstrip(jld_key, '/'))")
+    U_path, V_path = stem * "_U.h5", stem * "_V.h5"
+    plan = use_panel_path(maximum(dims), c, compute_env) ?
+           residency_plan(compute_env; workspace_bytes=gila_workspace_bytes(maximum(dims))) : nothing
+    if plan === nothing
+        @info string(now()) * " [rsvd::_run_rsvd_vectors] Path: in-memory RSVD, $(c) components of $(jld_key) ($(dims))"
+        sample_vec = use_gpu(compute_env) ? CuArray(zeros(ComplexF64, 0)) : zeros(ComplexF64, 0)
+        out = rsvd(G, c; num_oversamples=oversamples(rsvd_params),
+                   num_power_iterations=power_iter(rsvd_params), sample_vec=sample_vec)
+        S = Array(out.S)
+        save_tall(out.U, U_path)
+        save_tall(copy(Array(out.Vt)'), V_path)
+    else
+        @info string(now()) * " [rsvd::_run_rsvd_vectors] Path: panel RSVD, $(c) components of $(jld_key) ($(dims))" plan
+        _check_operator_normwise(G; backend=plan.backend, rtol=adjoint_check_rtol(maximum(dims), 1))
+        out = rsvd(G, c; num_oversamples=oversamples(rsvd_params), num_power_iterations=power_iter(rsvd_params),
+                   plan=plan, seed=seed(rsvd_params), validate=false)
+        S = Array(out.S)
+        try
+            save_tall(out.U, U_path)
+            save_tall(out.V, V_path)
+        finally
+            Funicular.free!(out.U)
+            Funicular.free!(out.V)
+        end
     end
+    out = plan = nothing
     run_gc()
+    use_gpu(compute_env) && CUDA.reclaim()
+    ε = residual_bound(G, U_path, use_gpu(compute_env))
+    @info string(now()) * " [rsvd::_run_rsvd_vectors] $(jld_key): σ[1] = $(S[1]), σ[$(length(S))] = $(S[end]), residual bound ε = $(ε)"
+    jldopen(jld_path, "a+") do jld
+        jld[jld_key * "D"] = S
+        jld[jld_key * "U_file"] = basename(U_path)
+        jld[jld_key * "V_file"] = basename(V_path)
+        jld[jld_key * "eps"] = ε # last: the skip above keys on it
+    end
 end
 
 # Singular values of one Green block: dense-exact, in-memory or panel, as for UR_asym.
 function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_params::RSVDParams, jld_key::String;
-                       plan_override=nothing, max_dense_N_r::Integer=DENSE_EXACT_MAX_N_R)
+                       plan_override=nothing, max_dense_N_r::Integer=DENSE_EXACT_MAX_N_R,
+                       operator=() -> _key_operator(compute_env, smr, jld_key))
     jld_path = rsvd_output_path(compute_env, smr)
     if _has_key(jld_path, jld_key * "D")
         @info string(now()) * " [rsvd::_run_rsvdvals] $(jld_key) already exists at $(jld_path): skipping"
         return
     end
-    G₀_ab = _key_operator(compute_env, smr, jld_key)
+    G₀_ab = operator()
     dims = size(G₀_ab)
     c = min(rank(rsvd_params), minimum(dims))
 
@@ -321,7 +423,8 @@ function _run_rsvdvals(compute_env::ComputeEnvironment, smr::SMRSystem, rsvd_par
         svdvals!(_dense_matrix(G₀_ab, use_gpu(compute_env)))
     else
         plan = !isnothing(plan_override) ? plan_override :
-               use_panel_path(maximum(dims), c, compute_env) ?
+               # a square block keeps every tall matrix at full height: OOMed at 3 for 393216², fine at 196608²
+               use_panel_path(maximum(dims), c, compute_env; n_mats=4) ?
                residency_plan(compute_env; workspace_bytes=gila_workspace_bytes(maximum(dims))) : nothing
         if plan === nothing
             @info string(now()) * " [rsvd::_run_rsvdvals] Path: in-memory RSVD, $(c) values of $(jld_key) ($(dims))"

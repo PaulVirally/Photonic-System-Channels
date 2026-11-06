@@ -4,8 +4,8 @@
 ## Run from the repo root:
 ##     julia --project=. test/smoke_funicular.jl
 ##
-## No GPU needed. Nothing is written outside a mktempdir, so this is safe to run
-## on a login node. Exits nonzero on the first failed check.
+## No GPU needed. Nothing is written outside a mktempdir. Exits nonzero on the first
+## failed check.
 
 using LinearAlgebra
 using Random
@@ -101,7 +101,6 @@ check("in-memory reigvals matches the panel run", d_mem < 1e-8,
       @sprintf("max abs diff = %.3e", d_mem))
 
 ## The disk tier, with the host budget squeezed so the spill actually happens.
-## This is the same valve trial E3c uses through $SLURM_TMPDIR.
 println("--- disk tier (scratch_dir, squeezed host_budget)")
 mktempdir() do dir
     dplan = ResidencyPlan(; backend=Funicular.CPUBackend(),

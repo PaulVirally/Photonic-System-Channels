@@ -65,7 +65,7 @@ Temporary Items
 bench/*.png
 bench/*.jld2
 
-jobs/
+data/
 projects/
 data analysis/
 
