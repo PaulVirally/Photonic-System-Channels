@@ -13,7 +13,7 @@ const GERMANIUM = 18.612 + 1.5502660841406073im
 function main()
     s = ArgParseSettings(description="Filled-block mediator bound (Fig 2) for one geometry.")
     @add_arg_table! s begin
-        "family"; help = "wg, ms1, ms2, ms4 or ms44"; required = true
+        "family"; help = "wg, wgt, ms05, ms1, ms2, ms4 or ms44"; required = true
         "param"; help = "mediator length ℓ (wg) or gap d (ms), in wavelengths, e.g. 1//2"; required = true
         "--scale"; help = "cell size in wavelengths"; default = "1//32"
         "--k-mb"; help = "rank of G_mb"; arg_type = Int; required = true

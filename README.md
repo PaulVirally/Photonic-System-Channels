@@ -111,7 +111,8 @@ Geometries (`filled_geometry`, lengths in wavelengths, cells of `--scale`, defau
 | family | sender, receiver | mediator | gaps | param |
 |---|---|---|---|---|
 | `wg` | 1/4 × 1 × 1 | ℓ × 1 × 1 | 1/8 | ℓ |
-| `ms1`, `ms2`, `ms4` | 1 × h × h | 1 × h × h | d | d |
+| `wgt` | 1/4 × 1/4 × 1/4 | ℓ × 1/4 × 1/4 | 1/8 | ℓ |
+| `ms05`, `ms1`, `ms2`, `ms4` | 1 × h × h (h = 1/2, 1, 2, 4) | 1 × h × h | d | d |
 | `ms44` | 1 × 4 × 4 | 4 × 4 × 4 | d | d |
 
 `--k-mb` is the rank kept of the vacuum coupling G_mb (mediator ← blocks) and `--k-rs` that of

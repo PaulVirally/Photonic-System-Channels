@@ -12,15 +12,18 @@
 """
     filled_geometry(family, param, scale) -> (s_cells, gap_cells, m_cells)
 
-`"wg"`: s, r = 1/4 × 1 × 1, gaps 1/8, m = param × 1 × 1 (param = ℓ). `"ms1"`, `"ms2"`, `"ms4"`:
-s, r, m = 1 × h × h, gaps = param (= d); `"ms44"`: m = 4 × 4 × 4. Lengths in wavelengths, x
-first (the s → r axis); r is the same block as s.
+`"wg"`: s, r = 1/4 × 1 × 1, gaps 1/8, m = param × 1 × 1 (param = ℓ); `"wgt"` (thin): s, r =
+1/4 × 1/4 × 1/4, gaps 1/8, m = param × 1/4 × 1/4. `"ms05"`, `"ms1"`, `"ms2"`, `"ms4"`:
+s, r, m = 1 × h × h (h = 1/2, 1, 2, 4), gaps = param (= d); `"ms44"`: m = 4 × 4 × 4. Lengths in
+wavelengths, x first (the s → r axis); r is the same block as s.
 """
 function filled_geometry(family::AbstractString, param::Rational, scale::Rational)
     c(x) = (n = x / scale; isinteger(n) || throw(ArgumentError("$x is not a multiple of $scale")); Int(n))
     family == "wg" && return (c(1 // 4), c(1), c(1)), c(1 // 8), (c(param), c(1), c(1))
-    h = get(Dict("ms1" => 1, "ms2" => 2, "ms4" => 4, "ms44" => 4), family, 0)
-    h > 0 || throw(ArgumentError("family must be wg, ms1, ms2, ms4 or ms44, not $family"))
+    q = 1 // 4
+    family == "wgt" && return (c(q), c(q), c(q)), c(1 // 8), (c(param), c(q), c(q))
+    h = get(Dict("ms05" => 1 // 2, "ms1" => 1 // 1, "ms2" => 2 // 1, "ms4" => 4 // 1, "ms44" => 4 // 1), family, 0 // 1)
+    h > 0 || throw(ArgumentError("family must be wg, wgt, ms05, ms1, ms2, ms4 or ms44, not $family"))
     return (c(1), c(h), c(h)), c(param), (c(family == "ms44" ? 4 : 1), c(h), c(h))
 end
 
@@ -130,7 +133,9 @@ function filled_bound(family::AbstractString, param::Rational, scale::Rational; 
     Ns, Nm, Nb = length(fb.s), length(fb.m), length(fb.b)
     dev(x) = on_gpu ? CuArray(ComplexF64.(x)) : ComplexF64.(x)
     cm(f, X, nout) = colmap(f, X, nout, dev)
-    log("$family $param λ/$(denominator(scale)): box $(fb.cells), Ns $Ns, Nm $Nm")
+    # a rank above the operator's dimensions is full rank (small blocks or a short mediator)
+    k_mb, k_rs, k_a = min(k_mb, Nb, Nm), min(k_rs, Ns), min(k_a, Nm)
+    log("$family $param λ/$(denominator(scale)): box $(fb.cells), Ns $Ns, Nm $Nm; k_mb $k_mb, k_rs $k_rs, k_a $k_a")
 
     # 1. vacuum basis on m
     Gmb(y) = (Gv * embed(fb, y, fb.b))[fb.m]
