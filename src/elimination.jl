@@ -10,15 +10,17 @@
 #   5. the reduced dual for each n, with rank removal on P⁽⁰⁾ (:bound) and on [P⁽⁰⁾ Γ] (:joint)
 
 """
-    filled_geometry(family, param, scale) -> (s_cells, gap_cells, m_cells)
+    filled_geometry(family, param, scale; m_face=nothing) -> (s_cells, gap_cells, m_cells)
 
 `"wg"`: s, r = 1/4 × 1 × 1, gaps 1/8, m = param × 1 × 1 (param = ℓ); `"wgt"` (thin): s, r =
 1/4 × 1/4 × 1/4, gaps 1/8, m = param × 1/4 × 1/4. `"ms05"`, `"ms1"`, `"ms2"`, `"ms4"`:
 s, r, m = 1 × h × h (h = 1/2, 1, 2, 4), gaps = param (= d); `"ms44"`: m = 4 × 4 × 4. Lengths in
-wavelengths, x first (the s → r axis); r is the same block as s.
+wavelengths, x first (the s → r axis); r is the same block as s. `m_face` (λ) replaces the
+mediator's y, z side; the box centres every body.
 """
-function filled_geometry(family::AbstractString, param::Rational, scale::Rational)
+function filled_geometry(family::AbstractString, param::Rational, scale::Rational; m_face=nothing)
     c(x) = (n = x / scale; isinteger(n) || throw(ArgumentError("$x is not a multiple of $scale")); Int(n))
+    m_face === nothing || return (g = filled_geometry(family, param, scale); (g[1], g[2], (g[3][1], c(m_face), c(m_face))))
     family == "wg" && return (c(1 // 4), c(1), c(1)), c(1 // 8), (c(param), c(1), c(1))
     q = 1 // 4
     family == "wgt" && return (c(q), c(q), c(q)), c(1 // 8), (c(param), c(q), c(q))
@@ -26,6 +28,9 @@ function filled_geometry(family::AbstractString, param::Rational, scale::Rationa
     h > 0 || throw(ArgumentError("family must be wg, wgt, ms05, ms1, ms2, ms4 or ms44, not $family"))
     return (c(1), c(h), c(h)), c(param), (c(family == "ms44" ? 4 : 1), c(h), c(h))
 end
+
+"Channels evaluated: 1, then 2ᵏ and 3·2ᵏ (1, 2, 3, 4, 6, 8, 12, …) below `nmax`, and `nmax`; 40 gives the original list."
+channel_grid(nmax) = sort!(union(filter(<=(nmax), [1; [m << k for m in (2, 3) for k in 0:30]]), nmax))
 
 # Columns of `f` applied to the host columns of X, one device vector at a time.
 function colmap(f, X::AbstractMatrix, nout::Int, dev)
@@ -119,15 +124,15 @@ end
                  lanczos_steps=20, δ=1e-10, log=println) -> NamedTuple
 
 Upper bounds on σₙ²(Pᵣₛ) over every structuring of the mediator, for n in
-1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40 up to `nmax` (geometry from `filled_geometry`). Returns
+`channel_grid(nmax)` (geometry from `filled_geometry`, `m_face` passed on). Returns
 `n => (bound, noeps, joint, joint_noeps, empty)`: the bounds with rank removal on P⁽⁰⁾ and on
 [P⁽⁰⁾ Γ], the same with every ε set to zero (not bounds), and σₙ²(P⁽⁰⁾); plus the ε's and ranks.
 Each bound holds except with probability 3δ (the three Lanczos estimates).
 """
 function filled_bound(family::AbstractString, param::Rational, scale::Rational; χ::Number, k_mb::Int, k_rs::Int,
-                      k_a::Int=200, nmax::Int=40, on_gpu::Bool=true, lanczos_steps::Int=20, δ::Real=1e-10, log=println)
+                      k_a::Int=200, nmax::Int=40, m_face=nothing, on_gpu::Bool=true, lanczos_steps::Int=20, δ::Real=1e-10, log=println)
     ζ = abs2(χ) / imag(χ)
-    sc, gap, mc = filled_geometry(family, param, scale)
+    sc, gap, mc = filled_geometry(family, param, scale; m_face)
     fb = FilledBox(sc, gap, mc, gap, sc, scale, χ; on_gpu)
     Gv = vacuum(fb)
     Ns, Nm, Nb = length(fb.s), length(fb.m), length(fb.b)
@@ -207,7 +212,7 @@ function filled_bound(family::AbstractString, param::Rational, scale::Rational; 
     FT = svd(Tc)
 
     bounds = Dict{Int, NamedTuple}()
-    for n in filter(<=(nmax), [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40])
+    for n in channel_grid(nmax)
         # rank removal on P⁽⁰⁾: q ⊥ V0[:, 1:n-1], q ∈ span[V0[:, n:end] Xc]
         Cq = hcat(Diagonal(S0)[:, n:end], zeros(k0, nXc))
         b, b0 = _dual(Cq' * Cq, ΓtU0 * Cq, CyCy, XsF[vcat(n:k0, k0+1:nXs), :], UAU, ζ, ε0, εF, εx, εΓ)

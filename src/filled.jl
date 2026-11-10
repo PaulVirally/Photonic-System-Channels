@@ -21,7 +21,7 @@ SolveStats() = SolveStats(0, 0, 0.0, 0.0)
 """
     FilledBox(s_cells, gap1, m_cells, gap2, r_cells, scale, χ; on_gpu, tol=1e-11)
 
-The box (x is the s → r axis; the three bodies share their y, z extent; gaps in cells) with its
+The box (x is the s → r axis; bodies centred in y, z, the box as wide as the widest; gaps in cells) with its
 operator A = I − XG⁰ and the shifted-frequency preconditioner (`ShiftedSolve`). `s`, `m`, `r`
 and `b = s ∪ r` index the box vector. Solves stop on the true relative residual `tol`.
 """
@@ -39,7 +39,7 @@ function _filled_box(χa, scale, on_gpu, tol, regions)
     vol = GlaVol(cells, (scale, scale, scale))
     A = on_gpu ? InvSctOpr{Float64}(vol, χa; dev=CUDA.CUDABackend()) : InvSctOpr{Float64}(vol, χa)
     LI = LinearIndices((cells..., 3))
-    idx(xx) = vec([LI[i, j, k, c] for i in xx, j in 1:cells[2], k in 1:cells[3], c in 1:3])
+    idx((xx, yy, zz)) = vec([LI[i, j, k, c] for i in xx, j in yy, k in zz, c in 1:3])
     up(v) = on_gpu ? CuArray(v) : v
     s, m, r = idx.(regions)
     return FilledBox(A, ShiftedSolve(A, χa), cells, up(s), up(m), up(r), up(vcat(s, r)), Float64(tol), SolveStats())
@@ -47,13 +47,14 @@ end
 
 function FilledBox(sc::NTuple{3, Int}, gap1::Int, mc::NTuple{3, Int}, gap2::Int, rc::NTuple{3, Int},
                    scale::Rational{Int}, χ::Number; on_gpu::Bool, tol::Real=1e-11)
-    sc[2:3] == mc[2:3] == rc[2:3] || throw(ArgumentError("s, m, r must share their y, z extent: $sc $mc $rc"))
-    nx = sc[1] + gap1 + mc[1] + gap2 + rc[1]
-    xs, xm, xr = 1:sc[1], sc[1]+gap1+1:sc[1]+gap1+mc[1], nx-rc[1]+1:nx
-    χa = zeros(ComplexF64, nx, sc[2], sc[3])
-    χa[xs, :, :] .= χ
-    χa[xr, :, :] .= χ
-    return _filled_box(χa, scale, on_gpu, tol, (xs, xm, xr))
+    nx, ny, nz = sc[1] + gap1 + mc[1] + gap2 + rc[1], max(sc[2], mc[2], rc[2]), max(sc[3], mc[3], rc[3])
+    mid(n, N) = iseven(N - n) ? ((N - n) ÷ 2 + 1:(N + n) ÷ 2) : throw(ArgumentError("faces $sc $mc $rc can't be centred"))
+    reg(xx, c) = (xx, mid(c[2], ny), mid(c[3], nz))
+    s, m, r = reg(1:sc[1], sc), reg(sc[1]+gap1+1:sc[1]+gap1+mc[1], mc), reg(nx-rc[1]+1:nx, rc)
+    χa = zeros(ComplexF64, nx, ny, nz)
+    χa[s...] .= χ
+    χa[r...] .= χ
+    return _filled_box(χa, scale, on_gpu, tol, (s, m, r))
 end
 
 """
@@ -63,7 +64,7 @@ One filled block alone (χ everywhere in `cells`), so A = I − χG⁰ = χ(χ�
 A_rr⁻¹ v = χ · boxsolve(box, v) (mediator_bound.pdf §8). `r` and `b` index the whole box.
 """
 solo_box(cells::NTuple{3, Int}, scale::Rational{Int}, χ::Number; on_gpu::Bool, tol::Real=1e-11) =
-    _filled_box(fill(ComplexF64(χ), cells), scale, on_gpu, tol, (1:0, 1:0, 1:cells[1]))
+    _filled_box(fill(ComplexF64(χ), cells), scale, on_gpu, tol, ((1:0, 1:0, 1:0), (1:0, 1:0, 1:0), Base.OneTo.(cells)))
 
 nbox(fb::FilledBox) = 3prod(fb.cells)
 vacuum(fb::FilledBox) = GilaElectromagnetics.vac(fb.A)

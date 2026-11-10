@@ -19,7 +19,8 @@ function main()
         "--k-mb"; help = "rank of G_mb"; arg_type = Int; required = true
         "--k-rs"; help = "rank of G_rs"; arg_type = Int; required = true
         "--k-a"; help = "Asym G⁰ₘₘ eigenvectors added to the basis"; arg_type = Int; default = 200
-        "--nmax"; help = "largest channel index"; arg_type = Int; default = 40
+        "--nmax"; help = "largest channel index (channels 1, 2, 3, 4, 6, 8, 12, ... and nmax)"; arg_type = Int; default = 40
+        "--m-face"; help = "mediator y, z side in wavelengths, e.g. 1//4 (default: the family's)"; default = ""
         "--gpu"; help = "GPU index, or -1 for the CPU"; arg_type = Int; default = 0
         "--out"; help = "output .jld2 file"; required = true
     end
@@ -28,7 +29,7 @@ function main()
     a["gpu"] >= 0 && CUDA.device!(a["gpu"])
     t = time()
     r = filled_bound(a["family"], rat(a["param"]), rat(a["scale"]); χ=GERMANIUM, k_mb=a["k-mb"], k_rs=a["k-rs"],
-                     k_a=a["k-a"], nmax=a["nmax"], on_gpu=a["gpu"] >= 0,
+                     k_a=a["k-a"], nmax=a["nmax"], m_face=isempty(a["m-face"]) ? nothing : rat(a["m-face"]), on_gpu=a["gpu"] >= 0,
                      log=msg -> (println(@sprintf("[%7.0f s] ", time() - t), msg); flush(stdout)))
     mkpath(dirname(abspath(a["out"])))
     jldsave(a["out"]; result=r, family=a["family"], param=a["param"], scale=a["scale"])
