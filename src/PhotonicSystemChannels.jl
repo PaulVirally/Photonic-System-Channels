@@ -38,6 +38,6 @@ export mediator_front, mediator_curve, mediator_dual, mediator_primal
 include("preconditioner.jl")
 include("filled.jl")
 include("elimination.jl")
-export FilledBox, solo_box, boxsolve, filled_geometry, filled_bound, lanczos_norm
+export FilledBox, solo_box, boxsolve, filled_geometry, filled_bound, filled_channels, lanczos_norm
 
 end # module

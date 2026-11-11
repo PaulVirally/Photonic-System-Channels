@@ -20,6 +20,7 @@ function main()
         "--k-rs"; help = "rank of G_rs"; arg_type = Int; required = true
         "--k-a"; help = "Asym G⁰ₘₘ eigenvectors added to the basis"; arg_type = Int; default = 200
         "--nmax"; help = "largest channel index (channels 1, 2, 3, 4, 6, 8, 12, ... and nmax)"; arg_type = Int; default = 40
+        "--ndense"; help = "every channel up to this one, then the grid above"; arg_type = Int; default = 256
         "--m-face"; help = "mediator y, z side in wavelengths, e.g. 1//4 (default: the family's)"; default = ""
         "--gpu"; help = "GPU index, or -1 for the CPU"; arg_type = Int; default = 0
         "--out"; help = "output .jld2 file"; required = true
@@ -28,10 +29,13 @@ function main()
     rat(x) = (p = parse.(Int, split(x, "//")); length(p) == 2 ? p[1] // p[2] : p[1] // 1)
     a["gpu"] >= 0 && CUDA.device!(a["gpu"])
     t = time()
-    r = filled_bound(a["family"], rat(a["param"]), rat(a["scale"]); χ=GERMANIUM, k_mb=a["k-mb"], k_rs=a["k-rs"],
-                     k_a=a["k-a"], nmax=a["nmax"], m_face=isempty(a["m-face"]) ? nothing : rat(a["m-face"]), on_gpu=a["gpu"] >= 0,
-                     log=msg -> (println(@sprintf("[%7.0f s] ", time() - t), msg); flush(stdout)))
     mkpath(dirname(abspath(a["out"])))
+    # the reduced problem goes to disk before the channel loop: filled_channels.jl gets any other n from it
+    save_red(red) = jldsave(splitext(a["out"])[1] * "_reduced.jld2"; reduced=red, family=a["family"], param=a["param"], scale=a["scale"])
+    r = filled_bound(a["family"], rat(a["param"]), rat(a["scale"]); χ=GERMANIUM, k_mb=a["k-mb"], k_rs=a["k-rs"],
+                     k_a=a["k-a"], nmax=a["nmax"], ndense=a["ndense"], m_face=isempty(a["m-face"]) ? nothing : rat(a["m-face"]),
+                     on_gpu=a["gpu"] >= 0, on_reduced=save_red,
+                     log=msg -> (println(@sprintf("[%7.0f s] ", time() - t), msg); flush(stdout)))
     jldsave(a["out"]; result=r, family=a["family"], param=a["param"], scale=a["scale"])
     num(x) = isfinite(x) ? string(x) : "null"
     rows = join(("\"$n\":{" * join(("\"$k\":$(num(getfield(b, k)))" for k in keys(b)), ",") * "}" for (n, b) in sort(collect(r.bounds))), ",")

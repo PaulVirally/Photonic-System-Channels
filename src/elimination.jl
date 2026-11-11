@@ -29,8 +29,8 @@ function filled_geometry(family::AbstractString, param::Rational, scale::Rationa
     return (c(1), c(h), c(h)), c(param), (c(family == "ms44" ? 4 : 1), c(h), c(h))
 end
 
-"Channels evaluated: 1, then 2ᵏ and 3·2ᵏ (1, 2, 3, 4, 6, 8, 12, …) below `nmax`, and `nmax`; 40 gives the original list."
-channel_grid(nmax) = sort!(union(filter(<=(nmax), [1; [m << k for m in (2, 3) for k in 0:30]]), nmax))
+"Channels evaluated: every n up to `ndense`, then 2ᵏ and 3·2ᵏ (1, 2, 3, 4, 6, 8, 12, …) below `nmax`, and `nmax`; (40, 0) gives the original list."
+channel_grid(nmax, ndense=0) = sort!(union(1:min(ndense, nmax), filter(<=(nmax), [1; [m << k for m in (2, 3) for k in 0:30]]), nmax))
 
 # Columns of `f` applied to the host columns of X, one device vector at a time.
 function colmap(f, X::AbstractMatrix, nout::Int, dev)
@@ -120,17 +120,20 @@ function _dual(CqCq, CyCq, CyCy, M, UAU, ζ, ε0, εF, εx, εΓ)
 end
 
 """
-    filled_bound(family, param, scale; χ, k_mb, k_rs, k_a=200, nmax=40, on_gpu=true,
-                 lanczos_steps=20, δ=1e-10, log=println) -> NamedTuple
+    filled_bound(family, param, scale; χ, k_mb, k_rs, k_a=200, nmax=40, ndense=0, on_gpu=true,
+                 lanczos_steps=20, δ=1e-10, on_reduced=nothing, log=println) -> NamedTuple
 
 Upper bounds on σₙ²(Pᵣₛ) over every structuring of the mediator, for n in
-`channel_grid(nmax)` (geometry from `filled_geometry`, `m_face` passed on). Returns
+`channel_grid(nmax, ndense)` (geometry from `filled_geometry`, `m_face` passed on). Returns
 `n => (bound, noeps, joint, joint_noeps, empty)`: the bounds with rank removal on P⁽⁰⁾ and on
 [P⁽⁰⁾ Γ], the same with every ε set to zero (not bounds), and σₙ²(P⁽⁰⁾); plus the ε's and ranks.
 Each bound holds except with probability 3δ (the three Lanczos estimates).
+`on_reduced(red)` gets the reduced problem before the channel loop; `filled_channels(red, ns)`
+then gives the bounds at any other channels without the box solves.
 """
 function filled_bound(family::AbstractString, param::Rational, scale::Rational; χ::Number, k_mb::Int, k_rs::Int,
-                      k_a::Int=200, nmax::Int=40, m_face=nothing, on_gpu::Bool=true, lanczos_steps::Int=20, δ::Real=1e-10, log=println)
+                      k_a::Int=200, nmax::Int=40, ndense::Int=0, m_face=nothing, on_gpu::Bool=true, lanczos_steps::Int=20,
+                      δ::Real=1e-10, on_reduced=nothing, log=println)
     ζ = abs2(χ) / imag(χ)
     sc, gap, mc = filled_geometry(family, param, scale; m_face)
     fb = FilledBox(sc, gap, mc, gap, sc, scale, χ; on_gpu)
@@ -209,10 +212,26 @@ function filled_bound(family::AbstractString, param::Rational, scale::Rational; 
     Kc = [Diagonal(S0) zeros(k0, nXc + kU); zeros(size(Ck, 1), nXs) (2imag(χ)) .* conj(Ck)]
     Tc = Rr * Kc
     ηT = δr * opnorm(Kc)
-    FT = svd(Tc)
 
+    red = (; S0, k0, nXs, ΓtU0, CyCy, XsF, UAU=Matrix(UAU), ζ, ε0, εF, εx, εΓ, Tc, ηT)
+    isnothing(on_reduced) || on_reduced(red)
+    bounds = filled_channels(red, channel_grid(nmax, ndense); log)
+    return (; bounds, ε0, εF, εx, kU, k_mb, k_rs, k0, solves=fb.stats.solves + solo.stats.solves,
+            maxres=max(fb.stats.maxres, solo.stats.maxres))
+end
+
+"""
+    filled_channels(red, ns; log=println) -> Dict(n => (bound, noeps, joint, joint_noeps, empty))
+
+The channel loop of `filled_bound` on its reduced problem `red`, at any channels `ns`: the same
+numbers `filled_bound` gives at those n. filled_bound.jl saves `red` next to its result.
+"""
+function filled_channels(red, ns; log=println)
+    (; S0, k0, nXs, ΓtU0, CyCy, XsF, UAU, ζ, ε0, εF, εx, εΓ, Tc, ηT) = red
+    nXc = nXs - k0
+    FT = svd(Tc)
     bounds = Dict{Int, NamedTuple}()
-    for n in channel_grid(nmax)
+    for n in ns
         # rank removal on P⁽⁰⁾: q ⊥ V0[:, 1:n-1], q ∈ span[V0[:, n:end] Xc]
         Cq = hcat(Diagonal(S0)[:, n:end], zeros(k0, nXc))
         b, b0 = _dual(Cq' * Cq, ΓtU0 * Cq, CyCy, XsF[vcat(n:k0, k0+1:nXs), :], UAU, ζ, ε0, εF, εx, εΓ)
@@ -225,6 +244,5 @@ function filled_bound(family::AbstractString, param::Rational, scale::Rational; 
         bounds[n] = (bound=b, noeps=b0, joint=j, joint_noeps=j0, empty=n <= k0 ? S0[n]^2 : NaN)
         log("n = $n: bound $b (ε = 0: $b0), joint $j (ε = 0: $j0)")
     end
-    return (; bounds, ε0, εF, εx, kU, k_mb, k_rs, k0, solves=fb.stats.solves + solo.stats.solves,
-            maxres=max(fb.stats.maxres, solo.stats.maxres))
+    return bounds
 end

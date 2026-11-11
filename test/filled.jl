@@ -7,7 +7,7 @@
 
 using PhotonicSystemChannels
 const PSC = PhotonicSystemChannels
-using LinearAlgebra, Printf
+using LinearAlgebra, Printf, JLD2
 
 const χ = 18.612 + 1.5502660841406073im
 const ζ = abs2(χ) / imag(χ)
@@ -22,6 +22,7 @@ end
 
 check("channel_grid(40) is the original list", PSC.channel_grid(40) == [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40])
 check("channel_grid(100) extends it", PSC.channel_grid(100) == [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 100])
+check("channel_grid(100, 20) is dense up to 20", PSC.channel_grid(100, 20) == [1:20; [24, 32, 48, 64, 96, 100]])
 
 # the default geometry, and a mediator narrower than the blocks (centred in y, z)
 for (tag, m_face) in (("wg", nothing), ("wg, m_face 1/4", 1 // 4))
@@ -58,7 +59,9 @@ for (tag, m_face) in (("wg", nothing), ("wg, m_face 1/4", 1 // 4))
     println("dense reference built"); flush(stdout)
     dense, _ = golden_min(t -> g1(λ0 * (1 + exp(t))), -14.0, 14.0; iters=80)
 
-    r = filled_bound("wg", 1 // 4, SCALE; χ, k_mb=368, k_rs=128, k_a=64, nmax=4096, m_face, on_gpu=false, log=msg -> (println("  ", msg); flush(stdout)))
+    red = Ref{Any}()
+    r = filled_bound("wg", 1 // 4, SCALE; χ, k_mb=368, k_rs=128, k_a=64, nmax=4096, ndense=40, m_face, on_gpu=false,
+                     on_reduced=x -> (red[] = x), log=msg -> (println("  ", msg); flush(stdout)))
     b = r.bounds[1]
     check("$tag: ε = 0 value equals the dense dual minimum", abs(b.noeps - dense) < 1e-4 * dense, @sprintf("%.8f vs %.8f", b.noeps, dense))
     check("$tag: bound with tails lies above it, within 0.05", b.noeps <= b.bound < b.noeps + 0.05, @sprintf("%.6f", b.bound))
@@ -69,8 +72,21 @@ for (tag, m_face) in (("wg", nothing), ("wg, m_face 1/4", 1 // 4))
           @sprintf("%.8f vs %.8f (ε₀ %.1e)", b.empty, σe^2, r.ε0))
     # nmax 4096 runs past rank(Tc) (it used to throw a BoundsError there): every grid point comes back with a
     # finite bound. The joint bound may be Inf once the ε terms dominate, as before.
-    check("$tag: nmax 4096 runs past rank(Tc) to the end", sort!(collect(keys(r.bounds))) == PSC.channel_grid(4096) &&
+    check("$tag: nmax 4096 runs past rank(Tc) to the end", sort!(collect(keys(r.bounds))) == PSC.channel_grid(4096, 40) &&
           all(isfinite(v.bound) for v in values(r.bounds)), "rank(Tc) ≤ $(r.k0 + r.kU)")
+    # ndense 40: the dense part plus the grid above it, where the bound still falls steeply
+    check("$tag: ndense 40 gives every channel up to 40", all(haskey(r.bounds, n) for n in 1:40))
+    # rank removal on P⁽⁰⁾ restricts q to nested subspaces, so `bound` can only fall with n; a channel
+    # between two grid points is then pinned between their values (the minimizer leaves ~1e-6 relative noise)
+    bs = [r.bounds[n].bound for n in sort!(collect(keys(r.bounds)))]
+    rise = maximum(bs[2:end] ./ bs[1:end-1]) - 1
+    check("$tag: bound never rises with n (to the dual minimizer's ~1e-6)", rise <= 1e-5, @sprintf("largest step up %.1e", rise))
+    # the reduced problem, through a JLD2 round trip, gives the same numbers at any channels
+    path = tempname() * ".jld2"
+    jldsave(path; reduced=red[])
+    again = filled_channels(load(path, "reduced"), [1, 7, 96, 4096]; log=_ -> nothing)
+    check("$tag: filled_channels on the saved reduced problem matches", all(isequal(again[n], r.bounds[n]) for n in [1, 7, 96, 4096]),
+          @sprintf("%.1f MB", filesize(path) / 2^20))
     check("$tag: box solves reached the residual target", r.maxres <= 1e-11, @sprintf("%.1e", r.maxres))
 end
 
