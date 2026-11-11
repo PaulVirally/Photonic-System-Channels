@@ -216,8 +216,10 @@ function filled_bound(family::AbstractString, param::Rational, scale::Rational; 
         # rank removal on P⁽⁰⁾: q ⊥ V0[:, 1:n-1], q ∈ span[V0[:, n:end] Xc]
         Cq = hcat(Diagonal(S0)[:, n:end], zeros(k0, nXc))
         b, b0 = _dual(Cq' * Cq, ΓtU0 * Cq, CyCy, XsF[vcat(n:k0, k0+1:nXs), :], UAU, ζ, ε0, εF, εx, εΓ)
-        # rank removal on the joint T (Remark 1): σₙ(Pᵣₛ) ≤ σ₁((T − Tₙ₋₁)[q; w])
-        Tn = Tc - FT.U[:, 1:n-1] * Diagonal(FT.S[1:n-1]) * FT.V[:, 1:n-1]'
+        # rank removal on the joint T (Remark 1): σₙ(Pᵣₛ) ≤ σ₁((T − Tₙ₋₁)[q; w]). Past rank(Tc),
+        # Tₙ₋₁ is all of Tc, so the sum stops at length(FT.S).
+        m = min(n - 1, length(FT.S))
+        Tn = Tc - FT.U[:, 1:m] * Diagonal(FT.S[1:m]) * FT.V[:, 1:m]'
         Tq, Ty = Tn[:, 1:nXs], Tn[:, nXs+1:end]
         j, j0 = _dual(Tq' * Tq, Ty' * Tq, Ty' * Ty, XsF, UAU, ζ, ε0 + ηT, εF, εx, εΓ + ηT)
         bounds[n] = (bound=b, noeps=b0, joint=j, joint_noeps=j0, empty=n <= k0 ? S0[n]^2 : NaN)

@@ -58,7 +58,7 @@ for (tag, m_face) in (("wg", nothing), ("wg, m_face 1/4", 1 // 4))
     println("dense reference built"); flush(stdout)
     dense, _ = golden_min(t -> g1(λ0 * (1 + exp(t))), -14.0, 14.0; iters=80)
 
-    r = filled_bound("wg", 1 // 4, SCALE; χ, k_mb=368, k_rs=128, k_a=64, nmax=2, m_face, on_gpu=false, log=msg -> (println("  ", msg); flush(stdout)))
+    r = filled_bound("wg", 1 // 4, SCALE; χ, k_mb=368, k_rs=128, k_a=64, nmax=4096, m_face, on_gpu=false, log=msg -> (println("  ", msg); flush(stdout)))
     b = r.bounds[1]
     check("$tag: ε = 0 value equals the dense dual minimum", abs(b.noeps - dense) < 1e-4 * dense, @sprintf("%.8f vs %.8f", b.noeps, dense))
     check("$tag: bound with tails lies above it, within 0.05", b.noeps <= b.bound < b.noeps + 0.05, @sprintf("%.6f", b.bound))
@@ -67,6 +67,10 @@ for (tag, m_face) in (("wg", nothing), ("wg, m_face 1/4", 1 // 4))
     σe = opnorm(Pe)
     check("$tag: σ₁²(P⁽⁰⁾) from §8 matches dense within the ε₀ tail", abs(b.empty - σe^2) <= r.ε0 * (2σe + r.ε0),
           @sprintf("%.8f vs %.8f (ε₀ %.1e)", b.empty, σe^2, r.ε0))
+    # nmax 4096 runs past rank(Tc) (it used to throw a BoundsError there): every grid point comes back with a
+    # finite bound. The joint bound may be Inf once the ε terms dominate, as before.
+    check("$tag: nmax 4096 runs past rank(Tc) to the end", sort!(collect(keys(r.bounds))) == PSC.channel_grid(4096) &&
+          all(isfinite(v.bound) for v in values(r.bounds)), "rank(Tc) ≤ $(r.k0 + r.kU)")
     check("$tag: box solves reached the residual target", r.maxres <= 1e-11, @sprintf("%.1e", r.maxres))
 end
 
